@@ -1,22 +1,30 @@
 # ============================================================================
-# MacAttack - Docker Compose for Synology NAS DS918+
+# MacAttack - Docker Compose for Synology NAS DS918+ *and* Raspberry Pi 4
 # ============================================================================
-# IMPORTANT: Nothing is compiled on the NAS anymore!
+# IMPORTANT: Nothing is compiled on the host anymore!
 #
 # The Docker image is built by GitHub Actions on every push to the `main`
 # branch and published to GitHub Container Registry:
 #
 #     ghcr.io/birdy1974/macattack
 #
-# This compose file simply pulls that ready-made image.
+# It is a multi-platform image (linux/amd64 + linux/arm64), so this one
+# file works unchanged on both:
 #
-# INSTALLATION STEPS:
-# 1. Copy ONLY this file (and optionally update.sh) to:
-#    /volume1/docker/mac-attack/
-# 2. SSH into your NAS:  ssh admin@<NAS-IP>
-# 3. cd /volume1/docker/mac-attack
+#   * Synology DS918+  -> x86_64  (Intel Celeron J3455)
+#   * Raspberry Pi 4    -> aarch64 (64-bit Raspberry Pi OS)
+#
+# Docker selects the matching architecture automatically on pull, so no
+# `platform:` line and no per-host file is needed.
+#
+# INSTALLATION STEPS (identical on NAS and Pi):
+# 1. Copy ONLY this file (and optionally update.sh) to the host, e.g.:
+#      NAS: /volume1/docker/mac-attack/
+#      Pi:  ~/mac-attack/
+# 2. SSH into the host:  ssh <user>@<HOST-IP>
+# 3. cd into that directory
 # 4. docker compose up -d        (or: docker-compose up -d)
-# 5. Open in your browser:  http://<NAS-IP>:3099
+# 5. Open in your browser:  http://<HOST-IP>:3099
 #
 # UPDATING TO THE LATEST VERSION:
 #    docker compose pull && docker compose up -d
@@ -27,10 +35,10 @@
 #    echo "<PERSONAL-ACCESS-TOKEN>" | docker login ghcr.io -u <GITHUB-USER> --password-stdin
 # ============================================================================
 
-version: "3.8"
-
 services:
   # PostgreSQL Database
+  # postgres:16-alpine ships linux/amd64 and linux/arm64 builds, so the same
+  # tag works on the NAS and on the Pi.
   db:
     image: postgres:16-alpine
     container_name: mac-attack-db
@@ -48,7 +56,8 @@ services:
       retries: 10
 
   # MacAttack Web Application
-  # Pre-built image from GitHub Container Registry (compiled by GitHub Actions)
+  # Pre-built multi-arch image from GitHub Container Registry
+  # (compiled by GitHub Actions)
   app:
     image: ghcr.io/birdy1974/macattack:latest
     container_name: mac-attack

@@ -6,8 +6,13 @@
 #
 #     ghcr.io/birdy1974/macattack
 #
-# The Synology NAS then only needs to pull that image (see docker-compose.yml).
-# No local compilation on the NAS, ever.
+# The Synology NAS / Raspberry Pi then only needs to pull that image
+# (see docker-compose.yml). No local compilation on the host, ever.
+#
+# The published tag is a multi-platform manifest list:
+#   linux/amd64  ->  Synology DS918+ (Intel Celeron J3455)
+#   linux/arm64  ->  Raspberry Pi 4 (aarch64, 64-bit Raspberry Pi OS)
+# Docker picks the right one automatically at `docker compose pull` time.
 # ============================================================================
 name: Build & publish Docker image
 
@@ -18,6 +23,12 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Comma-separated platform list (override for one-off builds)"
+        required: false
+        default: "linux/amd64,linux/arm64"
+        type: string
 
 env:
   REGISTRY: ghcr.io
@@ -27,6 +38,7 @@ jobs:
   build-and-push:
     name: Build image and push to GHCR
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
@@ -36,6 +48,15 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      # Required so the architecture-specific runtime stage (node:20-alpine
+      # for arm64, and its addgroup/adduser calls) can execute on the
+      # x86_64 runner. The heavy npm/Next.js stages are pinned to
+      # $BUILDPLATFORM in the Dockerfile and are NOT emulated.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -60,8 +81,12 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          # The Synology DS918+ is x86_64 (Intel Celeron J3455)
-          platforms: linux/amd64
+          # Multi-architecture manifest:
+          #   linux/amd64 = Synology DS918+
+          #   linux/arm64 = Raspberry Pi 4 (aarch64)
+          # On a manual run you can pass e.g. "linux/arm64" or add
+          # "linux/arm/v7" for a 32-bit Raspberry Pi OS.
+          platforms: ${{ inputs.platforms || 'linux/amd64,linux/arm64' }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
