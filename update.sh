@@ -1,9 +1,12 @@
 #!/bin/sh
 # ============================================================================
-# MacAttack - Update Script for Synology NAS
+# MacAttack - Update Script (Synology NAS / Raspberry Pi 4)
 # ============================================================================
 # Pulls the newest pre-built image from GitHub Container Registry and
-# restarts the app. Nothing is compiled on the NAS.
+# restarts the app. Nothing is compiled on the host.
+#
+# The published image is multi-arch (linux/amd64 + linux/arm64), so Docker
+# always pulls the variant matching the machine.
 #
 # Usage:  chmod +x update.sh && ./update.sh
 # ============================================================================
@@ -28,5 +31,5 @@ echo "Restarting MacAttack with the new image..."
 $COMPOSE up -d
 
 echo ""
-echo "Done! MacAttack is running at http://<YOUR-NAS-IP>:3099"
+echo "Done! MacAttack is running at http://<HOST-IP>:3099"
 echo "(Use a hard refresh in the browser: Ctrl+Shift+R / Cmd+Shift+R)"
