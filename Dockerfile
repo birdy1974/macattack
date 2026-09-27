@@ -78,7 +78,7 @@ ENV DATABASE_URL=postgresql://placeholder:placeholder@localhost:5432/placeholder
 # .next/standalone, so shipping them would make the image crash on a
 # Raspberry Pi with:
 #     Error: Cannot find module '@img/sharp-linux-arm64'
- *
+#
 # MacAttack never uses next/image, so sharp is never loaded at runtime.
 # Deleting it here keeps the runtime image architecture-independent
 # (52 MB -> 20 MB of app files) and lets stages 1+2 run only once for
