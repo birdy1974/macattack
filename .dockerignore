@@ -1,0 +1,24 @@
+# Keep the Docker build context minimal - only app sources are needed.
+.git
+.github
+.gitignore
+
+# Reference copy of the old project (not part of the build)
+initial
+
+# Local build artifacts and dependencies
+node_modules
+.next
+out
+
+# Compose / docs / helper scripts - not needed inside the image
+docker-compose*.yml
+Dockerfile
+.dockerignore
+README.md
+read.me
+update.sh
+
+# Misc
+*.log
+*.md

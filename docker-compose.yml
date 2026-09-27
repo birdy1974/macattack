@@ -1,0 +1,67 @@
+# ============================================================================
+# MacAttack - Docker Compose for Synology NAS DS918+
+# ============================================================================
+# IMPORTANT: Nothing is compiled on the NAS anymore!
+#
+# The Docker image is built by GitHub Actions on every push to the `main`
+# branch and published to GitHub Container Registry:
+#
+#     ghcr.io/birdy1974/macattack
+#
+# This compose file simply pulls that ready-made image.
+#
+# INSTALLATION STEPS:
+# 1. Copy ONLY this file (and optionally update.sh) to:
+#    /volume1/docker/mac-attack/
+# 2. SSH into your NAS:  ssh admin@<NAS-IP>
+# 3. cd /volume1/docker/mac-attack
+# 4. docker compose up -d        (or: docker-compose up -d)
+# 5. Open in your browser:  http://<NAS-IP>:3099
+#
+# UPDATING TO THE LATEST VERSION:
+#    docker compose pull && docker compose up -d
+#    (or run ./update.sh)
+#
+# The repository is public, so the image can be pulled anonymously.
+# If you make the repository/package private later, log in first:
+#    echo "<PERSONAL-ACCESS-TOKEN>" | docker login ghcr.io -u <GITHUB-USER> --password-stdin
+# ============================================================================
+
+version: "3.8"
+
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:16-alpine
+    container_name: mac-attack-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: macattack
+      POSTGRES_PASSWORD: macattack_secret_pw
+      POSTGRES_DB: macattack_db
+    volumes:
+      - mac-attack-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U macattack -d macattack_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # MacAttack Web Application
+  # Pre-built image from GitHub Container Registry (compiled by GitHub Actions)
+  app:
+    image: ghcr.io/birdy1974/macattack:latest
+    container_name: mac-attack
+    restart: unless-stopped
+    ports:
+      - "3099:3000"
+    environment:
+      DATABASE_URL: postgresql://macattack:macattack_secret_pw@db:5432/macattack_db
+      NODE_ENV: production
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  mac-attack-pgdata:
+    driver: local
