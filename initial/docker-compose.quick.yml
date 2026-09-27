@@ -1,0 +1,66 @@
+# ============================================================================
+# MacAttack - Quick Deploy (pre-built on your computer)
+# ============================================================================
+#
+# 1. Build on your computer:  npm install && npm run build
+# 2. Copy folder to NAS:      scp -r ./ admin@NAS:/volume1/docker/mac-attack/
+# 3. On NAS:                  docker-compose -f docker-compose.quick.yml up -d
+# ============================================================================
+
+version: "3.8"
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: mac-attack-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: macattack
+      POSTGRES_PASSWORD: macattack_secret_pw
+      POSTGRES_DB: macattack_db
+    volumes:
+      - mac-attack-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U macattack -d macattack_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  app:
+    image: node:20-alpine
+    container_name: mac-attack
+    restart: unless-stopped
+    working_dir: /app
+    ports:
+      - "3099:3000"
+    environment:
+      DATABASE_URL: postgresql://macattack:macattack_secret_pw@db:5432/macattack_db
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+    volumes:
+      - ./.next/standalone:/app
+      - ./.next/static:/app/.next/static
+      - ./public:/app/public
+      - ./init-schema.js:/app/init-schema.js
+      - ./wait-for-db.js:/app/wait-for-db.js
+    command: >
+      sh -c "
+        echo 'Waiting for database...'
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+          node /app/wait-for-db.js && break
+          echo 'Retrying...'
+          sleep 2
+        done
+        echo 'Applying schema...'
+        node /app/init-schema.js || true
+        echo 'Starting MacAttack...'
+        node /app/server.js
+      "
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  mac-attack-pgdata:
+    driver: local

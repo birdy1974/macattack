@@ -1,0 +1,62 @@
+# ============================================================================
+# MacAttack - Docker Compose for Synology NAS DS918+
+# ============================================================================
+#
+# INSTALLATION STEPS:
+# 1. Copy all files to: /volume1/docker/mac-attack/
+# 2. SSH into your NAS: ssh admin@<NAS-IP>
+# 3. Navigate to folder: cd /volume1/docker/mac-attack
+# 4. Build with extended timeout (see below)
+# 5. Access at: http://<NAS-IP>:3099
+#
+# BUILD COMMAND (with extended timeout):
+# -----------------------------------------
+# DOCKER_CLIENT_TIMEOUT=600 COMPOSE_HTTP_TIMEOUT=600 docker-compose up -d --build
+#
+# Or if that doesn't work, build separately:
+# -----------------------------------------
+# docker build --network=host -t mac-attack-app . 
+# docker-compose up -d
+#
+# ============================================================================
+
+version: "3.8"
+
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:16-alpine
+    container_name: mac-attack-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: macattack
+      POSTGRES_PASSWORD: macattack_secret_pw
+      POSTGRES_DB: macattack_db
+    volumes:
+      - mac-attack-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U macattack -d macattack_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # MacAttack Web Application
+  app:
+    container_name: mac-attack
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
+    restart: unless-stopped
+    ports:
+      - "3099:3000"
+    environment:
+      DATABASE_URL: postgresql://macattack:macattack_secret_pw@db:5432/macattack_db
+      NODE_ENV: production
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  mac-attack-pgdata:
+    driver: local
