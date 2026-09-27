@@ -1,16 +1,16 @@
 import { NextResponse } from "next/server";
 import { db } from "@/db";
 import { scanJobs } from "@/db/schema";
-import { eq, desc } from "drizzle-orm";
+import { inArray, desc } from "drizzle-orm";
 
 // Get the currently active/running scan job
 export async function GET() {
   try {
-    // Find any running scan
+    // A scan waiting for its next allowed schedule window is still active.
     const [runningJob] = await db
       .select()
       .from(scanJobs)
-      .where(eq(scanJobs.status, "running"))
+      .where(inArray(scanJobs.status, ["running", "scheduled_paused"]))
       .orderBy(desc(scanJobs.updatedAt))
       .limit(1);
 

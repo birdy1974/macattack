@@ -34,8 +34,9 @@
 
 import { lookup } from "node:dns/promises";
 import { db } from "@/db";
-import { scanJobs, scanResults, scanLogs } from "@/db/schema";
+import { scanJobs, scanResults, scanLogs, settings } from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { isWithinSchedule, parseScheduleSettings } from "@/lib/schedule";
 
 // ============================================================================
 // ACTIVE SCANS MANAGEMENT
@@ -375,11 +376,14 @@ async function resolveServerLocation(
 
 async function findWorkingEndpoint(
   portalUrl: string,
-  timeoutMs: number = 10000
-): Promise<{ serverPath: string; portalBase: string } | null> {
+  timeoutMs: number = 10000,
+  beforeRequest?: () => Promise<boolean>
+): Promise<{ serverPath: string; portalBase: string } | { aborted: true } | null> {
   const baseUrl = getBaseUrl(portalUrl);
 
   for (const pattern of PORTAL_PATTERNS) {
+    if (beforeRequest && !(await beforeRequest())) return { aborted: true };
+
     const serverPath = `${baseUrl}${pattern.path}`;
     const portalBase = `${baseUrl}${pattern.base}`;
     const testUrl = `${serverPath}?type=stb&action=handshake&prehash=0&token=&JsHttpRequest=1-xml`;
@@ -422,15 +426,19 @@ async function findWorkingEndpoint(
 
 export async function validateStalkerPortal(
   portalUrl: string,
-  timeoutMs: number = 10000
+  timeoutMs: number = 10000,
+  beforeRequest?: () => Promise<boolean>
 ): Promise<{
   valid: boolean;
   error?: string;
   serverPath?: string;
   portalBase?: string;
+  aborted?: boolean;
 }> {
   try {
-    const result = await findWorkingEndpoint(portalUrl, timeoutMs);
+    const result = await findWorkingEndpoint(portalUrl, timeoutMs, beforeRequest);
+
+    if (result && "aborted" in result) return { valid: false, aborted: true };
 
     if (result) {
       return {
@@ -442,6 +450,8 @@ export async function validateStalkerPortal(
 
     const baseUrl = getBaseUrl(portalUrl);
     const directUrl = `${baseUrl}server/load.php?type=stb&action=handshake&prehash=0&token=&JsHttpRequest=1-xml`;
+
+    if (beforeRequest && !(await beforeRequest())) return { valid: false, aborted: true };
 
     try {
       const controller = new AbortController();
@@ -705,6 +715,88 @@ async function resetFoundCounterAndHa(jobId: number, reason: string): Promise<vo
 }
 
 // ============================================================================
+// SCHEDULE GATE
+// ============================================================================
+
+/**
+ * Throttles schedule checks while a scan is active, and keeps the worker alive
+ * in a scheduled-paused state until its next allowed window. The five-second
+ * check interval means schedule edits and window boundaries take effect quickly
+ * without a database query for every tested MAC.
+ */
+function createScheduleGate(jobId: number, isAborted: () => boolean) {
+  const checkIntervalMs = 5_000;
+  let cachedSchedule: ReturnType<typeof parseScheduleSettings> | null = null;
+  let nextCheckAt = 0;
+  let wasScheduledPaused = false;
+
+  const readSchedule = async () => {
+    const rows = await db.select().from(settings);
+    const settingsMap = Object.fromEntries(rows.map((row) => [row.key, row.value || ""]));
+    cachedSchedule = parseScheduleSettings(
+      settingsMap.schedule_enabled,
+      settingsMap.schedule_timezone,
+      settingsMap.schedule_days
+    );
+    nextCheckAt = Date.now() + checkIntervalMs;
+    return cachedSchedule;
+  };
+
+  const isAllowedNow = async () => {
+    if (cachedSchedule && Date.now() < nextCheckAt) {
+      return isWithinSchedule(cachedSchedule);
+    }
+
+    try {
+      return isWithinSchedule(await readSchedule());
+    } catch {
+      // If a saved schedule was already loaded, honor it during a transient
+      // database failure. Before the first successful read, fail closed rather
+      // than risk running outside a schedule that could not be checked.
+      nextCheckAt = Date.now() + checkIntervalMs;
+      return cachedSchedule ? isWithinSchedule(cachedSchedule) : false;
+    }
+  };
+
+  return async (): Promise<boolean> => {
+    if (isAborted()) return false;
+
+    if (await isAllowedNow()) {
+      if (wasScheduledPaused) {
+        await db.update(scanJobs)
+          .set({ status: "running", updatedAt: new Date() })
+          .where(eq(scanJobs.id, jobId));
+        await addLog(jobId, "success", "Allowed schedule window is open — scan resumed automatically");
+        wasScheduledPaused = false;
+      }
+      return true;
+    }
+
+    if (!wasScheduledPaused) {
+      await db.update(scanJobs)
+        .set({ status: "scheduled_paused", updatedAt: new Date() })
+        .where(eq(scanJobs.id, jobId));
+      await addLog(jobId, "warning", "Outside the allowed schedule — scan is paused until the next allowed window");
+      wasScheduledPaused = true;
+    }
+
+    while (!isAborted()) {
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+      if (await isAllowedNow()) {
+        await db.update(scanJobs)
+          .set({ status: "running", updatedAt: new Date() })
+          .where(eq(scanJobs.id, jobId));
+        await addLog(jobId, "success", "Allowed schedule window is open — scan resumed automatically");
+        wasScheduledPaused = false;
+        return true;
+      }
+    }
+
+    return false;
+  };
+}
+
+// ============================================================================
 // MAIN SCAN LOOP
 // ============================================================================
 
@@ -712,6 +804,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
   const controller = new AbortController();
   activeScans.set(jobId, controller);
   const isAborted = () => controller.signal.aborted;
+  const waitForAllowedWindow = createScheduleGate(jobId, isAborted);
 
   try {
     const [job] = await db
@@ -740,6 +833,8 @@ export async function startScan(jobId: number, skipVerification: boolean = false
     await addLog(jobId, "info", `Timeout: ${timeoutMs}ms`);
     await addLog(jobId, "info", `Total MAC combinations in this prefix: ${totalCombinations.toString()}`);
 
+    if (!(await waitForAllowedWindow())) return;
+
     let serverPath: string;
     let portalBase: string;
 
@@ -752,9 +847,11 @@ export async function startScan(jobId: number, skipVerification: boolean = false
     } else {
       await addLog(jobId, "info", "Validating portal URL...");
       await addLog(jobId, "info", "Trying multiple common Stalker middleware URL patterns...");
-      const validation = await validateStalkerPortal(job.portalUrl, timeoutMs);
+      const validation = await validateStalkerPortal(job.portalUrl, timeoutMs, waitForAllowedWindow);
 
       if (!validation.valid) {
+        if (validation.aborted || isAborted()) return;
+
         await addLog(jobId, "error", "════════════════════════════════════════");
         await addLog(jobId, "error", "    PORTAL VALIDATION FAILED");
         await addLog(jobId, "error", "════════════════════════════════════════");
@@ -776,6 +873,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
     }
 
     // Resolve server geolocation once at the beginning.
+    if (!(await waitForAllowedWindow())) return;
     await addLog(jobId, "info", "Resolving server IP and location...");
     const serverGeo = await resolveServerLocation(job.portalUrl);
     if (serverGeo.ip) {
@@ -783,6 +881,8 @@ export async function startScan(jobId: number, skipVerification: boolean = false
     } else {
       await addLog(jobId, "warning", "Could not determine server geolocation");
     }
+
+    if (!(await waitForAllowedWindow())) return;
 
     await db
       .update(scanJobs)
@@ -875,7 +975,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
 
       // ── Inner loop: iterate over shuffled indices within block ──
       for (const macIndex of indices) {
-        if (isAborted()) {
+        if (isAborted() || !(await waitForAllowedWindow())) {
           abortedEarly = true;
           break;
         }
@@ -911,6 +1011,10 @@ export async function startScan(jobId: number, skipVerification: boolean = false
           if (!token) {
             continue;
           }
+          if (!(await waitForAllowedWindow())) {
+            abortedEarly = true;
+            break;
+          }
 
           // STEP 2 – Account info (the REAL validation)
           const accountInfo = await fetchAccountInfo(
@@ -938,6 +1042,10 @@ export async function startScan(jobId: number, skipVerification: boolean = false
           // STEP 3 – Fetch additional data (profile, genres, VOD)
           await addLog(jobId, "info", "Fetching additional account details...");
 
+          if (!(await waitForAllowedWindow())) {
+            abortedEarly = true;
+            break;
+          }
           const profileInfo = await fetchProfile(
             serverPath, portalBase, mac, token, timeoutMs, isAborted
           );
@@ -947,6 +1055,10 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             await addLog(jobId, "warning", "✗ Could not retrieve profile data");
           }
 
+          if (!(await waitForAllowedWindow())) {
+            abortedEarly = true;
+            break;
+          }
           const itvGenres = await fetchGenres(
             serverPath, portalBase, mac, token, "itv", timeoutMs, isAborted
           );
@@ -956,6 +1068,10 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             await addLog(jobId, "warning", "✗ Could not retrieve ITV genres");
           }
 
+          if (!(await waitForAllowedWindow())) {
+            abortedEarly = true;
+            break;
+          }
           const vodCategories = await fetchGenres(
             serverPath, portalBase, mac, token, "vod", timeoutMs, isAborted
           );

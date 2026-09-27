@@ -1,6 +1,11 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import {
+  DEFAULT_WEEK_SCHEDULE,
+  WEEKDAYS,
+  type ScheduleSettings,
+} from "@/lib/schedule";
 
 // ============================================================================
 // TYPE DEFINITIONS
@@ -115,6 +120,18 @@ export default function MacAttackPage() {
     error?: string;
   } | null>(null);
   const [haSaving, setHaSaving] = useState(false);
+  const [showScheduleSettings, setShowScheduleSettings] = useState(false);
+  const [scheduleSettings, setScheduleSettings] = useState<ScheduleSettings>({
+    enabled: false,
+    timezone: "UTC",
+    days: DEFAULT_WEEK_SCHEDULE,
+  });
+  const [scheduleSaving, setScheduleSaving] = useState(false);
+  const [scheduleResult, setScheduleResult] = useState<{
+    success?: boolean;
+    message?: string;
+    error?: string;
+  } | null>(null);
 
   // ========================================================================
   // STATE: Scan status
@@ -150,9 +167,39 @@ export default function MacAttackPage() {
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // ========================================================================
+  // FUNCTIONS: Data loading
+  // ========================================================================
+
+  const loadHASettings = useCallback(async () => {
+    try {
+      const res = await fetch("/api/settings");
+      if (res.ok) {
+        const data = (await res.json()) as HASettings & {
+          scheduleEnabled: boolean;
+          scheduleTimezone: string;
+          scheduleDays: ScheduleSettings["days"];
+        };
+        setHaSettings({
+          haUrl: data.haUrl,
+          haToken: data.haToken,
+          haEntityId: data.haEntityId,
+        });
+        setScheduleSettings({
+          enabled: data.scheduleEnabled,
+          timezone: data.scheduleTimezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+          days: data.scheduleDays,
+        });
+        setHaEntityId((current) => current || data.haEntityId);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // ========================================================================
   // EFFECTS: Initial load
   // ========================================================================
-  
+
   // Check for active scan on page load
   useEffect(() => {
     const checkActiveScan = async () => {
@@ -186,27 +233,9 @@ export default function MacAttackPage() {
     };
     
     checkActiveScan();
-    loadHASettings();
-  }, []);
-
-  // ========================================================================
-  // FUNCTIONS: Data loading
-  // ========================================================================
-
-  const loadHASettings = async () => {
-    try {
-      const res = await fetch("/api/settings");
-      if (res.ok) {
-        const data = (await res.json()) as HASettings;
-        setHaSettings(data);
-        if (!haEntityId && data.haEntityId) {
-          setHaEntityId(data.haEntityId);
-        }
-      }
-    } catch {
-      // ignore
-    }
-  };
+    const settingsTimer = setTimeout(() => { void loadHASettings(); }, 0);
+    return () => clearTimeout(settingsTimer);
+  }, [loadHASettings]);
 
   // Poll for scan status updates
   const pollStatus = useCallback(async () => {
@@ -246,7 +275,14 @@ export default function MacAttackPage() {
         clearInterval(pollIntervalRef.current);
       }
       pollIntervalRef.current = setInterval(pollStatus, 1500);
-      pollStatus();
+      const initialPoll = setTimeout(() => { void pollStatus(); }, 0);
+      return () => {
+        clearTimeout(initialPoll);
+        if (pollIntervalRef.current) {
+          clearInterval(pollIntervalRef.current);
+          pollIntervalRef.current = null;
+        }
+      };
     }
     return () => {
       if (pollIntervalRef.current) {
@@ -396,6 +432,32 @@ export default function MacAttackPage() {
     }
   };
 
+  const handleSaveSchedule = async () => {
+    setScheduleSaving(true);
+    setScheduleResult(null);
+    try {
+      const res = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          scheduleEnabled: scheduleSettings.enabled,
+          scheduleTimezone: scheduleSettings.timezone,
+          scheduleDays: scheduleSettings.days,
+        }),
+      });
+      const data = (await res.json()) as { success?: boolean; error?: string };
+      if (!res.ok || !data.success) {
+        setScheduleResult({ error: data.error || "Failed to save schedule" });
+      } else {
+        setScheduleResult({ success: true, message: "Schedule saved successfully" });
+      }
+    } catch (err) {
+      setScheduleResult({ error: err instanceof Error ? err.message : "Failed to save schedule" });
+    } finally {
+      setScheduleSaving(false);
+    }
+  };
+
   const handleTestHA = async () => {
     setHaSaving(true);
     setHaTestResult(null);
@@ -419,6 +481,7 @@ export default function MacAttackPage() {
   // ========================================================================
 
   const isRunning = job?.status === "running";
+  const isScheduledPaused = job?.status === "scheduled_paused";
   const isStopped =
     !job ||
     job.status === "completed" ||
@@ -441,6 +504,7 @@ export default function MacAttackPage() {
       case "completed":
         return "text-green-400";
       case "paused":
+      case "scheduled_paused":
         return "text-yellow-400";
       case "error":
         return "text-red-400";
@@ -577,6 +641,19 @@ export default function MacAttackPage() {
                 </span>
               </div>
             )}
+            {isScheduledPaused && (
+              <div className="flex items-center gap-2 px-3 py-1.5 bg-yellow-900/30 border border-yellow-700/50 rounded-full">
+                <div className="w-2 h-2 bg-yellow-400 rounded-full" />
+                <span className="text-xs text-yellow-300 font-medium">Schedule pause</span>
+              </div>
+            )}
+            <button
+              onClick={() => setShowScheduleSettings(true)}
+              className="px-3 py-1.5 text-sm bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg transition-colors"
+              title="Work schedule settings"
+            >
+              ⏰ Schedule
+            </button>
             <button
               onClick={() => setShowHASettings(true)}
               className="px-3 py-1.5 text-sm bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg transition-colors"
@@ -609,6 +686,19 @@ export default function MacAttackPage() {
             </div>
             <span className="text-xs text-cyan-500">
               You can close this page; the scan will continue
+            </span>
+          </div>
+        </div>
+      )}
+      {isScheduledPaused && (
+        <div className="bg-yellow-900/20 border-b border-yellow-700/30 px-4 py-2">
+          <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-sm text-yellow-300">
+              <span>⏸</span>
+              <span>Outside the allowed work schedule — this scan is paused automatically.</span>
+            </div>
+            <span className="text-xs text-yellow-500">
+              It will resume when the next allowed window opens.
             </span>
           </div>
         </div>
@@ -722,6 +812,131 @@ export default function MacAttackPage() {
                 to your Home Assistant entity via the REST API. The entity state will update in real-time
                 as valid MACs are discovered. When you stop the scan, the entity will reset to 0.
               </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Work Schedule Modal */}
+      {showScheduleSettings && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl max-w-2xl w-full p-6 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h2 className="text-lg font-semibold text-gray-200">⏰ Work Schedule</h2>
+                <p className="text-xs text-gray-500 mt-1">Choose when MacAttack is allowed to scan.</p>
+              </div>
+              <button
+                onClick={() => setShowScheduleSettings(false)}
+                className="text-gray-400 hover:text-gray-200"
+                aria-label="Close schedule settings"
+              >
+                ✕
+              </button>
+            </div>
+
+            <label className="flex items-start gap-3 p-4 bg-gray-800/70 border border-gray-700 rounded-lg cursor-pointer">
+              <input
+                type="checkbox"
+                checked={scheduleSettings.enabled}
+                onChange={(event) => setScheduleSettings((current) => ({ ...current, enabled: event.target.checked }))}
+                className="mt-0.5 w-4 h-4 rounded border-gray-600 text-cyan-500 focus:ring-cyan-500 bg-gray-700"
+              />
+              <span>
+                <span className="block text-sm font-medium text-gray-200">Enable work schedule</span>
+                <span className="block text-xs text-gray-400 mt-1">
+                  {scheduleSettings.enabled
+                    ? "Scans run only during the allowed windows below and pause automatically outside them."
+                    : "Schedule disabled — MacAttack is allowed to run at all times."}
+                </span>
+              </span>
+            </label>
+
+            <div className="mt-4 mb-4 flex flex-col sm:flex-row sm:items-end gap-3">
+              <div className="flex-1">
+                <label htmlFor="schedule-timezone" className="block text-sm font-medium text-gray-300 mb-1.5">
+                  Time zone
+                </label>
+                <input
+                  id="schedule-timezone"
+                  type="text"
+                  value={scheduleSettings.timezone}
+                  onChange={(event) => setScheduleSettings((current) => ({ ...current, timezone: event.target.value }))}
+                  placeholder="Europe/London"
+                  className="w-full px-3 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:border-cyan-500"
+                />
+              </div>
+              <button
+                onClick={() => {
+                  const localTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                  if (localTimezone) setScheduleSettings((current) => ({ ...current, timezone: localTimezone }));
+                }}
+                className="px-3 py-2.5 text-sm bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg transition-colors"
+              >
+                Use my local time zone
+              </button>
+            </div>
+
+            <div className="rounded-lg border border-gray-800 overflow-hidden">
+              <div className="grid grid-cols-[minmax(6rem,1fr)_1fr_1fr] gap-3 bg-gray-800/70 px-4 py-2 text-xs uppercase tracking-wide text-gray-500">
+                <span>Day</span><span>Allowed from</span><span>Allowed until</span>
+              </div>
+              <div className="divide-y divide-gray-800">
+                {WEEKDAYS.map(({ key, label }) => (
+                  <div key={key} className="grid grid-cols-[minmax(6rem,1fr)_1fr_1fr] items-center gap-3 px-4 py-2.5">
+                    <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={scheduleSettings.days[key].enabled}
+                        onChange={(event) => setScheduleSettings((current) => ({
+                          ...current,
+                          days: { ...current.days, [key]: { ...current.days[key], enabled: event.target.checked } },
+                        }))}
+                        className="w-4 h-4 rounded border-gray-600 text-cyan-500 focus:ring-cyan-500 bg-gray-700"
+                      />
+                      {label}
+                    </label>
+                    {(["start", "end"] as const).map((field) => (
+                      <input
+                        key={field}
+                        type="time"
+                        aria-label={`${label} ${field === "start" ? "start" : "end"} time`}
+                        value={scheduleSettings.days[key][field]}
+                        onChange={(event) => setScheduleSettings((current) => ({
+                          ...current,
+                          days: { ...current.days, [key]: { ...current.days[key], [field]: event.target.value } },
+                        }))}
+                        className="w-full px-2.5 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 focus:outline-none focus:border-cyan-500 disabled:opacity-40"
+                      />
+                    ))}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <p className="text-xs text-gray-500 mt-2">
+              Times use the selected time zone. An end time earlier than the start time runs overnight into the next day.
+            </p>
+
+            {scheduleResult && (
+              <div className={`mt-4 p-3 rounded-lg text-sm ${scheduleResult.success ? "bg-green-900/30 border border-green-700/50 text-green-300" : "bg-red-900/30 border border-red-700/50 text-red-300"}`}>
+                {scheduleResult.success ? "✅ " : "❌ "}{scheduleResult.message || scheduleResult.error}
+              </div>
+            )}
+
+            <div className="flex justify-end gap-3 pt-5">
+              <button
+                onClick={() => setShowScheduleSettings(false)}
+                className="py-2.5 px-4 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-sm transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSaveSchedule}
+                disabled={scheduleSaving}
+                className="py-2.5 px-4 bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-700 rounded-lg font-medium text-sm transition-colors"
+              >
+                {scheduleSaving ? "Saving..." : "💾 Save Schedule"}
+              </button>
             </div>
           </div>
         </div>
@@ -979,6 +1194,22 @@ export default function MacAttackPage() {
                 ⚡ Actions
               </h2>
               <div className="space-y-3">
+                <div className="flex items-center justify-between gap-3 p-3 bg-gray-800/60 border border-gray-700/70 rounded-lg">
+                  <div>
+                    <p className="text-sm font-medium text-gray-200">⏰ Work schedule</p>
+                    <p className="text-xs text-gray-400 mt-1">
+                      {scheduleSettings.enabled
+                        ? `Limited hours · ${scheduleSettings.timezone}`
+                        : "Disabled · allowed to run at all times"}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => { setScheduleResult(null); setShowScheduleSettings(true); }}
+                    className="px-3 py-2 text-xs bg-gray-700 hover:bg-gray-600 border border-gray-600 rounded-lg transition-colors"
+                  >
+                    Configure
+                  </button>
+                </div>
                 {isStopped ? (
                   <button
                     onClick={handleStart}

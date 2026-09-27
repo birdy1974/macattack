@@ -245,6 +245,13 @@ Use the filter buttons to show/hide:
 ### 6. Download Results
 Export to CSV or TXT when valid MACs are found.
 
+### 7. Set allowed work hours (optional)
+Open **Schedule** and enable the schedule to choose allowed days and start/end
+hours in an IANA time zone (for example, `Europe/London`). A running scan pauses
+automatically outside those windows and resumes when the next window opens;
+overnight windows are supported by setting the end time earlier than the start.
+Turn off **Enable work schedule** to allow MacAttack to run at all times.
+
 ---
 
 ## 🏠 Home Assistant Integration
