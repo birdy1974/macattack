@@ -70,6 +70,7 @@ export async function GET(request: NextRequest) {
       portalUrl: "Portal URL",
       expireDate: "Expire Date",
       serverLocation: "Server Location",
+      responseTimeMs: "Response Time (ms)",
       tariffPlan: "Tariff Plan",
       maxConnections: "Max Connections",
       activeConnections: "Active Connections",
@@ -96,6 +97,10 @@ export async function GET(request: NextRequest) {
           return result.expireDate || "";
         case "serverLocation":
           return result.serverLocation || "";
+        case "responseTimeMs":
+          return result.responseTimeMs !== null && result.responseTimeMs !== undefined
+            ? String(result.responseTimeMs)
+            : "";
         case "tariffPlan":
           return result.tariffPlan || "";
         case "maxConnections":

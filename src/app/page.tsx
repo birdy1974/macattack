@@ -26,6 +26,21 @@ interface ScanJob {
   haToken: string | null;
   haEntityId: string | null;
   blockSize: number;
+  // Server diagnostics
+  pingMinMs: number | null;
+  pingAvgMs: number | null;
+  pingMaxMs: number | null;
+  pingStdevMs: number | null;
+  pingLossPct: number | null;
+  pingProbes: number | null;
+  pingError: string | null;
+  httpDnsMs: number | null;
+  httpTcpMs: number | null;
+  httpTlsMs: number | null;
+  httpTtfbMs: number | null;
+  httpTotalMs: number | null;
+  httpStatusCode: number | null;
+  serverIp: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -42,6 +57,7 @@ interface ScanResult {
   activeConnections: string | null;
   accountStatus: string | null;
   phoneNumber: string | null;
+  responseTimeMs: number | null;
   timezone: string | null;
   username: string | null;
   password: string | null;
@@ -73,7 +89,8 @@ const AVAILABLE_FIELDS = [
   { key: "macAddress", label: "MAC Address", default: true },
   { key: "portalUrl", label: "Portal URL", default: true },
   { key: "expireDate", label: "Expire Date", default: true },
-  { key: "serverLocation", label: "Server Location", default: false },
+  { key: "serverLocation", label: "Server Location", default: true },
+  { key: "responseTimeMs", label: "Response (ms)", default: true },
   { key: "tariffPlan", label: "Tariff Plan", default: true },
   { key: "maxConnections", label: "Max Connections", default: false },
   { key: "activeConnections", label: "Active Connections", default: false },
@@ -103,6 +120,20 @@ export default function MacAttackPage() {
   );
   const [skipVerification, setSkipVerification] = useState(false);
   const [blockSize, setBlockSize] = useState(8000);
+
+  // ========================================================================
+  // STATE: Filters
+  // ========================================================================
+  const [genreFilterEnabled, setGenreFilterEnabled] = useState(false);
+  const [genreFilterKeywords, setGenreFilterKeywords] = useState(
+    "nl, netherlands, dutch, ned, nederland"
+  );
+  const [genreMatchLive, setGenreMatchLive] = useState(true);
+  const [genreMatchVod, setGenreMatchVod] = useState(true);
+  const [genreMatchSeries, setGenreMatchSeries] = useState(true);
+  const [expireFilterEnabled, setExpireFilterEnabled] = useState(false);
+  const [expireMinDate, setExpireMinDate] = useState<string>("");
+  const [expireIncludeUnlimited, setExpireIncludeUnlimited] = useState(true);
 
   // ========================================================================
   // STATE: Home Assistant
@@ -223,6 +254,30 @@ export default function MacAttackPage() {
             if (data.job.blockSize) {
               setBlockSize(data.job.blockSize);
             }
+            // Restore filter state from the running/completed job so the UI
+            // reflects what was actually used during the scan.
+            const j = data.job as ScanJob & {
+              genreFilterEnabled?: number | boolean;
+              genreFilterKeywords?: string;
+              genreFilterMatchLive?: number | boolean;
+              genreFilterMatchVod?: number | boolean;
+              genreFilterMatchSeries?: number | boolean;
+              expireFilterEnabled?: number | boolean;
+              expireFilterMinDate?: string | null;
+              expireFilterIncludeUnlimited?: number | boolean;
+            };
+            if (j.genreFilterEnabled !== undefined) {
+              setGenreFilterEnabled(Boolean(j.genreFilterEnabled));
+              if (j.genreFilterKeywords) setGenreFilterKeywords(j.genreFilterKeywords);
+              setGenreMatchLive(j.genreFilterMatchLive !== 0 && j.genreFilterMatchLive !== false);
+              setGenreMatchVod(j.genreFilterMatchVod !== 0 && j.genreFilterMatchVod !== false);
+              setGenreMatchSeries(j.genreFilterMatchSeries !== 0 && j.genreFilterMatchSeries !== false);
+            }
+            if (j.expireFilterEnabled !== undefined) {
+              setExpireFilterEnabled(Boolean(j.expireFilterEnabled));
+              if (j.expireFilterMinDate) setExpireMinDate(j.expireFilterMinDate);
+              setExpireIncludeUnlimited(j.expireFilterIncludeUnlimited !== 0 && j.expireFilterIncludeUnlimited !== false);
+            }
           }
         }
       } catch {
@@ -341,6 +396,17 @@ export default function MacAttackPage() {
           haEntityId: haEntityId || haSettings.haEntityId,
           skipVerification,
           blockSize,
+          // Filters
+          genreFilterEnabled,
+          genreFilterKeywords: genreFilterEnabled
+            ? genreFilterKeywords
+            : "",
+          genreFilterMatchLive: genreMatchLive,
+          genreFilterMatchVod: genreMatchVod,
+          genreFilterMatchSeries: genreMatchSeries,
+          expireFilterEnabled,
+          expireFilterMinDate: expireFilterEnabled ? expireMinDate || null : null,
+          expireFilterIncludeUnlimited: expireIncludeUnlimited,
         }),
       });
 
@@ -542,7 +608,27 @@ export default function MacAttackPage() {
   const getFieldValue = (result: ScanResult, field: string): string => {
     const value = result[field as keyof ScanResult];
     if (value === null || value === undefined || value === "") return "—";
+    if (field === "responseTimeMs") {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return "—";
+      return `${Math.round(n)} ms`;
+    }
     return String(value);
+  };
+
+  /** Format a ms value for display, returns "—" if null/undefined. */
+  const fmtMs = (v: number | null | undefined): string => {
+    if (v === null || v === undefined || !Number.isFinite(v)) return "—";
+    return `${Math.round(v)} ms`;
+  };
+
+  /** Color-code a latency value (lower = greener, higher = redder). */
+  const latencyColor = (v: number | null | undefined): string => {
+    if (v === null || v === undefined || !Number.isFinite(v)) return "text-gray-400";
+    if (v < 100) return "text-green-400";
+    if (v < 300) return "text-cyan-400";
+    if (v < 700) return "text-yellow-400";
+    return "text-red-400";
   };
 
   const toggleLogFilter = (level: keyof typeof logFilters) => {
@@ -1143,6 +1229,162 @@ export default function MacAttackPage() {
               </div>
             </div>
 
+            {/* Filters */}
+            <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
+              <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-4">
+                🎚️ Result Filters
+              </h2>
+              <p className="text-xs text-gray-500 mb-4">
+                When disabled (default), every valid MAC is stored. Enable filters to save only MACs that match your criteria.
+              </p>
+
+              {/* Genre/content filter */}
+              <div className="mb-5 p-3 bg-gray-800/50 border border-gray-700/60 rounded-lg">
+                <label className="flex items-start gap-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={genreFilterEnabled}
+                    onChange={(e) => setGenreFilterEnabled(e.target.checked)}
+                    disabled={isRunning}
+                    className="mt-0.5 w-4 h-4 rounded border-gray-600 text-cyan-500 focus:ring-cyan-500 bg-gray-700 disabled:opacity-50"
+                  />
+                  <div className="flex-1">
+                    <span className="text-sm font-medium text-gray-200">
+                      Filter by content category (fuzzy match)
+                    </span>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      Only store MACs whose category list contains any of these keywords (case &amp; accent insensitive, comma-separated).
+                    </p>
+                  </div>
+                </label>
+
+                {genreFilterEnabled && (
+                  <div className="mt-3 space-y-3">
+                    <textarea
+                      value={genreFilterKeywords}
+                      onChange={(e) => setGenreFilterKeywords(e.target.value)}
+                      disabled={isRunning}
+                      rows={2}
+                      placeholder="nl, netherlands, dutch, ned, nederland"
+                      className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:border-cyan-500 disabled:opacity-50 font-mono"
+                    />
+                    <div className="flex flex-wrap gap-3 text-xs text-gray-400">
+                      <span>Match in:</span>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={genreMatchLive}
+                          onChange={(e) => setGenreMatchLive(e.target.checked)}
+                          disabled={isRunning}
+                          className="w-3.5 h-3.5 rounded border-gray-600 text-cyan-500 bg-gray-700"
+                        />
+                        📺 Live TV
+                      </label>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={genreMatchVod}
+                          onChange={(e) => setGenreMatchVod(e.target.checked)}
+                          disabled={isRunning}
+                          className="w-3.5 h-3.5 rounded border-gray-600 text-cyan-500 bg-gray-700"
+                        />
+                        🎬 VOD
+                      </label>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={genreMatchSeries}
+                          onChange={(e) => setGenreMatchSeries(e.target.checked)}
+                          disabled={isRunning}
+                          className="w-3.5 h-3.5 rounded border-gray-600 text-cyan-500 bg-gray-700"
+                        />
+                        🎞️ Series
+                      </label>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Expire-date filter */}
+              <div className="p-3 bg-gray-800/50 border border-gray-700/60 rounded-lg">
+                <label className="flex items-start gap-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={expireFilterEnabled}
+                    onChange={(e) => setExpireFilterEnabled(e.target.checked)}
+                    disabled={isRunning}
+                    className="mt-0.5 w-4 h-4 rounded border-gray-600 text-cyan-500 focus:ring-cyan-500 bg-gray-700 disabled:opacity-50"
+                  />
+                  <div className="flex-1">
+                    <span className="text-sm font-medium text-gray-200">
+                      Only keep MACs expiring on or after:
+                    </span>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      Reject MACs whose subscription expires before this date.
+                    </p>
+                  </div>
+                </label>
+
+                {expireFilterEnabled && (
+                  <div className="mt-3 space-y-3">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="date"
+                        value={expireMinDate}
+                        onChange={(e) => setExpireMinDate(e.target.value)}
+                        disabled={isRunning}
+                        className="px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 focus:outline-none focus:border-cyan-500 disabled:opacity-50"
+                      />
+                      <div className="flex flex-wrap gap-1">
+                        {[
+                          { label: "Today", offset: 0 },
+                          { label: "+1 mo", offset: 30 },
+                          { label: "+3 mo", offset: 90 },
+                          { label: "+6 mo", offset: 180 },
+                          { label: "+1 yr", offset: 365 },
+                        ].map((p) => {
+                          const d = new Date();
+                          d.setDate(d.getDate() + p.offset);
+                          const iso = d.toISOString().slice(0, 10);
+                          return (
+                            <button
+                              key={p.label}
+                              type="button"
+                              onClick={() => setExpireMinDate(iso)}
+                              disabled={isRunning}
+                              className="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 disabled:opacity-50 border border-gray-600 rounded transition-colors"
+                            >
+                              {p.label}
+                            </button>
+                          );
+                        })}
+                        <button
+                          type="button"
+                          onClick={() => setExpireMinDate("")}
+                          disabled={isRunning}
+                          className="px-2 py-1 text-xs bg-gray-800 hover:bg-gray-700 disabled:opacity-50 border border-gray-700 rounded transition-colors"
+                        >
+                          Any date
+                        </button>
+                      </div>
+                    </div>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={expireIncludeUnlimited}
+                        onChange={(e) => setExpireIncludeUnlimited(e.target.checked)}
+                        disabled={isRunning}
+                        className="w-4 h-4 rounded border-gray-600 text-cyan-500 focus:ring-cyan-500 bg-gray-700"
+                      />
+                      <span className="text-xs text-gray-300">
+                        Include <em>unlimited / lifetime</em> accounts (0000-00-00, empty, or far-future dates)
+                      </span>
+                    </label>
+                  </div>
+                )}
+              </div>
+            </div>
+
             {/* Output Fields Selection */}
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
               <div className="flex items-center justify-between mb-4">
@@ -1282,6 +1524,145 @@ export default function MacAttackPage() {
               </div>
             )}
 
+            {/* Network Diagnostics Card */}
+            {job && (job.pingAvgMs !== null || job.httpTotalMs !== null) && (
+              <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
+                <div className="flex items-center justify-between mb-4">
+                  <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">
+                    🌐 Server Diagnostics
+                  </h2>
+                  {job.pingError && (
+                    <span className="text-xs text-yellow-500">
+                      ⚠ {job.pingError}
+                    </span>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+                  <div className="bg-gray-800/60 rounded-lg p-3">
+                    <p className="text-xs text-gray-500 uppercase tracking-wide">
+                      TCP Ping (avg)
+                    </p>
+                    <p className={`text-lg font-mono font-bold ${latencyColor(job.pingAvgMs)}`}>
+                      {fmtMs(job.pingAvgMs)}
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      min {fmtMs(job.pingMinMs)} · max {fmtMs(job.pingMaxMs)}
+                      {job.pingStdevMs !== null ? ` · σ ${Math.round(job.pingStdevMs)}ms` : ""}
+                    </p>
+                  </div>
+
+                  <div className="bg-gray-800/60 rounded-lg p-3">
+                    <p className="text-xs text-gray-500 uppercase tracking-wide">
+                      HTTP Total
+                    </p>
+                    <p className={`text-lg font-mono font-bold ${latencyColor(job.httpTotalMs)}`}>
+                      {fmtMs(job.httpTotalMs)}
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      status{" "}
+                      <span className="text-cyan-400">
+                        {job.httpStatusCode ?? "—"}
+                      </span>
+                    </p>
+                  </div>
+
+                  <div className="bg-gray-800/60 rounded-lg p-3">
+                    <p className="text-xs text-gray-500 uppercase tracking-wide">
+                      Time to First Byte
+                    </p>
+                    <p className={`text-lg font-mono font-bold ${latencyColor(job.httpTtfbMs)}`}>
+                      {fmtMs(job.httpTtfbMs)}
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      server processing + RTT
+                    </p>
+                  </div>
+
+                  <div className="bg-gray-800/60 rounded-lg p-3">
+                    <p className="text-xs text-gray-500 uppercase tracking-wide">
+                      Packet Loss
+                    </p>
+                    <p
+                      className={`text-lg font-mono font-bold ${
+                        job.pingLossPct === null
+                          ? "text-gray-400"
+                          : job.pingLossPct === 0
+                          ? "text-green-400"
+                          : job.pingLossPct < 30
+                          ? "text-yellow-400"
+                          : "text-red-400"
+                      }`}
+                    >
+                      {job.pingLossPct !== null ? `${job.pingLossPct.toFixed(0)}%` : "—"}
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      {job.pingProbes ?? 0} probes
+                      {job.serverIp ? ` · IP ${job.serverIp}` : ""}
+                    </p>
+                  </div>
+                </div>
+
+                {/* HTTP waterfall bar — each phase is a duration in ms. */}
+                {job.httpTotalMs !== null && job.httpTotalMs > 0 && (
+                  <div>
+                    <p className="text-xs text-gray-500 mb-2">HTTP Timing Waterfall</p>
+                    {(() => {
+                      const total = job.httpTotalMs;
+                      const phases: Array<{
+                        key: string;
+                        label: string;
+                        ms: number;
+                        bg: string;
+                        fg: string;
+                      }> = [];
+                      if (job.httpDnsMs && job.httpDnsMs > 0)
+                        phases.push({ key: "dns", label: "DNS", ms: job.httpDnsMs, bg: "bg-blue-700", fg: "text-blue-100" });
+                      if (job.httpTcpMs && job.httpTcpMs > 0)
+                        phases.push({ key: "tcp", label: "TCP", ms: job.httpTcpMs, bg: "bg-purple-700", fg: "text-purple-100" });
+                      if (job.httpTlsMs && job.httpTlsMs > 0)
+                        phases.push({ key: "tls", label: "TLS", ms: job.httpTlsMs, bg: "bg-orange-700", fg: "text-orange-100" });
+                      if (job.httpTtfbMs && job.httpTtfbMs > 0)
+                        phases.push({ key: "ttfb", label: "TTFB", ms: job.httpTtfbMs, bg: "bg-cyan-700", fg: "text-cyan-100" });
+
+                      const accounted = phases.reduce((s, p) => s + p.ms, 0);
+                      const transferMs = Math.max(0, total - accounted);
+                      if (transferMs > 1)
+                        phases.push({ key: "transfer", label: "TX", ms: transferMs, bg: "bg-green-700", fg: "text-green-100" });
+
+                      return (
+                        <>
+                          <div className="flex h-6 w-full rounded overflow-hidden bg-gray-800 text-xs font-mono">
+                            {phases.map((p) => {
+                              const pct = (p.ms / total) * 100;
+                              return (
+                                <div
+                                  key={p.key}
+                                  className={`${p.bg} ${p.fg} flex items-center justify-center`}
+                                  style={{ width: `${pct}%` }}
+                                  title={`${p.label}: ${Math.round(p.ms)}ms`}
+                                >
+                                  {pct > 10 ? `${p.label} ${Math.round(p.ms)}ms` : ""}
+                                </div>
+                              );
+                            })}
+                          </div>
+                          <div className="flex flex-wrap gap-3 mt-2 text-xs text-gray-400">
+                            {phases.map((p) => (
+                              <span key={p.key}>
+                                <span className={`inline-block w-3 h-3 ${p.bg} rounded-sm mr-1 align-middle`} />
+                                {p.label} {Math.round(p.ms)}ms
+                              </span>
+                            ))}
+                          </div>
+                        </>
+                      );
+                    })()}
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Results Table */}
             <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
               <div className="px-5 py-4 border-b border-gray-800 flex items-center justify-between">
@@ -1347,6 +1728,8 @@ export default function MacAttackPage() {
                                   ? "font-mono text-green-400"
                                   : field === "expireDate"
                                   ? "text-yellow-400"
+                                  : field === "responseTimeMs"
+                                  ? `font-mono ${latencyColor(result.responseTimeMs)}`
                                   : "text-gray-300"
                               }`}
                               title={getFieldValue(result, field)}

