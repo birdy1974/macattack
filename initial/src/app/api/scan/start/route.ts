@@ -16,6 +16,15 @@ export async function POST(request: NextRequest) {
       haEntityId?: string;
       skipVerification?: boolean;
       blockSize?: number;
+      // Filters
+      genreFilterEnabled?: boolean;
+      genreFilterKeywords?: string;
+      genreFilterMatchLive?: boolean;
+      genreFilterMatchVod?: boolean;
+      genreFilterMatchSeries?: boolean;
+      expireFilterEnabled?: boolean;
+      expireFilterMinDate?: string | null;
+      expireFilterIncludeUnlimited?: boolean;
     };
 
     const {
@@ -28,6 +37,7 @@ export async function POST(request: NextRequest) {
         "portalUrl",
         "expireDate",
         "serverLocation",
+        "responseTimeMs",
         "tariffPlan",
         "accountStatus",
       ],
@@ -36,6 +46,14 @@ export async function POST(request: NextRequest) {
       haEntityId = "",
       skipVerification = false,
       blockSize = 8000,
+      genreFilterEnabled = false,
+      genreFilterKeywords = "",
+      genreFilterMatchLive = true,
+      genreFilterMatchVod = true,
+      genreFilterMatchSeries = true,
+      expireFilterEnabled = false,
+      expireFilterMinDate = null,
+      expireFilterIncludeUnlimited = true,
     } = body;
 
     if (!portalUrl) {
@@ -60,6 +78,14 @@ export async function POST(request: NextRequest) {
         haToken: haToken || null,
         haEntityId: haEntityId || null,
         blockSize: clampedBlockSize,
+        genreFilterEnabled: genreFilterEnabled ? 1 : 0,
+        genreFilterKeywords: genreFilterKeywords || "",
+        genreFilterMatchLive: genreFilterMatchLive ? 1 : 0,
+        genreFilterMatchVod: genreFilterMatchVod ? 1 : 0,
+        genreFilterMatchSeries: genreFilterMatchSeries ? 1 : 0,
+        expireFilterEnabled: expireFilterEnabled ? 1 : 0,
+        expireFilterMinDate: expireFilterMinDate || null,
+        expireFilterIncludeUnlimited: expireFilterIncludeUnlimited ? 1 : 0,
       })
       .returning();
 
