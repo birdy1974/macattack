@@ -67,10 +67,24 @@ services:
     environment:
       DATABASE_URL: postgresql://macattack:macattack_secret_pw@db:5432/macattack_db
       NODE_ENV: production
+      # Captured stream thumbnails live here (optional ffmpeg pack).
+      MACATTACK_DATA_DIR: /app/data/thumbnails
+    volumes:
+      # Keeps captured thumbnails across container updates. Everything else
+      # works without it; a Docker-managed volume starts writable by the app
+      # user, and if a mount is not writable MacAttack simply skips thumbnails.
+      - mac-attack-data:/app/data
     depends_on:
       db:
         condition: service_healthy
+    # Optional: to enable the picture pack (freeze/black/thumbnails), mount a
+    # host ffmpeg binary and point FFMPEG_PATH at it, e.g. on the Pi:
+    #   volumes:
+    #     - /usr/bin/ffmpeg:/usr/local/bin/ffmpeg:ro
+    # or install it in a derived image. ffmpeg is never bundled.
 
 volumes:
   mac-attack-pgdata:
+    driver: local
+  mac-attack-data:
     driver: local
