@@ -13,6 +13,9 @@ next-env.d.ts
 # Logs
 *.log
 
+# Runtime thumbnail cache (MACATTACK_DATA_DIR default)
+data/thumbnails/
+
 # OS / editor clutter
 .DS_Store
 *.tsbuildinfo

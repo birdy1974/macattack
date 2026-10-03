@@ -29,6 +29,32 @@ a **multi-platform image**:
                                                   └───────────────────┘                 └───────────────────┘
 ```
 
+### What it does beyond finding MACs
+
+* **Measures the streams it finds** — lists the portal's channels, resolves real
+  URLs with `create_link`, and probes a genre-spread sample: sustained throughput
+  vs. required bitrate, resolution/codec/DRM, HLS segment pacing (can the link
+  keep up with real time?), MPEG-TS continuity errors, and a
+  speed / picture / stability score with a verdict.
+* **Optional picture pack (ffmpeg, detected — never bundled)** — freeze and
+  blackdetect, fps/bitrate profiling, and one thumbnail per measured channel.
+  Without ffmpeg everything else still works and the UI says so.
+* **Trust over time** — every measurement is stored as a probe run; results show
+  an EWMA score, an improving/stable/degrading trend, a sparkline and alerts.
+* **Paste work, not click work** — bulk MAC lists, extra portals for a
+  second-chance re-check, capped parallel checks with per-host rate limiting.
+* **Hard evidence flags** — frozen picture, label-vs-reality mismatches ("4K"
+  that delivers 720p), transient retries, catch-up (archive) verification,
+  quality per genre, and where each measurement is limited.
+* **Optional egress proxy** with a validator, **user-agent rotation** with a
+  per-portal memory, **monitoring + alerts**, **stable revocable M3U
+  subscription URLs**, and **Xtream Codes** accounts alongside Stalker.
+
+Everything optional is runtime-detected or explicitly configured; the NAS/Pi
+image needs no extra packages. See
+[`docs/wave-implementation.md`](docs/wave-implementation.md) for the full item
+list, tests and remaining limits.
+
 ---
 
 ## 🚀 Installation on Synology NAS (no compilation!)
@@ -235,6 +261,18 @@ Select which data fields to include in results.
 ### 4. Start Scan
 Click **🚀 Start Scan** and watch the console log.
 
+### 4a. Scan scope: prefix, bulk list, extra portals (optional)
+The **Scan scope** box chooses what gets checked:
+
+* **Enumerate prefix** — the classic behaviour: every MAC in the prefix space.
+* **Bulk MAC list** — paste up to 5,000 addresses (one per line, commas/dashes
+  fine, `portal|mac` pairs accepted). Duplicates are removed and unusable
+  entries are reported after the job is queued.
+* **Additional portals** — one per line. Rejected MACs are retried once against
+  the next portal (round-robin), so a dead server cannot stall a run.
+* **Parallel MAC checks** — 1 (default) up to 8, rate-limited per portal host.
+  Higher values also parallelise the quality check (≤ 4 channel probes at once).
+
 ### 5. Filter Logs
 Use the filter buttons to show/hide:
 - ℹ️ Info messages
@@ -275,13 +313,63 @@ The full reasoning, the scoring model, and a comparison against the wider tool e
 Flux-Stream, Stalker-Portal-Checker, m3u-editor, multicast-checker, …) with the feature gaps we still have
 lives in [`docs/iptv-tool-landscape.md`](docs/iptv-tool-landscape.md).
 
+### 8a. Optional add-ons (Advanced panel)
+Open **🧰 Advanced** in the header:
+
+* **Host capabilities** — whether ffmpeg is available (and where), plus the
+  thumbnail cache location and age. Install ffmpeg in the container/host (or set
+  `FFMPEG_PATH`) to enable picture checks; it is never bundled.
+* **User-agent candidates** — the rotation list tried when a portal refuses the
+  default MAG user agent. The first working one is remembered per portal host.
+* **Proxy pool** — `host:port` or `user:pass@host:port`, up to 50 entries, used
+  for stream probes and quality checks (a second vantage point for suspected
+  geo-blocks). **Validate proxies** connects through each one and records
+  latency.
+* **Monitoring & alerts** — enable *Monitor* on a found MAC to re-check it on an
+  interval; **Run due checks now** executes everything that is due (an external
+  cron can `PUT /api/scan/monitors` instead). Alerts appear on the result.
+* **Xtream Codes** — paste a URL containing `username`/`password`: *Check login*
+  verifies the account, *Check + sample streams* measures live streams with the
+  same engine as Stalker results.
+
+### 8b. Per-result extras
+Each measured result offers **Trend history** (probe runs, EWMA, sparkline),
+**Subscription URL** (a stable, revocable `?token=` M3U URL you can paste into a
+player — links are re-resolved on every fetch) and evidence badges (frozen
+picture, label mismatch, retries, catch-up state, EWMA/trend).
+
 ### 9. Set allowed work hours (optional)
-### 8. Set allowed work hours (optional)
 Open **Schedule** and enable the schedule to choose allowed days and start/end
 hours in an IANA time zone (for example, `Europe/London`). A running scan pauses
 automatically outside those windows and resumes when the next window opens;
 overnight windows are supported by setting the end time earlier than the start.
 Turn off **Enable work schedule** to allow MacAttack to run at all times.
+
+---
+
+## 🧪 Tests
+
+All suites run offline against the bundled fixture server:
+
+```bash
+npm run fixtures        # terminal 1: mock Stalker portal + Xtream API + CONNECT proxy (:4599)
+npm run test:probe      # stream-probe engine, retries, proxy egress
+npm run test:quality    # Stalker → quality pipeline, catch-up, genre groups
+npm run test:xtream     # Xtream Codes login/catalogue/measurement
+npm run test:waves      # pure logic (no server needed)
+```
+
+---
+
+## ⚙️ Optional environment variables
+
+| Variable | Effect |
+|---|---|
+| `FFMPEG_PATH` | Path to `ffmpeg` when it is not on `PATH` (enables picture checks/thumbnails) |
+| `MACATTACK_DATA_DIR` | Where thumbnails are stored (default `./data/thumbnails`, pruned after 14 days) |
+| `MACATTACK_STB_USER_AGENT` | Overrides the default MAG user agent |
+| `MACATTACK_ALLOW_LOCAL_STREAMS=1` | Test escape hatch: allow loopback stream URLs (used by the fixture suites) |
+| `MACATTACK_FREEZE_NOISE`, `MACATTACK_FREEZE_MIN_SEC`, `MACATTACK_BLACK_MIN_SEC` | Tune ffmpeg freeze/black thresholds |
 
 ---
 
@@ -373,13 +461,30 @@ Next.js server — give it a few seconds on first boot.
 │   ├── db/                # Database schema
 │   └── lib/               # Scanner logic
 │       ├── scanner.ts         # MAC enumeration + portal validation
+│       ├── mac-list.ts        # bulk MAC list parsing
+│       ├── proxy.ts           # proxy parsing/validation + CONNECT tunnels
+│       ├── user-agents.ts     # UA rotation candidates + per-host memory
+│       ├── parallel.ts        # capped concurrency + per-host rate limiter
+│       ├── label-mismatch.ts  # "4K" label vs. measured reality
+│       ├── ffmpeg-tools.ts    # optional ffmpeg: freeze/black/fps/thumbnails
+│       ├── thumbnail-store.ts # on-disk thumbnail cache (self-pruning)
+│       ├── quality-history.ts # EWMA / trend / degradation maths
+│       ├── xtream-streams.ts  # Xtream Codes API client
+│       ├── xtream-quality.ts  # Xtream accounts → shared measurement engine
 │       ├── stream-probe.ts    # media-path measurement (HLS/MPEG-TS, no ffmpeg)
 │       ├── stalker-streams.ts # handshake → channels → create_link → M3U
 │       ├── mac-quality.ts     # per-MAC speed/quality/stability check
 │       └── quality-report.ts  # honest, reproducible quality reporting
 ├── docs/
-│   └── iptv-tool-landscape.md # ecosystem deep dive + feature gaps
-├── scripts/               # offline test fixtures and self tests
+│   ├── iptv-tool-landscape.md  # ecosystem deep dive + feature gaps
+│   ├── feature-gap-roadmap.md  # tabular roadmap (all waves implemented)
+│   └── wave-implementation.md  # what shipped, how it is tested, limits
+├── scripts/               # offline fixtures, integration and unit suites
+│   ├── probe-fixtures.mjs     # mock Stalker portal + Xtream API + CONNECT proxy
+│   ├── probe-tests.ts         # probe engine (48 checks)
+│   ├── mac-quality-tests.ts   # Stalker quality pipeline (29 checks)
+│   ├── xtream-tests.ts        # Xtream API path (24 checks)
+│   └── wave-tests.ts          # pure logic: lists, proxies, history, parsers (74 checks)
 └── initial/               # Reference copy of the original local-build version
 ```
 

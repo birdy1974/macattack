@@ -10,6 +10,7 @@
  */
 
 import http from "node:http";
+import net from "node:net";
 
 const PORT = Number(process.argv[2] || process.env.PROBE_FIXTURE_PORT || 4599);
 
@@ -154,7 +155,8 @@ function masterPlaylist(baseUrl, variantPath = "/variant") {
 // ---------------------------------------------------------------------------
 
 const CHANNELS = [
-  { id: "1", name: "News HD", tv_genre_id: "2", cmd: "ffmpeg http://127.0.0.1:PORT/variant/1080/index.m3u8", logo: "" },
+  // Channel 1 advertises a 7-day archive — the catch-up verification path.
+  { id: "1", name: "News HD", tv_genre_id: "2", cmd: "ffmpeg http://127.0.0.1:PORT/variant/1080/index.m3u8", logo: "", tv_archive: 1, tv_archive_duration: 7 },
   { id: "2", name: "Sports FHD", tv_genre_id: "3", cmd: "http://127.0.0.1:PORT/live.ts?seconds=30", logo: "" },
   { id: "3", name: "Movies", tv_genre_id: "4", cmd: "ffmpeg /media/broken.m3u8", logo: "" },
   { id: "4", name: "Kids", tv_genre_id: "2", cmd: "ffmpeg http://127.0.0.1:PORT/vod.m3u8", logo: "" },
@@ -186,6 +188,20 @@ function handlePortal(url, res) {
   }
   if (type === "itv" && action === "create_link") {
     const cmd = url.searchParams.get("cmd") || "";
+    // Archive requests carry a start/end window; a portal that really supports
+    // catch-up answers with a playable past-programme URL.
+    const start = url.searchParams.get("start") || "";
+    if (start) {
+      if (!/variant\/1080/.test(cmd)) {
+        // Portal does not really have an archive for this channel.
+        json(res, { js: { error: "no archive for this channel" } });
+        return true;
+      }
+      json(res, {
+        js: { cmd: `ffmpeg ${cmd.replace("index.m3u8", "archive.m3u8")}` },
+      });
+      return true;
+    }
     if (/broken\.m3u8/.test(cmd)) {
       json(res, { js: { cmd: "ffmpeg http://127.0.0.1:PORT/does-not-exist.m3u8".replace("PORT", String(PORT)) } });
       return true;
@@ -200,8 +216,119 @@ function handlePortal(url, res) {
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// Mock Xtream Codes API (player_api.php + get.php + /live/…)
+// ---------------------------------------------------------------------------
+
+const XTREAM_USERS = {
+  demo: { password: "demo-pass", status: "Active", live: 3, expiry: "2030-12-31" },
+  expired: { password: "old-pass", status: "Expired", live: 0, expiry: "2020-01-01" },
+};
+
+const XTREAM_CATEGORIES = [
+  { category_id: "10", category_name: "NL | News", parent_id: 0 },
+  { category_id: "11", category_name: "NL | Sports", parent_id: 0 },
+];
+
+const XTREAM_STREAMS = [
+  { num: 1, name: "News HD", stream_id: 101, stream_icon: "", category_id: "10", tv_archive: 1, tv_archive_duration: 7 },
+  { num: 2, name: "Sports FHD", stream_id: 102, stream_icon: "", category_id: "11", tv_archive: 0, tv_archive_duration: 0 },
+  { num: 3, name: "Movies 4K", stream_id: 103, stream_icon: "", category_id: "10", tv_archive: 0, tv_archive_duration: 0 },
+];
+
+function xtreamAuth(url) {
+  const username = url.searchParams.get("username") || "";
+  const password = url.searchParams.get("password") || "";
+  const user = XTREAM_USERS[username];
+  if (!user || user.password !== password) return null;
+  return { username, user };
+}
+
+function handleXtream(url, res) {
+  const auth = xtreamAuth(url);
+  const action = url.searchParams.get("action") || "";
+
+  if (url.pathname === "/get.php" || url.searchParams.get("type")) {
+    if (!auth) {
+      res.writeHead(401, { "Content-Type": "text/plain" });
+      res.end("unauthorised");
+      return true;
+    }
+    res.writeHead(200, { "Content-Type": "audio/x-mpegurl" });
+    res.end(
+      ["#EXTM3U", ...XTREAM_STREAMS.map((stream) => `#EXTINF:-1,${stream.name}\n${`http://127.0.0.1:${PORT}/live/${auth.username}/${url.searchParams.get("password")}/${stream.stream_id}.ts`}`)].join(
+        "\n"
+      )
+    );
+    return true;
+  }
+
+  if (!auth) {
+    json(res, { user_info: { auth: 0, status: "Disabled" } });
+    return true;
+  }
+
+  const { username, user } = auth;
+  const userInfo = {
+    username,
+    auth: 1,
+    status: user.status,
+    exp_date: user.expiry,
+    max_connections: "2",
+    active_cons: "1",
+    is_trial: "0",
+  };
+
+  if (action === "get_live_categories") {
+    json(res, XTREAM_CATEGORIES);
+    return true;
+  }
+  if (action === "get_live_streams") {
+    json(res, XTREAM_STREAMS);
+    return true;
+  }
+  if (action === "get_vod_categories" || action === "get_series_categories") {
+    json(res, []);
+    return true;
+  }
+
+  json(res, { user_info: userInfo, server_info: { url: "127.0.0.1", port: String(PORT) } });
+  return true;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const flakyCounters = new Map();
+
+// A deliberately tiny CONNECT proxy so the proxy egress path can be tested
+// offline: the fixture server both hosts the streams and forwards tunnels to
+// itself (or anywhere else on the loopback interface).
+function handleConnect(req, clientSocket, head) {
+  if (process.env.PROBE_FIXTURE_DEBUG) console.log("[fixture] CONNECT", req.url);
+  const [host, portRaw] = String(req.url || "").split(":");
+  const port = Number(portRaw) || 80;
+  if (!host) {
+    clientSocket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+    return;
+  }
+  if (/^127\.0\.0\.1:(1|2)$/.test(`${host}:${port}`)) {
+    // Simulated dead proxy target, used to assert honest failure reporting.
+    clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+    return;
+  }
+  const upstream = net.connect({ host, port }, () => {
+    clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    if (head && head.length > 0) upstream.write(head);
+    upstream.pipe(clientSocket);
+    clientSocket.pipe(upstream);
+  });
+  upstream.on("error", (err) => {
+    if (process.env.PROBE_FIXTURE_DEBUG) console.log("[fixture] upstream error", err.message);
+    clientSocket.destroy();
+  });
+  clientSocket.on("error", () => upstream.destroy());
 }
 
 const server = http.createServer(async (req, res) => {
@@ -217,6 +344,42 @@ const server = http.createServer(async (req, res) => {
       if (handlePortal(realUrl, res)) return;
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "unknown action" }));
+      return;
+    }
+
+    if (path === "/player_api.php" || path === "/panel_api.php" || path === "/get.php") {
+      if (handleXtream(url, res)) return;
+    }
+
+    // Transient-failure fixtures: /flaky-<failures>[-<seed>].m3u8 fails the
+    // first <failures> requests with 503, then serves a normal playlist.
+    // The seed keeps repeated test runs independent.
+    const flaky = /^\/flaky-(\d+)(?:-(\d+))?\.m3u8$/.exec(path);
+    if (flaky) {
+      const failures = Number(flaky[1]);
+      const key = path;
+      const hits = (flakyCounters.get(key) || 0) + 1;
+      flakyCounters.set(key, hits);
+      if (hits <= failures) {
+        res.writeHead(503, { "Content-Type": "text/plain", "Retry-After": "1" });
+        res.end("temporarily unavailable");
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/vnd.apple.mpegurl" });
+      res.end(mediaPlaylist(origin, { count: 4 }));
+      return;
+    }
+
+    if (path === "/flaky-always.m3u8") {
+      res.writeHead(503, { "Content-Type": "text/plain", "Retry-After": "1" });
+      res.end("temporarily unavailable");
+      return;
+    }
+
+    if (/^\/variant\/\d+\/archive\.m3u8$/.test(path)) {
+      const variantBase = path.replace("/archive.m3u8", "");
+      res.writeHead(200, { "Content-Type": "application/vnd.apple.mpegurl" });
+      res.end(mediaPlaylist(`${origin}${variantBase}`, { count: 3, endlist: true }));
       return;
     }
 
@@ -314,6 +477,34 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (/^\/live\/[^/]+\/[^/]+\/\d+\.(ts|m3u8)$/.test(path)) {
+      // Xtream live stream: TS served live-ish so the same probe engine applies.
+      if (path.endsWith(".m3u8")) {
+        res.writeHead(200, { "Content-Type": "application/vnd.apple.mpegurl" });
+        res.end(mediaPlaylist(`${origin}/xtream-seg`, { count: 4 }));
+        return;
+      }
+      const mbps = 3.2;
+      const totalSeconds = Number(url.searchParams.get("seconds") || 20);
+      const body = buildTransportStream({ seconds: totalSeconds, mbps });
+      res.writeHead(200, { "Content-Type": "video/mp2t", "Cache-Control": "no-cache" });
+      const bytesPerSecond = (mbps * 1_000_000) / 8;
+      const chunkSize = Math.round(bytesPerSecond / 4);
+      for (let offset = 0; offset < body.length; offset += chunkSize) {
+        res.write(body.subarray(offset, offset + chunkSize));
+        await sleep(250);
+      }
+      res.end();
+      return;
+    }
+
+    if (/^\/xtream-seg\/seg\/seg\d+\.ts$/.test(path)) {
+      const body = buildTransportStream({ seconds: SEGMENT_SECONDS, mbps: 3.2 });
+      res.writeHead(200, { "Content-Type": "video/mp2t", "Content-Length": String(body.length) });
+      res.end(body);
+      return;
+    }
+
     if (path === "/live.ts") {
       // Live-ish TS stream paced at real time, with a sprinkling of CC errors.
       const mbps = 4;
@@ -355,6 +546,8 @@ const server = http.createServer(async (req, res) => {
     res.end(String(error));
   }
 });
+
+server.on("connect", handleConnect);
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`probe fixture server listening on http://127.0.0.1:${PORT}`);

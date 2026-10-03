@@ -63,6 +63,17 @@ export async function GET(request: NextRequest) {
         qualityChannelsPlayable: scanResults.qualityChannelsPlayable,
         qualityChannelsProbed: scanResults.qualityChannelsProbed,
         qualityCheckedAt: scanResults.qualityCheckedAt,
+        qualityFrozen: scanResults.qualityFrozen,
+        qualityLabelMismatch: scanResults.qualityLabelMismatch,
+        qualityRetries: scanResults.qualityRetries,
+        qualityThroughputCv: scanResults.qualityThroughputCv,
+        qualityCatchUpStatus: scanResults.qualityCatchUpStatus,
+        qualityCatchUpDays: scanResults.qualityCatchUpDays,
+        qualityThumbnail: scanResults.qualityThumbnail,
+        qualityEwma: scanResults.qualityEwma,
+        qualityTrend: scanResults.qualityTrend,
+        qualityGenreSummary: scanResults.qualityGenreSummary,
+        protocol: scanResults.protocol,
         foundAt: scanResults.foundAt,
       })
       .from(scanResults)

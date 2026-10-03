@@ -25,6 +25,8 @@
 import http from "node:http";
 import https from "node:https";
 import { STB_USER_AGENT } from "@/lib/stream-probe";
+import { buildUserAgentCandidates } from "@/lib/user-agents";
+import { type ProxyConfig, openProxyTunnel, tlsOverTunnel } from "@/lib/proxy";
 
 export interface StalkerClientOptions {
   /** e.g. http://host:port/server/load.php (or .../portal.php) */
@@ -34,6 +36,14 @@ export interface StalkerClientOptions {
   mac: string;
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** User agent actually used for every request (set by the handshake rotation). */
+  userAgent?: string | null;
+  /** Ordered UA candidates tried by the handshake when rotation is enabled. */
+  userAgentCandidates?: string[] | null;
+  /** Optional HTTP CONNECT proxy for the portal API calls. */
+  proxy?: ProxyConfig | null;
+  /** Stable per-portal serial number sent with requests (fingerprinting). */
+  serialNumber?: string | null;
 }
 
 export interface StalkerChannel {
@@ -43,6 +53,12 @@ export interface StalkerChannel {
   logo: string | null;
   /** Raw `cmd` value as returned by the portal (may be a URL or a portal path). */
   cmd: string | null;
+  /** Portal says catch-up/archive is available for this channel. */
+  tvArchive: boolean;
+  /** Archive depth in days as advertised by the portal (0 = unknown/none). */
+  tvArchiveDays: number | null;
+  /** Raw item kept so create_link can consult flags like use_http_tmp_link. */
+  raw?: Record<string, unknown>;
 }
 
 export interface StalkerStreamLink {
@@ -86,8 +102,43 @@ async function stalkerRequest(
   params: Record<string, string>
 ): Promise<StalkerResponse> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const url = buildUrl(options.serverPath, { ...params, JsHttpRequest: "1-xml" });
-  const transport = url.toLowerCase().startsWith("https:") ? https : http;
+  const url = buildUrl(options.serverPath, {
+    ...params,
+    JsHttpRequest: "1-xml",
+    ...(options.serialNumber ? { sn: options.serialNumber } : {}),
+  });
+  const isTls = url.toLowerCase().startsWith("https:");
+  const transport = isTls ? https : http;
+  const userAgent = options.userAgent || STB_USER_AGENT;
+
+  // Optional proxy: pre-open the CONNECT tunnel (DNS happens at the proxy).
+  let tunneledSocket: import("node:net").Socket | null = null;
+  if (options.proxy) {
+    try {
+      const target = new URL(url);
+      const tunnel = await openProxyTunnel(
+        options.proxy,
+        target.hostname,
+        Number(target.port || (isTls ? 443 : 80)),
+        timeoutMs
+      );
+      tunneledSocket = isTls ? tlsOverTunnel(tunnel, target.hostname) : tunnel.socket;
+      if (isTls) {
+        await new Promise<void>((resolve, reject) => {
+          const secure = tunneledSocket as import("node:tls").TLSSocket;
+          secure.once("secureConnect", () => resolve());
+          secure.once("error", (error: Error) => reject(error));
+        });
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        statusCode: null,
+        payload: null,
+        error: error instanceof Error ? error.message : "Proxy tunnel failed",
+      };
+    }
+  }
 
   return new Promise((resolve) => {
     if (options.signal?.aborted) {
@@ -107,11 +158,17 @@ async function stalkerRequest(
       request = transport.get(
         url,
         {
+          ...(tunneledSocket
+            ? { agent: false, createConnection: () => tunneledSocket as import("node:net").Socket }
+            : {}),
           headers: {
-            "User-Agent": STB_USER_AGENT,
-            "X-User-Agent": "Model: MAG250; Link: WiFi",
+            "User-Agent": userAgent,
+            "X-User-Agent": options.userAgent?.includes("MAG")
+              ? "Model: MAG250; Link: WiFi"
+              : "Model: MAG254; Link: Ethernet",
             Accept: "*/*",
             "Accept-Encoding": "identity",
+            ...(options.serialNumber ? { SN: options.serialNumber, "X-Serial-Number": options.serialNumber } : {}),
             Cookie: `mac=${options.mac}; stb_lang=en; timezone=${STB_REQUEST_TIMEZONE}`,
           },
         },
@@ -177,16 +234,40 @@ async function stalkerRequest(
 export interface HandshakeResult {
   token: string | null;
   error: string | null;
+  /** User agent that worked (persist it per portal host — UA rotation). */
+  userAgent: string | null;
+  /** How many UA candidates were tried before one worked. */
+  attempts: number;
 }
 
 export async function stalkerHandshake(options: StalkerClientOptions): Promise<HandshakeResult> {
-  const response = await stalkerRequest(options, { type: "stb", action: "handshake" });
-  if (!response.ok) return { token: null, error: response.error };
+  const candidates = options.userAgentCandidates?.length
+    ? options.userAgentCandidates
+    : buildUserAgentCandidates(options.userAgent ?? null, null);
 
-  const payload = response.payload as { token?: string } | null;
-  const token = payload?.token;
-  if (!token) return { token: null, error: "Handshake returned no token" };
-  return { token, error: null };
+  const errors: string[] = [];
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    const response = await stalkerRequest({ ...options, userAgent: candidate }, { type: "stb", action: "handshake" });
+    if (response.ok) {
+      const payload = response.payload as { token?: string } | null;
+      if (payload?.token) {
+        return { token: payload.token, error: null, userAgent: candidate, attempts: index + 1 };
+      }
+      errors.push(`UA ${index + 1}: handshake returned no token`);
+      continue;
+    }
+    errors.push(`UA ${index + 1}: ${response.error}`);
+    // An explicit "aborted" must not trigger more attempts.
+    if (options.signal?.aborted) break;
+  }
+
+  return {
+    token: null,
+    error: errors.length > 0 ? errors.join(" · ") : "Handshake failed",
+    userAgent: null,
+    attempts: candidates.length,
+  };
 }
 
 // ============================================================================
@@ -222,13 +303,28 @@ function extractChannelItems(payload: unknown): Array<Record<string, unknown>> {
   return [];
 }
 
+function pickBoolean(record: Record<string, unknown>, keys: string[]): boolean {
+  for (const key of keys) {
+    const value = record[key];
+    if (value === true) return true;
+    if (typeof value === "number") return value !== 0;
+    if (typeof value === "string") return value !== "" && value !== "0" && value.toLowerCase() !== "false";
+  }
+  return false;
+}
+
 function toChannel(item: Record<string, unknown>): StalkerChannel {
+  const archiveDaysRaw = pickString(item, ["tv_archive_duration", "archive_duration"]);
+  const archiveDays = archiveDaysRaw !== null && Number.isFinite(Number(archiveDaysRaw)) ? Number(archiveDaysRaw) : null;
   return {
-    id: pickString(item, ["id", "channel_id", "ch_id"]) ,
+    id: pickString(item, ["id", "channel_id", "ch_id"]),
     name: pickString(item, ["name", "title", "tv_name"]) || "(unnamed channel)",
     genreId: pickString(item, ["tv_genre_id", "genre_id", "genre"]),
     logo: pickString(item, ["logo", "tv_logo", "icon"]),
     cmd: pickString(item, ["cmd", "stream_url", "url"]),
+    tvArchive: pickBoolean(item, ["tv_archive", "tv_archive_available"]),
+    tvArchiveDays: archiveDays,
+    raw: item,
   };
 }
 
@@ -236,6 +332,25 @@ export interface ChannelListResult {
   channels: StalkerChannel[];
   source: "get_all_channels" | "ordered_list" | "none";
   error: string | null;
+  /** genreId → title, when the portal exposes genre names. */
+  genreTitles: Record<string, string>;
+}
+
+/** Fetch genre titles (used for grouping and for the genre filter UI). */
+export async function stalkerGenreTitles(
+  options: StalkerClientOptions,
+  token: string,
+  type: "itv" | "vod" | "series" = "itv"
+): Promise<Record<string, string>> {
+  const response = await stalkerRequest(options, { type, action: "get_genres", token });
+  if (!response.ok) return {};
+  const titles: Record<string, string> = {};
+  for (const item of extractChannelItems(response.payload)) {
+    const id = pickString(item, ["id", "genre_id", "tv_genre_id"]);
+    const title = pickString(item, ["title", "name"]);
+    if (id && title) titles[id] = title;
+  }
+  return titles;
 }
 
 /**
@@ -258,6 +373,7 @@ export async function stalkerListChannels(
         channels: items.slice(0, maxChannels).map(toChannel),
         source: "get_all_channels",
         error: null,
+        genreTitles: await stalkerGenreTitles(options, token, "itv"),
       };
     }
   }
@@ -269,10 +385,17 @@ export async function stalkerListChannels(
       channels: [],
       source: "none",
       error: genresResponse.error || all.error || "No channel list available",
+      genreTitles: {},
     };
   }
 
   const genreItems = extractChannelItems(genresResponse.payload);
+  const genreTitles: Record<string, string> = {};
+  for (const genre of genreItems) {
+    const id = pickString(genre, ["id", "genre_id", "tv_genre_id"]);
+    const title = pickString(genre, ["title", "name"]);
+    if (id && title) genreTitles[id] = title;
+  }
   const channels: StalkerChannel[] = [];
   const seen = new Set<string>();
 
@@ -306,6 +429,7 @@ export async function stalkerListChannels(
     channels,
     source: channels.length > 0 ? "ordered_list" : "none",
     error: channels.length > 0 ? null : "No channels returned by get_all_channels or get_ordered_list",
+    genreTitles,
   };
 }
 
@@ -435,6 +559,107 @@ export function selectChannelsForProbe(channels: StalkerChannel[], count: number
     add(channel);
   }
   return selected.slice(0, count);
+}
+
+// ============================================================================
+// SERIAL NUMBER FINGERPRINT
+// ============================================================================
+
+/**
+ * Stable per-(MAC, portal host) serial number. Portals that share middleware
+ * behind several hostnames report the same device signature, which is how two
+ * "different" portals can be recognised as one system (kiddac's S/N idea).
+ */
+export function computeSerialNumber(mac: string, serverPath: string): string {
+  const host = (() => {
+    try {
+      return new URL(serverPath).hostname.toLowerCase();
+    } catch {
+      return serverPath.toLowerCase();
+    }
+  })();
+  let hash = 0x811c9dc5;
+  const input = `${mac.toUpperCase()}|${host}`;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  const base = hash.toString(16).toUpperCase().padStart(8, "0");
+  const macPart = mac.replace(/[^0-9A-Fa-f]/g, "").toUpperCase().slice(-6).padStart(6, "0");
+  return `${base}${macPart}0`.slice(0, 13);
+}
+
+// ============================================================================
+// CATCH-UP / ARCHIVE (IPTVChecker's "verify catch-up actually works")
+// ============================================================================
+
+export interface CatchUpProbe {
+  channel: StalkerChannel;
+  advertisedDays: number | null;
+  /** URL for the requested archive window (may be identical to the live URL). */
+  url: string | null;
+  /** True when the portal returned a link that is clearly different from live. */
+  linkResolved: boolean;
+  error: string | null;
+}
+
+function formatArchiveTime(date: Date): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return (
+    `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ` +
+    `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`
+  );
+}
+
+/**
+ * Ask the portal for an archive (catch-up) link for a channel.
+ * `minutesAgo` selects the window: 60 = the last hour, larger values probe how
+ * far back the archive really goes.
+ */
+export async function stalkerResolveArchiveLink(
+  options: StalkerClientOptions,
+  token: string,
+  channel: StalkerChannel,
+  minutesAgo: number
+): Promise<CatchUpProbe> {
+  const advertisedDays = channel.tvArchiveDays ?? null;
+  if (!channel.cmd) {
+    return { channel, advertisedDays, url: null, linkResolved: false, error: "Channel has no cmd" };
+  }
+
+  const end = new Date(Date.now() - Math.max(1, minutesAgo) * 60 * 1000);
+  const start = new Date(end.getTime() - 30 * 60 * 1000);
+
+  const response = await stalkerRequest(options, {
+    type: "itv",
+    action: "create_link",
+    cmd: channel.cmd,
+    series: "",
+    forced_storage: "",
+    disable_ad: "1",
+    download: "0",
+    start: formatArchiveTime(start),
+    end: formatArchiveTime(end),
+    token,
+  });
+
+  if (!response.ok) {
+    return { channel, advertisedDays, url: null, linkResolved: false, error: response.error || "create_link failed" };
+  }
+
+  const payload = asRecord(response.payload);
+  const resolved = pickString(payload ?? {}, ["cmd", "url", "link", "stream_url"]) || null;
+  const url = extractStreamUrl(resolved);
+  const liveUrl = extractStreamUrl(channel.cmd);
+
+  return {
+    channel,
+    advertisedDays,
+    url,
+    // A portal that "supports" catch-up but hands back the live URL is faking it.
+    linkResolved: !!url && (!liveUrl || url !== liveUrl || /start=|utc=|archive/i.test(resolved ?? "")),
+    error: url ? null : "No archive URL returned",
+  };
 }
 
 // ============================================================================

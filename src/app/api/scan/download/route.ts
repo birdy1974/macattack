@@ -97,6 +97,15 @@ export async function GET(request: NextRequest) {
       qualityRequiredMbps: "Stream Required Bitrate (Mbps)",
       qualityChannels: "Stream Channels Playable/Probed",
       qualityMeasured: "Stream Quality Measured At",
+      qualityRetries: "Stream Retries (transient)",
+      qualityFrozen: "Stream Frozen Picture Detected",
+      qualityLabelMismatch: "Stream Label Mismatch",
+      qualityCatchUp: "Stream Catch-Up (archive) Check",
+      qualityThumbnail: "Stream Thumbnail URL",
+      qualityEwma: "Stream Score EWMA (history)",
+      qualityTrend: "Stream Score Trend (history)",
+      qualityGenres: "Stream Quality by Genre (measured)",
+      protocol: "Account Protocol",
       tariffPlan: "Tariff Plan",
       maxConnections: "Max Connections",
       activeConnections: "Active Connections",
@@ -181,6 +190,42 @@ export async function GET(request: NextRequest) {
             : "";
         case "qualityMeasured":
           return result.qualityCheckedAt ? result.qualityCheckedAt.toISOString() : "";
+        case "qualityRetries":
+          return result.qualityRetries !== null && result.qualityRetries !== undefined
+            ? String(result.qualityRetries)
+            : "";
+        case "qualityFrozen":
+          return result.qualityFrozen === 1 ? "yes" : result.qualityFrozen === 0 ? "no" : "";
+        case "qualityLabelMismatch":
+          return result.qualityLabelMismatch || "";
+        case "qualityCatchUp": {
+          if (!result.qualityCatchUpStatus) return "";
+          const days = result.qualityCatchUpDays;
+          return days && days >= 1
+            ? `${result.qualityCatchUpStatus} (${days.toFixed(1)} day(s))`
+            : result.qualityCatchUpStatus;
+        }
+        case "qualityThumbnail":
+          return result.qualityThumbnail
+            ? `/api/scan/thumbnail?name=${encodeURIComponent(result.qualityThumbnail)}`
+            : "";
+        case "qualityEwma":
+          return result.qualityEwma !== null && result.qualityEwma !== undefined
+            ? String(result.qualityEwma)
+            : "";
+        case "qualityTrend":
+          return result.qualityTrend || "";
+        case "qualityGenres": {
+          const groups = (result.qualityGenreSummary as Array<{ genreTitle: string; averageOverall: number | null; channelsPlayable: number; channelsProbed: number }> | null) || [];
+          return groups
+            .map(
+              (group) =>
+                `${group.genreTitle}: ${group.averageOverall ?? "—"}/10 (${group.channelsPlayable}/${group.channelsProbed} playable)`
+            )
+            .join(" · ");
+        }
+        case "protocol":
+          return result.protocol || "stalker";
         case "tariffPlan":
           return result.tariffPlan || "";
         case "maxConnections":

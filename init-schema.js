@@ -166,6 +166,16 @@ async function createSchema() {
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS quality_check_enabled INTEGER NOT NULL DEFAULT 1",
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS quality_channels INTEGER NOT NULL DEFAULT 3",
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS quality_sample_ms INTEGER NOT NULL DEFAULT 8000",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS portal_urls JSONB",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS scan_mode TEXT NOT NULL DEFAULT 'prefix'",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS mac_list JSONB",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS concurrency INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ua_rotation_enabled INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS picture_checks_enabled INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS thumbnails_enabled INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS catch_up_check_enabled INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS xtream_username TEXT",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS xtream_password TEXT",
     ];
     var resultAlters = [
       "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS response_time_ms INTEGER",
@@ -187,12 +197,60 @@ async function createSchema() {
       "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_channels_probed INTEGER",
       "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_checked_at TIMESTAMP",
       "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_report JSONB",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_frozen INTEGER",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_label_mismatch TEXT",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_retries INTEGER",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_throughput_cv REAL",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_catch_up_status TEXT",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_catch_up_days REAL",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_thumbnail TEXT",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_ewma REAL",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_trend TEXT",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_genre_summary JSONB",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS protocol TEXT NOT NULL DEFAULT 'stalker'",
+    ];
+    var tableDdl = [
+      "CREATE TABLE IF NOT EXISTS quality_probe_runs (" +
+        " id SERIAL PRIMARY KEY," +
+        " result_id INTEGER NOT NULL REFERENCES scan_results(id) ON DELETE CASCADE," +
+        " job_id INTEGER, mac_address TEXT NOT NULL," +
+        " measured_at TIMESTAMP NOT NULL DEFAULT NOW()," +
+        " overall_score REAL, speed_score REAL, quality_score REAL, stability_score REAL," +
+        " verdict TEXT, throughput_mbps REAL, required_mbps REAL," +
+        " channels_playable INTEGER, channels_probed INTEGER," +
+        " frozen INTEGER DEFAULT 0, label_mismatches INTEGER DEFAULT 0," +
+        " via_proxy TEXT, source TEXT NOT NULL DEFAULT 'scan'," +
+        " created_at TIMESTAMP NOT NULL DEFAULT NOW())",
+      "CREATE INDEX IF NOT EXISTS quality_probe_runs_result_idx ON quality_probe_runs (result_id, measured_at)",
+      "CREATE TABLE IF NOT EXISTS playlist_tokens (" +
+        " id SERIAL PRIMARY KEY," +
+        " result_id INTEGER NOT NULL REFERENCES scan_results(id) ON DELETE CASCADE," +
+        " token TEXT NOT NULL UNIQUE, limit_count INTEGER NOT NULL DEFAULT 200," +
+        " revoked INTEGER NOT NULL DEFAULT 0, fetch_count INTEGER NOT NULL DEFAULT 0," +
+        " last_fetched_at TIMESTAMP, created_at TIMESTAMP NOT NULL DEFAULT NOW())",
+      "CREATE TABLE IF NOT EXISTS monitors (" +
+        " id SERIAL PRIMARY KEY," +
+        " result_id INTEGER NOT NULL REFERENCES scan_results(id) ON DELETE CASCADE," +
+        " enabled INTEGER NOT NULL DEFAULT 1, interval_minutes INTEGER NOT NULL DEFAULT 360," +
+        " alert_on TEXT NOT NULL DEFAULT 'degrading,poor,unusable'," +
+        " channels INTEGER NOT NULL DEFAULT 3, sample_ms INTEGER NOT NULL DEFAULT 8000," +
+        " last_run_at TIMESTAMP, last_verdict TEXT, last_score REAL, last_trend TEXT," +
+        " last_alert_at TIMESTAMP, last_alert_reason TEXT," +
+        " created_at TIMESTAMP NOT NULL DEFAULT NOW())",
+      "CREATE TABLE IF NOT EXISTS proxies (" +
+        " id SERIAL PRIMARY KEY, value TEXT NOT NULL, display TEXT NOT NULL," +
+        " enabled INTEGER NOT NULL DEFAULT 1, last_ok INTEGER, last_latency_ms INTEGER," +
+        " last_error TEXT, last_checked_at TIMESTAMP," +
+        " created_at TIMESTAMP NOT NULL DEFAULT NOW())",
     ];
     for (var i = 0; i < jobAlters.length; i++) {
       try { await pool.query(jobAlters[i]); } catch (e) { /* ignore */ }
     }
     for (var j = 0; j < resultAlters.length; j++) {
       try { await pool.query(resultAlters[j]); } catch (e) { /* ignore */ }
+    }
+    for (var k = 0; k < tableDdl.length; k++) {
+      try { await pool.query(tableDdl[k]); } catch (e) { /* ignore */ }
     }
   } catch (err) {
     console.log("[init-schema] Schema note: " + err.message);

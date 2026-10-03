@@ -132,6 +132,42 @@ async function main() {
     check("geoblock warning", result.warnings.some((item) => /geoblock/i.test(item)), result.warnings);
   }
 
+  // ── 10. Retry / backoff on transient statuses (Wave 1) ──────────────────
+  {
+    console.log("\n[10] Transient 503 retry (backoff)");
+    const seed = Date.now() % 100000;
+    const result = await probeStream(`${BASE}/flaky-2-${seed}.m3u8`, { sampleMs: 3000, timeoutMs: 3000, maxRetries: 3 });
+    check("eventually measured after retries", result.status === "measured", result.status);
+    check("retry counter is reported", result.retryCount >= 2, String(result.retryCount));
+    check("retry is explained in notes", result.notes.some((item) => /retr/i.test(item)), result.notes);
+    const noRetry = await probeStream(`${BASE}/flaky-always.m3u8`, { sampleMs: 3000, timeoutMs: 3000, maxRetries: 0 });
+    check("maxRetries=0 gives up immediately", noRetry.retryCount === 0 && noRetry.status !== "measured", {
+      status: noRetry.status,
+      retries: noRetry.retryCount,
+    });
+  }
+
+  // ── 11. Proxy egress (Wave 2) ───────────────────────────────────────────
+  {
+    console.log("\n[11] Proxy egress through the fixture CONNECT proxy");
+    const viaProxy = await probeStream(`${BASE}/live.ts?seconds=6`, {
+      sampleMs: 3000,
+      timeoutMs: 4000,
+      proxy: { host: "127.0.0.1", port: PORT, username: null, password: null, raw: `127.0.0.1:${PORT}` },
+    });
+    check("proxied stream is measured", viaProxy.status === "measured", { status: viaProxy.status, errors: viaProxy.errors });
+    check("proxy is recorded on the result", viaProxy.viaProxy === `127.0.0.1:${PORT}`, viaProxy.viaProxy);
+    check("proxied bytes flowed", viaProxy.bytesRead > 100000, viaProxy.bytesRead);
+
+    const deadProxy = await probeStream(`${BASE}/live.ts?seconds=4`, {
+      sampleMs: 2000,
+      timeoutMs: 2000,
+      proxy: { host: "127.0.0.1", port: 1, username: null, password: null, raw: "127.0.0.1:1" },
+    });
+    check("dead proxy is reported honestly", deadProxy.status === "network_error", deadProxy.status);
+    check("dead proxy error names the proxy", deadProxy.errors.some((line) => /proxy/i.test(line)), deadProxy.errors);
+  }
+
   console.log(`\n${checks - failures}/${checks} checks passed`);
   if (failures > 0) process.exit(1);
 }

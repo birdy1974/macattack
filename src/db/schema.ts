@@ -11,6 +11,14 @@ import {
 export const scanJobs = pgTable("scan_jobs", {
   id: serial("id").primaryKey(),
   portalUrl: text("portal_url").notNull(),
+  /** Additional portals for a multi-portal run (portalUrl is the first). */
+  portalUrls: jsonb("portal_urls").$type<string[]>(),
+  /** "prefix" (enumerate a MAC prefix) or "list" (check a supplied MAC list). */
+  scanMode: text("scan_mode").notNull().default("prefix"),
+  /** MAC list for scanMode = "list". */
+  macList: jsonb("mac_list").$type<string[]>(),
+  /** Parallel MAC checks (capped in the scanner; portals rate-limit). */
+  concurrency: integer("concurrency").notNull().default(1),
   macPrefix: text("mac_prefix").notNull().default("00:1A:79"),
   status: text("status").notNull().default("pending"), // pending, running, paused, completed, error
   timeoutMs: integer("timeout_ms").notNull().default(5000),
@@ -51,6 +59,10 @@ export const scanJobs = pgTable("scan_jobs", {
   httpError: text("http_error"), // non-fatal HTTP timing error
   pingError: text("ping_error"), // non-fatal TCP probe error message
 
+  /** Xtream credentials when the job targets an Xtream panel instead of Stalker. */
+  xtreamUsername: text("xtream_username"),
+  xtreamPassword: text("xtream_password"),
+
   // Server geolocation (resolved once at start-up)
   serverIp: text("server_ip"),
   serverGeoRaw: jsonb("server_geo_raw"),
@@ -59,6 +71,11 @@ export const scanJobs = pgTable("scan_jobs", {
   qualityCheckEnabled: integer("quality_check_enabled").notNull().default(1),
   qualityChannels: integer("quality_channels").notNull().default(3),
   qualitySampleMs: integer("quality_sample_ms").notNull().default(8000),
+  // Optional add-ons (all safe to leave off / unavailable)
+  uaRotationEnabled: integer("ua_rotation_enabled").notNull().default(1),
+  pictureChecksEnabled: integer("picture_checks_enabled").notNull().default(1),
+  thumbnailsEnabled: integer("thumbnails_enabled").notNull().default(1),
+  catchUpCheckEnabled: integer("catch_up_check_enabled").notNull().default(1),
 
   // ── Filters (applied at scan time; stored so history/UI can replay them) ──
   genreFilterEnabled: integer("genre_filter_enabled").notNull().default(0), // 0/1 boolean
@@ -103,6 +120,8 @@ export const scanResults = pgTable("scan_results", {
   password: text("password"),
   playlistGenres: text("playlist_genres"),
   vodCategories: text("vod_categories"),
+  /** "stalker" or "xtream" — how this result was produced. */
+  protocol: text("protocol").notNull().default("stalker"),
 
   // ── Measured stream quality for this MAC (see src/lib/mac-quality.ts) ──
   // Populated right after the MAC is validated and passes the user's filters.
@@ -120,6 +139,18 @@ export const scanResults = pgTable("scan_results", {
   qualityChannelsProbed: integer("quality_channels_probed"),
   qualityCheckedAt: timestamp("quality_checked_at"),
   qualityReport: jsonb("quality_report").$type<unknown>(),
+  /** Extra evidence columns for the results table / CSV. */
+  qualityFrozen: integer("quality_frozen"), // 1 = a sustained frozen picture was detected
+  qualityLabelMismatch: text("quality_label_mismatch"), // e.g. "Label says 4K but the stream delivers 720p"
+  qualityRetries: integer("quality_retries"),
+  qualityThroughputCv: real("quality_throughput_cv"), // throughput variation over the sample
+  qualityCatchUpStatus: text("quality_catch_up_status"), // verified | advertised_but_failed | not_advertised | not_checked
+  qualityCatchUpDays: real("quality_catch_up_days"), // archive depth actually verified (days)
+  qualityThumbnail: text("quality_thumbnail"), // file name served by /api/scan/thumbnail
+  qualityEwma: real("quality_ewma"), // rolling score across probe runs
+  qualityTrend: text("quality_trend"), // improving | stable | degrading | insufficient_data
+  /** Per-genre summary of the measurement (genre aggregation, Wave 3). */
+  qualityGenreSummary: jsonb("quality_genre_summary").$type<unknown>(),
 
   rawData: jsonb("raw_data"),
   foundAt: timestamp("found_at").defaultNow().notNull(),
@@ -132,6 +163,83 @@ export const scanLogs = pgTable("scan_logs", {
     .notNull(),
   level: text("level").notNull().default("info"), // info, warning, error, success
   message: text("message").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+// ── Probe history: one row per quality check, for trend/EWMA and alerts ──
+export const qualityProbeRuns = pgTable("quality_probe_runs", {
+  id: serial("id").primaryKey(),
+  resultId: integer("result_id")
+    .references(() => scanResults.id, { onDelete: "cascade" })
+    .notNull(),
+  jobId: integer("job_id"),
+  macAddress: text("mac_address").notNull(),
+  measuredAt: timestamp("measured_at").defaultNow().notNull(),
+  overallScore: real("overall_score"),
+  speedScore: real("speed_score"),
+  qualityScore: real("quality_score"),
+  stabilityScore: real("stability_score"),
+  verdict: text("verdict"),
+  throughputMbps: real("throughput_mbps"),
+  requiredMbps: real("required_mbps"),
+  channelsPlayable: integer("channels_playable"),
+  channelsProbed: integer("channels_probed"),
+  frozen: integer("frozen").default(0),
+  labelMismatches: integer("label_mismatches").default(0),
+  viaProxy: text("via_proxy"),
+  source: text("source").notNull().default("scan"), // scan | manual | monitor
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+// ── Stable subscription M3U URLs (revocable tokens) ──
+export const playlistTokens = pgTable("playlist_tokens", {
+  id: serial("id").primaryKey(),
+  resultId: integer("result_id")
+    .references(() => scanResults.id, { onDelete: "cascade" })
+    .notNull(),
+  token: text("token").notNull().unique(),
+  /** Max channels to resolve per fetch (keeps load predictable). */
+  limitCount: integer("limit_count").notNull().default(200),
+  revoked: integer("revoked").notNull().default(0),
+  fetchCount: integer("fetch_count").notNull().default(0),
+  lastFetchedAt: timestamp("last_fetched_at"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+// ── Monitoring / alerts over stored results ──
+export const monitors = pgTable("monitors", {
+  id: serial("id").primaryKey(),
+  resultId: integer("result_id")
+    .references(() => scanResults.id, { onDelete: "cascade" })
+    .notNull(),
+  enabled: integer("enabled").notNull().default(1),
+  /** Minimum minutes between checks. */
+  intervalMinutes: integer("interval_minutes").notNull().default(360),
+  /** Verdicts that trigger an alert (comma separated). */
+  alertOn: text("alert_on").notNull().default("degrading,poor,unusable"),
+  channels: integer("channels").notNull().default(3),
+  sampleMs: integer("sample_ms").notNull().default(8000),
+  lastRunAt: timestamp("last_run_at"),
+  lastVerdict: text("last_verdict"),
+  lastScore: real("last_score"),
+  lastTrend: text("last_trend"),
+  lastAlertAt: timestamp("last_alert_at"),
+  lastAlertReason: text("last_alert_reason"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+// ── Proxy pool (validation + egress) ──
+export const proxies = pgTable("proxies", {
+  id: serial("id").primaryKey(),
+  /** host:port, optionally with credentials attached. */
+  value: text("value").notNull(),
+  /** Persisted parse result: "host:port (auth)" — never the password. */
+  display: text("display").notNull(),
+  enabled: integer("enabled").notNull().default(1),
+  lastOk: integer("last_ok"),
+  lastLatencyMs: integer("last_latency_ms"),
+  lastError: text("last_error"),
+  lastCheckedAt: timestamp("last_checked_at"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 

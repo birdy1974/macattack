@@ -1,7 +1,7 @@
 import { NextRequest } from "next/server";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
-import { scanJobs, scanResults } from "@/db/schema";
+import { playlistTokens, scanJobs, scanResults } from "@/db/schema";
 import { validateStalkerPortal } from "@/lib/scanner";
 import {
   buildM3U,
@@ -27,18 +27,43 @@ const MAX_LIMIT = 800;
 const CONCURRENCY = 5;
 
 export async function GET(request: NextRequest) {
-  const resultId = Number(request.nextUrl.searchParams.get("resultId"));
-  const limit = Math.max(
-    1,
-    Math.min(Number(request.nextUrl.searchParams.get("limit")) || DEFAULT_LIMIT, MAX_LIMIT)
-  );
+  let resultId = Number(request.nextUrl.searchParams.get("resultId"));
+  const limitRaw = Number(request.nextUrl.searchParams.get("limit"));
+  let limit = Math.max(1, Math.min(limitRaw || DEFAULT_LIMIT, MAX_LIMIT));
+
+  // ── Stable subscription URL: ?token=… ───────────────────────────────
+  // Tokens are created by /api/scan/playlist-token and can be revoked there.
+  const token = request.nextUrl.searchParams.get("token");
+  let tokenLimit: number | null = null;
+  if (token) {
+    const [row] = await db
+      .select()
+      .from(playlistTokens)
+      .where(and(eq(playlistTokens.token, token), eq(playlistTokens.revoked, 0)))
+      .limit(1);
+    if (!row) {
+      return new Response(JSON.stringify({ error: "Unknown or revoked playlist token" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    resultId = row.resultId;
+    tokenLimit = row.limitCount;
+    if (!Number.isFinite(limitRaw)) limit = row.limitCount;
+    void db
+      .update(playlistTokens)
+      .set({ fetchCount: row.fetchCount + 1, lastFetchedAt: new Date() })
+      .where(eq(playlistTokens.id, row.id))
+      .catch(() => undefined);
+  }
 
   if (!Number.isSafeInteger(resultId) || resultId < 1) {
-    return new Response(JSON.stringify({ error: "Valid resultId is required" }), {
+    return new Response(JSON.stringify({ error: "Valid resultId or token is required" }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
     });
   }
+  if (tokenLimit !== null) limit = Math.min(limit, tokenLimit);
 
   try {
     const [row] = await db
@@ -117,7 +142,11 @@ export async function GET(request: NextRequest) {
       status: 200,
       headers: {
         "Content-Type": "audio/x-mpegurl; charset=utf-8",
-        "Content-Disposition": `attachment; filename="${filename}"`,
+        // A token URL is a subscription: let the player re-fetch it instead of
+        // downloading a one-off file.
+        "Content-Disposition": token
+          ? "inline"
+          : `attachment; filename="${filename}"`,
         "X-Channels-Listed": String(list.channels.length),
         "X-Channels-Playable": String(resolved.length),
       },

@@ -106,7 +106,12 @@ implemented server-side with concurrency caps and token-redacted storage.
 
 ---
 
-## 6. 🚩 **Nice features we do NOT have** (priority-ordered)
+## 6. 🚩 **Nice features we did not have** (priority-ordered)
+
+> **Status update (2026-10-03):** every gap below was implemented in the three waves
+> planned in [`feature-gap-roadmap.md`](feature-gap-roadmap.md) — see
+> [`wave-implementation.md`](wave-implementation.md) for where each one lives and how it
+> is tested. The descriptions are kept as the original gap analysis.
 
 > These are the answers to “highlight if there are any nice features in these other applications that we do not have”.
 

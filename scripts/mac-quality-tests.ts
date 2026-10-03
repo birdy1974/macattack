@@ -69,6 +69,8 @@ async function main() {
     genreId: null,
     logo: null,
     cmd: "ffmpeg http://localhost:80/ch/1_",
+    tvArchive: false,
+    tvArchiveDays: null,
   });
   check("localhost placeholder rejected", localhost.url === null, localhost);
 
@@ -93,7 +95,7 @@ async function main() {
     sampleMs: 5000,
   });
 
-  check("report version 1", report.version === 1);
+  check("report version 2", report.version === 2);
   check("3 channels probed", report.aggregate.channelsProbed === 3, report.aggregate);
   check("aggregate overall score present", typeof report.aggregate.overallScore === "number", report.aggregate.overallScore);
   check("aggregate has speed/quality/stability", [report.aggregate.speedScore, report.aggregate.qualityScore, report.aggregate.stabilityScore].every((value) => typeof value === "number"));
@@ -124,6 +126,57 @@ async function main() {
   check("playlist header", m3u.startsWith("#EXTM3U\n"), m3u.slice(0, 12));
   check("EXTINF lines for every link", (m3u.match(/#EXTINF/g) || []).length === links.length, links.length);
   check("genre group titles used", /group-title="Genre /.test(m3u));
+
+  // ── 6. Genre aggregation + catch-up verification (Wave 2/3) ─────────────
+  console.log("\n[6] Genre aggregation and catch-up verification");
+  check("genre groups are reported", report.genreGroups.length >= 2, report.genreGroups.length);
+  check(
+    "each genre group counts its channels",
+    report.genreGroups.every((group) => group.channelsProbed >= 1 && group.genreTitle.length > 0),
+    report.genreGroups
+  );
+  check(
+    "genre groups carry an average where measurable",
+    report.genreGroups.some((group) => typeof group.averageOverall === "number"),
+    report.genreGroups.map((group) => group.averageOverall)
+  );
+
+  const archiveChannel = list.channels.find((channel) => channel.tvArchive);
+  check("the mock portal advertises an archive", !!archiveChannel, list.channels.map((c) => [c.name, c.tvArchive]));
+
+  const catchUpReport = await checkMacStreamQuality({
+    serverPath: SERVER_PATH,
+    portalBase: PORTAL_BASE,
+    mac: MAC,
+    timeoutMs: 5000,
+    channelsToProbe: 3,
+    sampleMs: 4000,
+    checkCatchUp: true,
+  });
+  check("catch-up was attempted", catchUpReport.catchUp.status !== "not_checked", catchUpReport.catchUp);
+  check(
+    "advertised archive resolves and plays",
+    catchUpReport.catchUp.status === "verified" && catchUpReport.catchUp.linkResolved && catchUpReport.catchUp.playable,
+    catchUpReport.catchUp
+  );
+  check(
+    "catch-up names the channel and the window",
+    !!catchUpReport.catchUp.channelName && (catchUpReport.catchUp.verifiedMinutes ?? 0) > 0,
+    catchUpReport.catchUp
+  );
+  check("catch-up bytes were read", (catchUpReport.catchUp.bytesRead ?? 0) > 0, catchUpReport.catchUp.bytesRead);
+
+  // Same job without the flag must not spend time on catch-up.
+  const noCatchUp = await checkMacStreamQuality({
+    serverPath: SERVER_PATH,
+    portalBase: PORTAL_BASE,
+    mac: MAC,
+    timeoutMs: 5000,
+    channelsToProbe: 1,
+    sampleMs: 3000,
+    checkCatchUp: false,
+  });
+  check("catch-up can be switched off", noCatchUp.catchUp.status === "not_checked", noCatchUp.catchUp);
 
   console.log(`\n${checks - failures}/${checks} checks passed`);
   if (failures > 0) process.exit(1);

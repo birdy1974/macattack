@@ -1,8 +1,11 @@
 # Feature-gap roadmap — what we can still implement, why, and what it buys us
 
 **Companion to:** [`iptv-tool-landscape.md`](iptv-tool-landscape.md) (the ecosystem deep dive)
-**Date:** 2026-10-03 · **Status:** proposals only — nothing in this file is implemented yet,
-except where marked 🟢 *done in this branch*.
+**Date:** 2026-10-03 · **Status:** ✅ **all three waves implemented** — see
+[`wave-implementation.md`](wave-implementation.md) for the shipped item list, the tests that
+cover each one, and the honest limits that remain. Only the “Not recommended” section was
+left unimplemented, by design. The tables below are kept unchanged as the decision record
+(what the gap was, why it mattered, what it bought us).
 
 ## How to read the tables
 

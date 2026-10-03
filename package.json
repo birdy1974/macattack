@@ -10,7 +10,9 @@
     "fixtures": "node scripts/probe-fixtures.mjs",
     "test:probe": "npx --yes tsx scripts/probe-tests.ts",
     "test:quality": "npx --yes tsx scripts/mac-quality-tests.ts",
-    "probe:url": "npx --yes tsx scripts/probe-selftest.ts"
+    "probe:url": "npx --yes tsx scripts/probe-selftest.ts",
+    "test:waves": "npx --yes tsx scripts/wave-tests.ts",
+    "test:xtream": "npx --yes tsx scripts/xtream-tests.ts"
   },
   "dependencies": {
     "dotenv": "17.3.1",

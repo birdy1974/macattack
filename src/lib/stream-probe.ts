@@ -47,14 +47,17 @@
 
 import http from "node:http";
 import https from "node:https";
+import net from "node:net";
 import dns from "node:dns";
 import { performance } from "node:perf_hooks";
+import { openProxyTunnel, tlsOverTunnel, type ProxyConfig } from "@/lib/proxy";
+import { sleep } from "@/lib/parallel";
 
 // ============================================================================
 // PUBLIC TYPES
 // ============================================================================
 
-export type ProbeContainer = "hls" | "dash" | "mpegts" | "mp4" | "other" | "unknown";
+export type ProbeContainer = "hls" | "dash" | "mpegts" | "mp4" | "rtsp" | "rtmp" | "udp" | "other" | "unknown";
 
 export type ProbeStatus =
   | "measured"
@@ -62,6 +65,11 @@ export type ProbeStatus =
   | "http_error"
   | "timeout"
   | "network_error"
+  /** RTSP/RTMP: TCP reachable and protocol handshake answered, but the media
+   *  itself cannot be measured without a full RTSP/RTMP client. Honest label. */
+  | "reachable_only"
+  /** UDP streams cannot be liveness-checked at all from here. */
+  | "unverifiable"
   | "unsupported_scheme";
 
 export interface ProbeTimings {
@@ -181,6 +189,12 @@ export interface StreamProbeResult {
   videoCodec: string | null;
   audioCodec: string | null;
   drm: string | null;
+  /** Retries performed because of transient HTTP statuses (408/425/429/5xx). */
+  retryCount: number;
+  /** Transport actually probed: http/hls or rtsp/rtmp/udp. */
+  protocol: "http" | "rtsp" | "rtmp" | "udp";
+  /** Configured proxy (host:port only) when the probe egressed through one. */
+  viaProxy: string | null;
   errors: string[];
   warnings: string[];
   notes: string[];
@@ -200,6 +214,10 @@ export interface StreamProbeOptions {
   signal?: AbortSignal;
   /** Maximum HLS variants to walk down before sampling. Default 3. */
   maxPlaylistDepth?: number;
+  /** HTTP CONNECT proxy to egress through (second vantage point / geoblock checks). */
+  proxy?: ProxyConfig | null;
+  /** Retries for transient HTTP statuses. Default 2, clamped 0–4. */
+  maxRetries?: number;
 }
 
 // ============================================================================
@@ -257,6 +275,182 @@ function contentTypeOf(headers: http.IncomingHttpHeaders): string {
   return (headerValue(headers, "content-type") || "").toLowerCase();
 }
 
+
+// ============================================================================
+// NON-HTTP STREAM LIVENESS (RTSP / RTMP / UDP)
+// ============================================================================
+
+/**
+ * Classify a stream URL by transport. RTSP/RTMP get a bounded TCP reachability
+ * check (plus an RTSP OPTIONS handshake); UDP is honestly unverifiable from a
+ * scanner because every UDP "connection" succeeds.
+ */
+export function detectStreamProtocol(url: string): "http" | "rtsp" | "rtmp" | "udp" | "unknown" {
+  const scheme = /^([a-z0-9+.-]+):/i.exec(url.trim())?.[1]?.toLowerCase();
+  switch (scheme) {
+    case "http":
+    case "https":
+      return "http";
+    case "rtsp":
+    case "rtsps":
+      return "rtsp";
+    case "rtmp":
+    case "rtmps":
+    case "rtmpt":
+    case "rtmpe":
+      return "rtmp";
+    case "udp":
+    case "rtp":
+      return "udp";
+    default:
+      return "unknown";
+  }
+}
+
+/** TCP connect (+ RTSP OPTIONS for rtsp) with a hard timeout. */
+async function probeSocketLiveness(
+  url: string,
+  protocol: "rtsp" | "rtmp",
+  timeoutMs: number,
+  options: StreamProbeOptions
+): Promise<StreamProbeResult> {
+  const measuredAt = new Date().toISOString();
+  const startedAt = nowMs();
+  const container: ProbeContainer = protocol;
+
+  const emptyBase = (status: ProbeStatus, errorLines: string[], warningLines: string[], noteLines: string[]): StreamProbeResult => ({
+    url,
+    finalUrl: url,
+    redirectChain: [],
+    status,
+    httpStatus: null,
+    contentType: null,
+    container,
+    requiredMbps: null,
+    requiredMbpsSource: null,
+    sustainedMbps: null,
+    peakMbps: null,
+    minSampleMbps: null,
+    throughputCoefficientOfVariation: null,
+    throughputSamples: [],
+    maxGapMs: null,
+    sampleWindowMs: 0,
+    bytesRead: 0,
+    timings: { dnsMs: null, tcpMs: null, tlsMs: null, ttfbMs: null, firstByteMs: null },
+    hls: null,
+    ts: null,
+    resolution: null,
+    videoCodec: null,
+    audioCodec: null,
+    drm: null,
+    retryCount: 0,
+    protocol,
+    viaProxy: options.proxy ? `${options.proxy.host}:${options.proxy.port}` : null,
+    errors: errorLines,
+    warnings: warningLines,
+    notes: noteLines,
+    measuredAt,
+  });
+
+  let target: URL;
+  try {
+    target = new URL(url);
+  } catch {
+    return emptyBase("unsupported_scheme", [`Not a valid ${protocol.toUpperCase()} URL`], [], []);
+  }
+  const port = Number(target.port) || (protocol === "rtsp" ? 554 : 1935);
+  const host = target.hostname;
+
+  const outcome = await new Promise<{ ok: boolean; tcpMs: number | null; banner: string | null; error: string | null }>(
+    (resolve) => {
+      const socket = net.connect({ host, port });
+      let settled = false;
+      let banner = "";
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        resolve({ ok: false, tcpMs: null, banner: null, error: `TCP connect timed out after ${timeoutMs} ms` });
+      }, timeoutMs);
+
+      socket.on("connect", () => {
+        const tcpMs = Math.round(nowMs() - startedAt);
+        if (protocol === "rtsp") {
+          // Bounded handshake: ask the server for its options and watch for a
+          // response line. No media is requested, so nothing is decoded.
+          const request =
+            `OPTIONS ${target.href} RTSP/1.0\r\n` +
+            `CSeq: 1\r\n` +
+            `User-Agent: MacAttack\r\n\r\n`;
+          socket.write(request);
+          socket.on("data", (chunk) => {
+            banner += chunk.toString("latin1").slice(0, 512);
+            if (!settled) {
+              settled = true;
+              clearTimeout(timer);
+              const answered = /^RTSP\/\d\.\d\s+\d{3}/i.test(banner.trim());
+              socket.destroy();
+              resolve({
+                ok: answered,
+                tcpMs,
+                banner: banner.split("\r\n")[0] || null,
+                error: answered ? null : "Connected, but the server did not answer RTSP OPTIONS",
+              });
+            }
+          });
+          return;
+        }
+        // RTMP: the server sends its handshake bytes unprompted after connect.
+        socket.on("data", (chunk) => {
+          const head = chunk.subarray(0, 1).toString("latin1");
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            socket.destroy();
+            const looksLikeHandshake = head.length === 1; // RTMP replies with a 1-byte version + 1536 random bytes
+            resolve({
+              ok: looksLikeHandshake,
+              tcpMs,
+              banner: `RTMP handshake byte 0x${chunk.subarray(0, 1).toString("hex")}`,
+              error: looksLikeHandshake ? null : "Connected, but the server sent no RTMP handshake",
+            });
+          }
+        });
+        // Some RTMP servers wait for the client handshake first.
+        socket.write(Buffer.from([0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03]));
+      });
+
+      socket.on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        socket.destroy();
+        resolve({ ok: false, tcpMs: null, banner: null, error: `${protocol.toUpperCase()} connect failed: ${err.message}` });
+      });
+      socket.on("close", () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ ok: false, tcpMs: null, banner: null, error: "Connection closed before a handshake completed" });
+      });
+    }
+  );
+
+  const timings = { dnsMs: null, tcpMs: outcome.tcpMs, tlsMs: null, ttfbMs: outcome.tcpMs, firstByteMs: outcome.tcpMs };
+  const base = emptyBase(
+    outcome.ok ? "reachable_only" : outcome.tcpMs !== null ? "unplayable" : "network_error",
+    outcome.ok ? [] : [outcome.error || "Liveness check failed"],
+    outcome.ok
+      ? [
+          `${protocol.toUpperCase()} liveness only: the server answered on ${host}:${port}, but throughput, resolution and stability cannot be measured without a full ${protocol.toUpperCase()} client.`,
+          "Picture/speed scores are not derived from this check — only reachability.",
+        ]
+      : [],
+    outcome.ok && outcome.banner ? [`Server greeting: ${outcome.banner}`] : [],
+    );
+  return { ...base, timings, sampleWindowMs: outcome.tcpMs ?? 0 };
+}
+
 function isHttpUrl(value: string): boolean {
   return /^https?:\/\//i.test(value.trim());
 }
@@ -280,6 +474,7 @@ interface RawRequestOptions {
   headers?: Record<string, string>;
   timeoutMs: number;
   maxBytes: number;
+  proxy?: ProxyConfig | null;
   collectBody: boolean;
   collectBodyMaxBytes?: number;
   signal?: AbortSignal;
@@ -303,6 +498,37 @@ interface RawRequestResult {
   contentType: string;
   error: string | null;
   abortedByUser: boolean;
+}
+
+/**
+ * One request, retried for transient failures (connect errors, timeouts and
+ * retryable HTTP statuses). Returns the final attempt plus the retry count.
+ */
+async function requestWithRetry(
+  url: string,
+  options: RawRequestOptions,
+  maxRetries: number
+): Promise<RawRequestResult & { retryCount: number }> {
+  let attempt = 0;
+  let result = await rawRequest(url, options);
+
+  while (attempt < maxRetries) {
+    const retryableStatus =
+      result.statusCode !== null && RETRYABLE_HTTP_STATUSES.has(result.statusCode);
+    const retryableTransport =
+      result.status === "timeout" ||
+      // A connect reset/refused often clears on a second attempt (CDN edge).
+      (result.status === "network_error" && !/invalid url/i.test(result.error || ""));
+    if (result.abortedByUser || (!retryableStatus && !retryableTransport)) break;
+    if (!retryableStatus && result.bytesRead > 0) break;
+
+    attempt += 1;
+    const delayMs = Math.min(1000 * 3 ** (attempt - 1), 6000);
+    await sleep(delayMs);
+    result = await rawRequest(url, options);
+  }
+
+  return { ...result, retryCount: attempt };
 }
 
 async function rawRequest(
@@ -358,29 +584,81 @@ async function rawRequest(
   return finalResult;
 }
 
-function singleRequest(url: string, options: RawRequestOptions): Promise<RawRequestResult> {
+async function singleRequest(url: string, options: RawRequestOptions): Promise<RawRequestResult> {
+  const start = nowMs();
+  let dnsMs: number | null = null;
+  let tcpMs: number | null = null;
+  let tlsMs: number | null = null;
+  let ttfbMs: number | null = null;
+  let firstByteMs: number | null = null;
+  let bytesRead = 0;
+  let settled = false;
+  let abortedByUser = false;
+  let errorMessage: string | null = null;
+  let responseHeaders: http.IncomingHttpHeaders = {};
+  let statusCode: number | null = null;
+  let contentType = "";
+  let buffered = Buffer.alloc(0);
+  let sniff: Buffer = Buffer.alloc(0);
+  let body = "";
+
+  const isTls = url.trim().toLowerCase().startsWith("https:") || url.trim().toLowerCase().startsWith("wss:");
+  const transport = isTls ? https : http;
+
+  const empty = (status: ProbeStatus, error: string | null): RawRequestResult => ({
+    status,
+    statusCode,
+    headers: responseHeaders,
+    finalUrl: url,
+    redirectChain: [],
+    timings: { dnsMs, tcpMs, tlsMs, ttfbMs, firstByteMs },
+    body,
+    sniff,
+    bytesRead,
+    contentType,
+    error,
+    abortedByUser,
+  });
+
+  if (options.signal?.aborted) {
+    abortedByUser = true;
+    return empty("network_error", "Aborted before the request started");
+  }
+
+  let target: URL;
+  try {
+    target = new URL(url);
+  } catch {
+    return empty("network_error", "Invalid URL");
+  }
+
+  // ── Optional proxy: open the CONNECT tunnel before building the request ──
+  let preconnected: import("node:net").Socket | null = null;
+  if (options.proxy) {
+    try {
+      const tunnel = await openProxyTunnel(options.proxy, target.hostname, Number(target.port || (isTls ? 443 : 80)), options.timeoutMs);
+      tcpMs = round(nowMs() - start, 1);
+      if (isTls) {
+        preconnected = await new Promise<import("node:net").Socket>((resolve, reject) => {
+          const secure = tlsOverTunnel(tunnel, target.hostname);
+          secure.once("secureConnect", () => {
+            tlsMs = round(nowMs() - start, 1);
+            resolve(secure);
+          });
+          secure.once("error", (error: Error) => {
+            tunnel.close();
+            reject(error);
+          });
+        });
+      } else {
+        preconnected = tunnel.socket;
+      }
+    } catch (error) {
+      return empty("network_error", error instanceof Error ? error.message : "Proxy tunnel failed");
+    }
+  }
+
   return new Promise((resolve) => {
-    const start = nowMs();
-    let dnsMs: number | null = null;
-    let tcpMs: number | null = null;
-    let tlsMs: number | null = null;
-    let ttfbMs: number | null = null;
-    let firstByteMs: number | null = null;
-    let bytesRead = 0;
-    let settled = false;
-    let abortedByUser = false;
-    let errorMessage: string | null = null;
-    let responseHeaders: http.IncomingHttpHeaders = {};
-    let statusCode: number | null = null;
-    let contentType = "";
-    let buffered = Buffer.alloc(0);
-    let sniff: Buffer = Buffer.alloc(0);
-    let body = "";
-    let lastChunkAt: number | null = null;
-
-    const isTls = url.trim().toLowerCase().startsWith("https:");
-    const transport = isTls ? https : http;
-
     const finish = (status: ProbeStatus) => {
       if (settled) return;
       settled = true;
@@ -400,36 +678,44 @@ function singleRequest(url: string, options: RawRequestOptions): Promise<RawRequ
       });
     };
 
-    if (options.signal?.aborted) {
-      errorMessage = "Aborted before the request started";
-      abortedByUser = true;
-      finish("network_error");
-      return;
-    }
-
     let request: http.ClientRequest;
     try {
-      request = transport.request(
-        url,
-        {
-          method: "GET",
-          headers: {
-            "User-Agent": STB_USER_AGENT,
-            Accept: "*/*",
-            Connection: "close",
-            ...(options.headers || {}),
-          },
-          // Track DNS resolution time without changing resolver behaviour.
-          // Node may call this with `all: true` (autoSelectFamily), so the
-          // callback arguments are forwarded verbatim.
-          lookup: ((hostname: string, lookupOptions: dns.LookupOptions, callback: (...args: unknown[]) => void) => {
-            const lookupStart = nowMs();
-            dns.lookup(hostname, lookupOptions, ((err: NodeJS.ErrnoException | null, address: unknown, family: unknown) => {
-              dnsMs = round(nowMs() - lookupStart, 1);
-              callback(err, address, family);
-            }) as never);
-          }) as never,
+      const requestOptions: http.RequestOptions & { servername?: string } = {
+        protocol: target.protocol,
+        hostname: target.hostname,
+        host: target.hostname,
+        port: Number(target.port || (isTls ? 443 : 80)),
+        path: `${target.pathname}${target.search}`,
+        method: "GET",
+        headers: {
+          "User-Agent": STB_USER_AGENT,
+          Accept: "*/*",
+          Connection: "close",
+          Host: target.host,
+          ...(options.headers || {}),
         },
+      };
+
+      if (preconnected) {
+        const socket = preconnected;
+        requestOptions.agent = false;
+        requestOptions.createConnection = () => socket;
+      } else {
+        // Track DNS resolution time without changing resolver behaviour.
+        // Node may call this with `all: true` (autoSelectFamily), so the
+        // callback arguments are forwarded verbatim.
+        requestOptions.lookup = ((hostname: string, lookupOptions: dns.LookupOptions, callback: (...args: unknown[]) => void) => {
+          const lookupStart = nowMs();
+          dns.lookup(hostname, lookupOptions, ((err: NodeJS.ErrnoException | null, address: unknown, family: unknown) => {
+            dnsMs = round(nowMs() - lookupStart, 1);
+            callback(err, address, family);
+          }) as never);
+        }) as never;
+        requestOptions.servername = target.hostname;
+      }
+
+      request = transport.request(
+        requestOptions,
         (response) => {
           responseHeaders = response.headers;
           statusCode = response.statusCode ?? null;
@@ -441,7 +727,6 @@ function singleRequest(url: string, options: RawRequestOptions): Promise<RawRequ
             if (chunk.length === 0) return;
             const atMs = nowMs() - start;
             if (firstByteMs === null) firstByteMs = round(atMs, 1);
-            lastChunkAt = atMs;
             bytesRead += chunk.length;
 
             // Keep a copy of the first bytes for signature detection, and let
@@ -460,17 +745,13 @@ function singleRequest(url: string, options: RawRequestOptions): Promise<RawRequ
               }
             }
 
-            if (
-              bytesRead >= options.maxBytes ||
-              (options.shouldStop && options.shouldStop())
-            ) {
+            if (bytesRead >= options.maxBytes || (options.shouldStop && options.shouldStop())) {
               response.destroy();
               finish("measured");
             }
           });
 
           response.on("end", () => {
-            // If the body never reached the sniff threshold, keep what we got.
             if (sniff.length === 0 && buffered.length > 0) {
               sniff = buffered;
               buffered = Buffer.alloc(0);
@@ -500,10 +781,10 @@ function singleRequest(url: string, options: RawRequestOptions): Promise<RawRequ
       if (typed.__macattackHooked) return;
       typed.__macattackHooked = true;
       socket.on("connect", () => {
-        tcpMs = round(nowMs() - start, 1);
+        if (tcpMs === null) tcpMs = round(nowMs() - start, 1);
       });
       socket.on("secureConnect", () => {
-        tlsMs = round(nowMs() - start, 1);
+        if (tlsMs === null) tlsMs = round(nowMs() - start, 1);
       });
     });
 
@@ -514,10 +795,7 @@ function singleRequest(url: string, options: RawRequestOptions): Promise<RawRequ
 
     request.on("error", (err: Error) => {
       if (options.signal?.aborted) abortedByUser = true;
-      const message =
-        err.name === "AbortError"
-          ? "Request aborted"
-          : err.message || "Network error";
+      const message = err.name === "AbortError" ? "Request aborted" : err.message || "Network error";
       errorMessage = errorMessage || message;
       const timedOut = /timeout/i.test(message);
       finish(timedOut ? "timeout" : "network_error");
@@ -533,20 +811,17 @@ function singleRequest(url: string, options: RawRequestOptions): Promise<RawRequ
 
     request.end();
 
-    // Guard: if the server trickles data forever without an end event, stop at maxBytes.
     const watchdog = setInterval(() => {
       if (settled) {
         clearInterval(watchdog);
         return;
       }
-      if (bytesRead >= options.maxBytes) {
+      if (options.maxBytes > 0 && bytesRead >= options.maxBytes) {
         request.destroy();
         finish("measured");
       }
     }, 500);
     request.on("close", () => clearInterval(watchdog));
-    // Track the last activity time for stall reporting (used by callers).
-    void lastChunkAt;
   });
 }
 
@@ -1076,6 +1351,9 @@ export async function probeStream(
     videoCodec: null,
     audioCodec: null,
     drm: null,
+    retryCount: 0,
+    protocol: "http",
+    viaProxy: options.proxy ? `${options.proxy.host}:${options.proxy.port}` : null,
     errors: [],
     warnings: [],
     notes: [],
@@ -1084,10 +1362,29 @@ export async function probeStream(
 
   const trimmed = (url || "").trim();
   if (!isHttpUrl(trimmed)) {
+    // RTSP / RTMP / UDP: bounded TCP reachability check where it is meaningful.
+    const streamProtocol = detectStreamProtocol(trimmed);
+    if (streamProtocol === "rtsp" || streamProtocol === "rtmp") {
+      return probeSocketLiveness(trimmed, streamProtocol, timeoutMs, options);
+    }
+    if (streamProtocol === "udp") {
+      return {
+        ...base,
+        protocol: "udp",
+        container: "udp",
+        status: "unverifiable",
+        notes: [
+          "UDP streams carry no handshake to test: a UDP socket always appears to \"connect\", so liveness cannot be verified from the scanner host.",
+          "Open the stream in a player on the target device to confirm it works.",
+        ],
+        errors: [],
+        warnings: ["UDP liveness cannot be verified without an RTCP/RTSP client or a decoder"],
+      };
+    }
     return {
       ...base,
       status: "unsupported_scheme",
-      errors: [`Only http(s) streams can be probed (got "${trimmed.slice(0, 60)}")`],
+      errors: [`Unsupported stream scheme (got "${trimmed.slice(0, 60)}") — supported: http(s), rtsp, rtmp, udp`],
     };
   }
 
@@ -1156,16 +1453,22 @@ export async function probeStream(
     if (windowBytes >= MIN_MEDIA_BYTES_DIRECT) exceededMinBytes = true;
   };
 
-  const first = await rawRequest(trimmed, {
-    headers,
-    timeoutMs,
-    maxBytes,
-    collectBody: true,
-    collectBodyMaxBytes: 512 * 1024,
-    signal: options.signal,
-    onChunk,
-    shouldStop,
-  });
+  const maxRetries = clamp(Math.floor(options.maxRetries ?? 2), 0, 4);
+  const first = await requestWithRetry(
+    trimmed,
+    {
+      headers,
+      timeoutMs,
+      maxBytes,
+      proxy: options.proxy ?? null,
+      collectBody: true,
+      collectBodyMaxBytes: 512 * 1024,
+      signal: options.signal,
+      onChunk,
+      shouldStop,
+    },
+    maxRetries
+  );
 
   const sniffText = first.sniff.toString("utf8", 0, Math.min(first.sniff.length, 1024));
   const sniffedIsText = /^\s*(#extm3u|<\?xml|<mpd|\{)/i.test(sniffText) || sniffText.startsWith("#EXTM3U");
@@ -1177,6 +1480,11 @@ export async function probeStream(
 
   // Track timing information from the first request.
   const timings: ProbeTimings = { ...first.timings };
+
+  if (first.retryCount > 0) {
+    base.retryCount = first.retryCount;
+    base.notes.push(`Retried ${first.retryCount}× after a transient response before this measurement`);
+  }
 
   if (first.statusCode !== null && first.statusCode >= 400) {
     const warnings: string[] = [];
@@ -1236,6 +1544,7 @@ export async function probeStream(
         contentType: first.contentType,
         maxDepth,
         startedAt,
+        proxy: options.proxy ?? null,
       },
       first.body || first.sniff.toString("utf8"),
       first.finalUrl,
@@ -1394,6 +1703,7 @@ interface HlsProbeContext {
   contentType: string;
   maxDepth: number;
   startedAt: number;
+  proxy?: ProxyConfig | null;
 }
 
 async function probeHls(
@@ -1444,14 +1754,19 @@ async function probeHls(
       : null;
     hls.selectedRequiredSource = best.averageBandwidthBps != null ? "average-bandwidth" : best.bandwidthBps != null ? "bandwidth" : null;
 
-    const variantResponse = await rawRequest(best.url, {
-      headers: context.headers,
-      timeoutMs: context.timeoutMs,
-      maxBytes: 2 * 1024 * 1024,
-      collectBody: true,
-      collectBodyMaxBytes: 2 * 1024 * 1024,
-      signal: context.signal,
-    });
+    const variantResponse = await requestWithRetry(
+      best.url,
+      {
+        headers: context.headers,
+        timeoutMs: context.timeoutMs,
+        maxBytes: 2 * 1024 * 1024,
+        proxy: context.proxy ?? null,
+        collectBody: true,
+        collectBodyMaxBytes: 2 * 1024 * 1024,
+        signal: context.signal,
+      },
+      1
+    );
 
     if (variantResponse.statusCode !== null && variantResponse.statusCode >= 400) {
       return {
@@ -1570,6 +1885,7 @@ async function sampleHlsMedia(
   const throughput: ThroughputSample[] = [];
   let totalBytes = 0;
   let totalTransferMs = 0;
+  let segmentRetries = 0;
 
   for (let index = 0; index < parsed.segments.length; index += 1) {
     if (context.signal?.aborted) {
@@ -1590,10 +1906,13 @@ async function sampleHlsMedia(
     let transferStartAt: number | null = null;
     let lastAt: number | null = null;
 
-    const response = await rawRequest(segment.url, {
+    const response = await requestWithRetry(
+      segment.url,
+      {
       headers: context.headers,
       timeoutMs: Math.min(context.timeoutMs, 10000),
       maxBytes: Math.min(context.maxBytes - totalBytes, 64 * 1024 * 1024),
+      proxy: context.proxy ?? null,
       collectBody: false,
       signal: context.signal,
       shouldStop: () => {
@@ -1607,7 +1926,10 @@ async function sampleHlsMedia(
         transferStartAt = transferStartAt ?? atMs;
         lastAt = atMs;
       },
-    });
+    },
+      1
+    );
+    segmentRetries += response.retryCount;
 
     const transferMs = Math.max(nowMs() - segmentStart, 1);
     const ok = response.statusCode !== null && response.statusCode < 400 && segmentBytes > 0;
@@ -1686,6 +2008,10 @@ async function sampleHlsMedia(
   result.requiredMbps = requiredMbps;
   result.requiredMbpsSource = requiredSource;
   result.hls = hls;
+  result.retryCount += segmentRetries;
+  if (segmentRetries > 0) {
+    result.notes.push(`${segmentRetries} segment request(s) needed a retry after a transient failure`);
+  }
 
   // Segment-arrival gap (stall proxy) — the probe fetches back-to-back, so a
   // gap here means the server/CDN stalled, not that playback was paused.
@@ -1751,6 +2077,22 @@ export interface StreamScore {
   label: string;
   evidence: string[];
   penalties: string[];
+  /** True when the optional ffmpeg pass saw a sustained frozen/black picture. */
+  frozen?: boolean;
+}
+
+/** Optional evidence from the ffmpeg picture pack and the label check. */
+export interface StreamScoreExtras {
+  picture?: {
+    analyzed: boolean;
+    frozenDetected: boolean;
+    blackDetected: boolean;
+    frozenDurationSec: number;
+    blackDurationSec: number;
+    fps: number | null;
+    videoBitrateMbps: number | null;
+  } | null;
+  labelMismatch?: string | null;
 }
 
 function scaleScore(value: number, worst: number, best: number): number {
@@ -1783,7 +2125,7 @@ function heightOf(result: StreamProbeResult): number | null {
   return null;
 }
 
-export function scoreStreamProbe(result: StreamProbeResult): StreamScore {
+export function scoreStreamProbe(result: StreamProbeResult, extras: StreamScoreExtras = {}): StreamScore {
   const evidence: string[] = [];
   const penalties: string[] = [];
 
@@ -1960,6 +2302,34 @@ export function scoreStreamProbe(result: StreamProbeResult): StreamScore {
     stability = stability === null ? 0 : Math.min(stability, 1);
   }
 
+  // ── ffmpeg picture evidence (optional pack) ──────────────────────────────
+  let frozen = false;
+  if (extras.picture?.analyzed) {
+    const picture = extras.picture;
+    if (picture.fps !== null) evidence.push(`Decoded ${picture.fps.toFixed(1)} fps over ${picture.frozenDurationSec >= 0 ? "" : ""}the sample`);
+    if (picture.videoBitrateMbps !== null) {
+      evidence.push(`ffmpeg decoded ≈${picture.videoBitrateMbps.toFixed(2)} Mbps average video bitrate`);
+    }
+    if (picture.frozenDetected) {
+      frozen = true;
+      stability = stability === null ? 1 : Math.min(stability, 1.5);
+      quality = quality === null ? 4 : Math.min(quality, 5);
+      penalties.push(
+        `Freeze detected: the picture did not change for ${picture.frozenDurationSec.toFixed(1)}s of the sample — looks like a still image with audio`
+      );
+    }
+    if (picture.blackDetected) {
+      stability = stability === null ? 2 : Math.min(stability, 2.5);
+      penalties.push(`Black frames for ${picture.blackDurationSec.toFixed(1)}s of the sample`);
+    }
+  }
+
+  // ── Channel-label sanity ─────────────────────────────────────────────────
+  if (extras.labelMismatch) {
+    quality = quality === null ? 5 : Math.min(quality, 6);
+    penalties.push(extras.labelMismatch);
+  }
+
   const scored = [
     { value: stability, weight: 0.4 },
     { value: speed, weight: 0.35 },
@@ -2004,5 +2374,6 @@ export function scoreStreamProbe(result: StreamProbeResult): StreamScore {
     label: labels[verdict],
     evidence,
     penalties,
+    frozen,
   };
 }

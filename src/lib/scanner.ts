@@ -35,7 +35,7 @@
 import { lookup } from "node:dns/promises";
 import { performance } from "node:perf_hooks";
 import { db } from "@/db";
-import { scanJobs, scanResults, scanLogs, settings } from "@/db/schema";
+import { scanJobs, scanResults, scanLogs, settings, qualityProbeRuns } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { isWithinSchedule, parseScheduleSettings } from "@/lib/schedule";
 import {
@@ -52,6 +52,12 @@ import {
 } from "@/lib/filters";
 import { extractPortalFields } from "@/lib/portal-result-fields";
 import { checkMacStreamQuality, formatMacQualityLog } from "@/lib/mac-quality";
+import { HostRateLimiter, hostOf } from "@/lib/parallel";
+import { buildUserAgentCandidates, parseUserAgentList, userAgentSettingKey } from "@/lib/user-agents";
+import { parseProxyList } from "@/lib/proxy";
+import { pruneThumbnails } from "@/lib/thumbnail-store";
+import { computeSerialNumber } from "@/lib/stalker-streams";
+import { detectDegradation, summariseHistory, type ProbeRun } from "@/lib/quality-history";
 
 // ============================================================================
 // ACTIVE SCANS MANAGEMENT
@@ -559,12 +565,36 @@ export async function validateStalkerPortal(
 // STALKER API CALLS
 // ============================================================================
 
+/**
+ * Per-job request overrides (user-agent rotation, serial-number fingerprint).
+ * Threaded through the portal calls a MAC check makes.
+ */
+export interface PortalRequestOptions {
+  userAgent?: string | null;
+  serialNumber?: string | null;
+}
+
+function portalHeaders(
+  portalBase: string,
+  mac: string,
+  options?: PortalRequestOptions
+): Record<string, string> {
+  return {
+    ...STB_HEADERS,
+    ...(options?.userAgent ? { "User-Agent": options.userAgent, "X-User-Agent": "Model: MAG250; Link: WiFi" } : {}),
+    ...(options?.serialNumber ? { SN: options.serialNumber, "X-Serial-Number": options.serialNumber } : {}),
+    Cookie: makeCookie(mac),
+    Referer: portalBase,
+  };
+}
+
 async function doHandshake(
   serverPath: string,
   portalBase: string,
   mac: string,
   timeoutMs: number,
-  aborted: () => boolean
+  aborted: () => boolean,
+  options?: PortalRequestOptions
 ): Promise<string | null> {
   if (aborted()) return null;
 
@@ -576,11 +606,7 @@ async function doHandshake(
 
     const res = await fetch(url, {
       method: "GET",
-      headers: {
-        ...STB_HEADERS,
-        Cookie: makeCookie(mac),
-        Referer: portalBase,
-      },
+      headers: portalHeaders(portalBase, mac, options),
       signal: controller.signal,
     });
 
@@ -702,7 +728,8 @@ async function fetchAccountInfo(
   mac: string,
   token: string,
   timeoutMs: number,
-  aborted: () => boolean
+  aborted: () => boolean,
+  options?: PortalRequestOptions
 ): Promise<PortalResponse<Record<string, unknown>> | null> {
   if (aborted()) return null;
 
@@ -715,10 +742,8 @@ async function fetchAccountInfo(
     const res = await fetch(url, {
       method: "GET",
       headers: {
-        ...STB_HEADERS,
-        Cookie: makeCookie(mac),
+        ...portalHeaders(portalBase, mac, options),
         Authorization: `Bearer ${token}`,
-        Referer: portalBase,
       },
       signal: controller.signal,
     });
@@ -971,10 +996,14 @@ export async function startScan(jobId: number, skipVerification: boolean = false
 
     const macPrefix = job.macPrefix || "00:1A:79";
     const timeoutMs = job.timeoutMs || 5000;
+    const macListMode = job.scanMode === "list" && Array.isArray(job.macList) && job.macList.length > 0;
+    const macList = macListMode ? (job.macList as string[]) : null;
+    const scanConcurrency = Math.max(1, Math.min(job.concurrency ?? 1, 8));
+    const portalRateLimiter = new HostRateLimiter(scanConcurrency > 1 ? 150 : 0);
     const haUrl = job.haUrl || "";
     const haToken = job.haToken || "";
     const haEntityId = job.haEntityId || "";
-    const totalCombinations = getTotalMacCombinations(macPrefix);
+    const totalCombinations = macListMode ? macList!.length : getTotalMacCombinations(macPrefix);
 
     // ── Build filter configs from the persisted job row ────────────────
     const genreFilter: GenreFilterConfig = {
@@ -993,6 +1022,10 @@ export async function startScan(jobId: number, skipVerification: boolean = false
     // ── Stream quality check options (defaults are applied in the DB) ──
     const qualityCheck = {
       enabled: (job.qualityCheckEnabled ?? 1) !== 0,
+      pictureChecks: (job.pictureChecksEnabled ?? 1) !== 0,
+      thumbnails: (job.thumbnailsEnabled ?? 1) !== 0,
+      catchUp: (job.catchUpCheckEnabled ?? 1) !== 0,
+      concurrency: Math.max(1, Math.min(job.concurrency ?? 1, 4)),
       channels: Math.max(1, Math.min(job.qualityChannels ?? 3, 8)),
       sampleMs: Math.max(3000, Math.min(job.qualitySampleMs ?? 8000, 30000)),
     };
@@ -1006,7 +1039,22 @@ export async function startScan(jobId: number, skipVerification: boolean = false
     await addLog(jobId, "info", `Portal URL: ${job.portalUrl}`);
     await addLog(jobId, "info", `MAC Prefix: ${macPrefix}`);
     await addLog(jobId, "info", `Timeout: ${timeoutMs}ms`);
-    await addLog(jobId, "info", `Total MAC combinations in this prefix: ${totalCombinations.toString()}`);
+    await addLog(
+      jobId,
+      "info",
+      macListMode
+        ? `Bulk MAC list: ${totalCombinations.toLocaleString()} unique MAC address(es) to check`
+        : `Total MAC combinations in this prefix: ${totalCombinations.toString()}`
+    );
+    if (scanConcurrency > 1) {
+      await addLog(
+        jobId,
+        "info",
+        `Concurrency: ${scanConcurrency} workers (rate-limited to ~${Math.round(
+          1000 / 150
+        )} requests/second per portal host)`
+      );
+    }
 
     if (expireFilter.enabled) {
       await addLog(
@@ -1082,6 +1130,110 @@ export async function startScan(jobId: number, skipVerification: boolean = false
       await addLog(jobId, "success", "Portal validation SUCCESSFUL!");
       await addLog(jobId, "success", `Found working endpoint: ${serverPath}`);
     }
+
+    const portalHost = hostOf(serverPath);
+    const primaryTarget = { serverPath, portalBase, host: portalHost };
+
+    // ── Multi-portal / second-chance re-check ─────────────────────────
+    // Extra portals given for the job are validated once; a MAC rejected by
+    // the primary portal then gets one retry against the next portal
+    // (round-robin, so load is spread and every MAC gets a second chance).
+    const portalAlternatives: Array<{ serverPath: string; portalBase: string; host: string }> = [];
+    const extraPortalUrls: string[] = Array.isArray(job.portalUrls) ? (job.portalUrls as string[]) : [];
+    for (const extraUrl of extraPortalUrls.slice(0, 20)) {
+      if (!(await waitForAllowedWindow())) return;
+      try {
+        const validation = await validateStalkerPortal(extraUrl, timeoutMs);
+        if (validation.valid && validation.serverPath) {
+          portalAlternatives.push({
+            serverPath: validation.serverPath,
+            portalBase: validation.portalBase || `${new URL(validation.serverPath).origin}/c/`,
+            host: hostOf(validation.serverPath),
+          });
+        } else {
+          await addLog(jobId, "warning", `Extra portal skipped (not a Stalker portal): ${extraUrl}`);
+        }
+      } catch (err) {
+        await addLog(
+          jobId,
+          "warning",
+          `Extra portal skipped: ${extraUrl} (${err instanceof Error ? err.message : "unreachable"})`
+        );
+      }
+    }
+    if (portalAlternatives.length > 0) {
+      await addLog(
+        jobId,
+        "info",
+        `Second-chance re-check enabled: rejected MACs are retried on ${portalAlternatives.length} extra portal(s) (${portalAlternatives
+          .map((target) => target.host)
+          .join(", ")})`
+      );
+    }
+
+    // ── Global settings used by the optional add-ons ──────────────────
+    const allSettings = await db.select().from(settings);
+    const settingsMap = Object.fromEntries(allSettings.map((row) => [row.key, row.value || ""]));
+    const userAgents = parseUserAgentList(settingsMap.ua_list);
+    const rememberedUserAgent = settingsMap[userAgentSettingKey(portalHost)] || null;
+    const proxyPool = parseProxyList(settingsMap.proxy_list).filter((proxy) => proxy);
+    const proxyEnabled = (job as { proxyEnabled?: number }).proxyEnabled === 1 && proxyPool.length > 0;
+    const scanProxy = proxyEnabled ? proxyPool[0] : null;
+    if (scanProxy) {
+      await addLog(
+        jobId,
+        "info",
+        `Egress proxy available: ${scanProxy.host}:${scanProxy.port} (used for stream probes and quality checks)`
+      );
+    }
+
+    // ── User-agent rotation (per portal host, remembered in settings) ──
+    const serialNumber = computeSerialNumber(firstMacForProbe(macPrefix, macList), serverPath);
+    let scanRequestOptions: PortalRequestOptions = { userAgent: rememberedUserAgent, serialNumber };
+
+    if ((job.uaRotationEnabled ?? 1) !== 0) {
+      const candidates = buildUserAgentCandidates(rememberedUserAgent, userAgents);
+      if (candidates.length > 1 || !rememberedUserAgent) {
+        const probeMac = firstMacForProbe(macPrefix, macList);
+        for (let index = 0; index < candidates.length; index += 1) {
+          if (!(await waitForAllowedWindow())) return;
+          const token = await doHandshake(serverPath, portalBase, probeMac, timeoutMs, isAborted, {
+            userAgent: candidates[index],
+            serialNumber,
+          });
+          if (token) {
+            scanRequestOptions = { userAgent: candidates[index], serialNumber };
+            if (candidates[index] !== rememberedUserAgent) {
+              await addLog(
+                jobId,
+                "success",
+                index === 0
+                  ? `User agent remembered for ${portalHost}`
+                  : `User-agent rotation: candidate ${index + 1}/${candidates.length} worked — remembering it for ${portalHost}`
+              );
+              await db
+                .insert(settings)
+                .values({ key: userAgentSettingKey(portalHost), value: candidates[index] })
+                .onConflictDoUpdate({
+                  target: settings.key,
+                  set: { value: candidates[index], updatedAt: new Date() },
+                });
+            }
+            break;
+          }
+          await addLog(
+            jobId,
+            "warning",
+            `Handshake failed with user agent ${index + 1}/${candidates.length} (${candidates[index].slice(0, 40)}…)`
+          );
+        }
+      }
+    }
+    await addLog(jobId, "info", `Serial number (fingerprint): ${serialNumber}`);
+
+    if (!(await waitForAllowedWindow())) return;
+    // Opportunistic housekeeping: thumbnails older than two weeks are pruned.
+    void pruneThumbnails().catch(() => undefined);
 
     // ── Resolve server geolocation once at the beginning. ─────────────
     if (!(await waitForAllowedWindow())) return;
@@ -1310,13 +1462,24 @@ export async function startScan(jobId: number, skipVerification: boolean = false
       }
 
       // ── Inner loop: iterate over shuffled indices within block ──
-      for (const macIndex of indices) {
+      //
+      // With concurrency > 1 the block's index list is split into interleaved
+      // slices, each running this same sequential loop. Interleaving keeps MACs
+      // spread across the address space, and a shared per-host rate limiter
+      // stops parallel workers from bursting the portal.
+      const runSlice = async (slice: number[]): Promise<void> => {
+      for (const macIndex of slice) {
         if (isAborted() || !(await waitForAllowedWindow())) {
           abortedEarly = true;
           break;
         }
 
-        const mac = buildMacAddressFromIndex(macPrefix, macIndex);
+        if (scanConcurrency > 1) {
+          await portalRateLimiter.wait(portalHost);
+        }
+
+        // Prefix enumeration or an explicit MAC list (bulk mode).
+        const mac = macListMode ? (macList![macIndex] as string) : buildMacAddressFromIndex(macPrefix, macIndex);
         tested += 1;
 
         // Update progress in DB every 5 MACs
@@ -1342,33 +1505,61 @@ export async function startScan(jobId: number, skipVerification: boolean = false
         }
 
         try {
+          // Portal candidates for this MAC: the primary portal first, then one
+          // rotating alternative when the job was given extra portals.
+          const macTargets =
+            portalAlternatives.length > 0
+              ? [primaryTarget, portalAlternatives[(tested + blockIdx) % portalAlternatives.length]]
+              : [primaryTarget];
+
           // STEP 1 – Handshake (token alone does NOT mean the MAC is valid).
           // Time the two portal requests separately so schedule pauses between
           // them are not mistaken for slow server response time.
-          const macTestStart = performance.now();
-          const token = await doHandshake(serverPath, portalBase, mac, timeoutMs, isAborted);
-          const handshakeTimeMs = Math.round(performance.now() - macTestStart);
-          if (!token) {
-            continue;
-          }
-          if (!(await waitForAllowedWindow())) {
-            abortedEarly = true;
-            break;
+          let macTarget = macTargets[0];
+          let token: string | null = null;
+          let accountResponse: PortalResponse<Record<string, unknown>> | null = null;
+          let handshakeTimeMs = 0;
+          let accountInfoTimeMs = 0;
+
+          for (let targetIndex = 0; targetIndex < macTargets.length; targetIndex += 1) {
+            const target = macTargets[targetIndex];
+            const macTestStart = performance.now();
+            token = await doHandshake(target.serverPath, target.portalBase, mac, timeoutMs, isAborted, scanRequestOptions);
+            handshakeTimeMs = Math.round(performance.now() - macTestStart);
+            if (!token) continue;
+            if (!(await waitForAllowedWindow())) {
+              abortedEarly = true;
+              break;
+            }
+
+            // STEP 2 – Account info (the REAL validation)
+            const accountInfoStart = performance.now();
+            accountResponse = await fetchAccountInfo(
+              target.serverPath,
+              target.portalBase,
+              mac,
+              token,
+              timeoutMs,
+              isAborted,
+              scanRequestOptions
+            );
+            accountInfoTimeMs = Math.round(performance.now() - accountInfoStart);
+
+            if (accountResponse && isAccountInfoValid(accountResponse.payload)) {
+              macTarget = target;
+              break;
+            }
+            accountResponse = null;
+            if (targetIndex + 1 < macTargets.length) {
+              await addLog(
+                jobId,
+                "info",
+                `MAC ${mac} rejected by ${target.host} — second-chance check on ${macTargets[targetIndex + 1].host}`
+              );
+            }
           }
 
-          // STEP 2 – Account info (the REAL validation)
-          const accountInfoStart = performance.now();
-          const accountResponse = await fetchAccountInfo(
-            serverPath,
-            portalBase,
-            mac,
-            token,
-            timeoutMs,
-            isAborted
-          );
-          const accountInfoTimeMs = Math.round(performance.now() - accountInfoStart);
-
-          if (!accountResponse || !isAccountInfoValid(accountResponse.payload)) {
+          if (!token || !accountResponse || !isAccountInfoValid(accountResponse.payload)) {
             continue;
           }
           const accountInfo = accountResponse.payload;
@@ -1420,7 +1611,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             break;
           }
           const profileResponse = await fetchProfile(
-            serverPath, portalBase, mac, token, timeoutMs, isAborted
+            macTarget.serverPath, macTarget.portalBase, mac, token, timeoutMs, isAborted
           );
           const profileInfo = profileResponse?.payload ?? null;
           if (profileResponse) {
@@ -1452,7 +1643,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
           }
           if (needLive) {
             itvResponse = await fetchGenres(
-              serverPath, portalBase, mac, token, "itv", timeoutMs, isAborted
+              macTarget.serverPath, macTarget.portalBase, mac, token, "itv", timeoutMs, isAborted
             );
             itvGenres = itvResponse?.entries ?? null;
             if (itvGenres && itvGenres.length > 0) {
@@ -1468,7 +1659,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
           }
           if (needVod) {
             vodResponse = await fetchGenres(
-              serverPath, portalBase, mac, token, "vod", timeoutMs, isAborted
+              macTarget.serverPath, macTarget.portalBase, mac, token, "vod", timeoutMs, isAborted
             );
             vodCategories = vodResponse?.entries ?? null;
             if (vodCategories && vodCategories.length > 0) {
@@ -1484,7 +1675,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
               break;
             }
             seriesResponse = await fetchGenres(
-              serverPath, portalBase, mac, token, "series", timeoutMs, isAborted
+              macTarget.serverPath, macTarget.portalBase, mac, token, "series", timeoutMs, isAborted
             );
             seriesCategories = seriesResponse?.entries ?? null;
             if (seriesCategories && seriesCategories.length > 0) {
@@ -1645,7 +1836,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
               },
               fieldProvenance: extractedFields.provenance,
             },
-            stalkerServerPath: serverPath,
+            stalkerServerPath: macTarget.serverPath,
           }).returning();
 
           await addLog(jobId, "info", "Result saved successfully");
@@ -1670,13 +1861,29 @@ export async function startScan(jobId: number, skipVerification: boolean = false
 
             try {
               const qualityReport = await checkMacStreamQuality({
-                serverPath,
-                portalBase,
+                serverPath: macTarget.serverPath,
+                portalBase: macTarget.portalBase,
                 mac,
                 timeoutMs,
                 channelsToProbe: qualityCheck.channels,
                 sampleMs: qualityCheck.sampleMs,
                 signal: controller.signal,
+                userAgents,
+                rememberedUserAgent: scanRequestOptions.userAgent,
+                onUserAgentResolved: async (userAgent) => {
+                  await db
+                    .insert(settings)
+                    .values({ key: userAgentSettingKey(portalHost), value: userAgent })
+                    .onConflictDoUpdate({
+                      target: settings.key,
+                      set: { value: userAgent, updatedAt: new Date() },
+                    });
+                },
+                proxy: scanProxy,
+                pictureChecks: qualityCheck.pictureChecks,
+                thumbnails: qualityCheck.thumbnails,
+                checkCatchUp: qualityCheck.catchUp,
+                concurrency: qualityCheck.concurrency,
               });
 
               for (const line of formatMacQualityLog(qualityReport)) {
@@ -1685,6 +1892,14 @@ export async function startScan(jobId: number, skipVerification: boolean = false
 
               const aggregate = qualityReport.aggregate;
               const measuredChannel = qualityReport.channels.find((entry) => entry.probe);
+              const thumbnailChannel = qualityReport.channels.find((entry) => entry.thumbnail);
+
+              // Probe history → EWMA + trend (trust over time).
+              const history = await recordProbeRun(savedResult.id, jobId, mac, qualityReport);
+              const ewma = history.ewma;
+              const trend = history.trend;
+              const degradation = detectDegradation(history.runs);
+
               await db
                 .update(scanResults)
                 .set({
@@ -1701,9 +1916,30 @@ export async function startScan(jobId: number, skipVerification: boolean = false
                   qualityChannelsProbed: aggregate.channelsProbed,
                   qualityCheckedAt: new Date(qualityReport.measuredAt),
                   qualityReport,
+                  qualityFrozen: aggregate.frozenChannels > 0 ? 1 : 0,
+                  qualityLabelMismatch: aggregate.labelMismatches > 0 ? `${aggregate.labelMismatches} channel(s) mislabeled` : null,
+                  qualityRetries: measuredChannel?.probe?.retryCount ?? 0,
+                  qualityThroughputCv: measuredChannel?.probe?.throughputCoefficientOfVariation ?? null,
+                  qualityCatchUpStatus: qualityReport.catchUp?.status ?? "not_checked",
+                  qualityCatchUpDays: qualityReport.catchUp?.verifiedMinutes
+                    ? qualityReport.catchUp.verifiedMinutes / (60 * 24)
+                    : null,
+                  qualityThumbnail: thumbnailChannel?.thumbnail ?? null,
+                  qualityEwma: ewma,
+                  qualityTrend: trend,
+                  qualityGenreSummary: qualityReport.genreGroups,
                 })
                 .where(eq(scanResults.id, savedResult.id));
 
+              if (degradation.degraded) {
+                await addLog(
+                  jobId,
+                  "warning",
+                  `ALERT: ${mac} is degrading — latest ${degradation.latest?.toFixed(1)} vs EWMA ${degradation.ewma?.toFixed(
+                    1
+                  )} (drop ${degradation.drop?.toFixed(1)}, ${history.runs.length} probe runs)`
+                );
+              }
               await addLog(jobId, "info", "Stream quality report saved");
             } catch (qualityError) {
               await addLog(
@@ -1754,6 +1990,23 @@ export async function startScan(jobId: number, skipVerification: boolean = false
         // Small delay to avoid overwhelming the portal
         await new Promise((r) => setTimeout(r, 100));
       } // end inner block loop
+      };
+
+      // Run the slice(s): one worker when sequential, N interleaved workers
+      // when the user asked for concurrency (capped, rate-limited).
+      const slices: number[][] = [];
+      if (scanConcurrency > 1) {
+        for (let worker = 0; worker < scanConcurrency; worker += 1) {
+          slices.push(indices.filter((_, position) => position % scanConcurrency === worker));
+        }
+      } else {
+        slices.push(indices);
+      }
+      await Promise.all(slices.map((slice) => runSlice(slice)));
+      if (isAborted()) {
+        abortedEarly = true;
+        break;
+      }
     } // end outer block loop
 
     // ── Final status ──
@@ -1844,4 +2097,81 @@ export function isScanRunning(jobId: number): boolean {
 
 export function getActiveScans(): number[] {
   return Array.from(activeScans.keys());
+}
+
+// ============================================================================
+// PROBE HISTORY (trust over time)
+// ============================================================================
+
+/**
+ * Append one row to quality_probe_runs and return the row plus the updated
+ * EWMA/trend across all runs stored for that result.
+ */
+async function recordProbeRun(
+  resultId: number,
+  jobId: number,
+  mac: string,
+  report: { aggregate: { overallScore: number | null; speedScore: number | null; qualityScore: number | null; stabilityScore: number | null; verdict: string; channelsPlayable: number; channelsProbed: number; frozenChannels: number; labelMismatches: number }; channels: Array<{ probe: { sustainedMbps: number | null; requiredMbps: number | null } | null }>; portal?: { viaProxy: string | null } }
+): Promise<{ runs: ProbeRun[]; ewma: number | null; trend: string }> {
+  const measuredChannel = report.channels.find((channel) => channel.probe);
+  const row = {
+    resultId,
+    jobId,
+    macAddress: mac,
+    measuredAt: new Date(),
+    overallScore: report.aggregate.overallScore,
+    speedScore: report.aggregate.speedScore,
+    qualityScore: report.aggregate.qualityScore,
+    stabilityScore: report.aggregate.stabilityScore,
+    verdict: report.aggregate.verdict,
+    throughputMbps: measuredChannel?.probe?.sustainedMbps ?? null,
+    requiredMbps: measuredChannel?.probe?.requiredMbps ?? null,
+    channelsPlayable: report.aggregate.channelsPlayable,
+    channelsProbed: report.aggregate.channelsProbed,
+    frozen: report.aggregate.frozenChannels > 0 ? 1 : 0,
+    labelMismatches: report.aggregate.labelMismatches,
+    viaProxy: report.portal?.viaProxy ?? null,
+    source: "scan",
+  };
+
+  try {
+    await db.insert(qualityProbeRuns).values(row);
+  } catch {
+    // History is best-effort: never fail a scan because of the audit trail.
+    return { runs: [], ewma: null, trend: "insufficient_data" };
+  }
+
+  const stored = await db
+    .select()
+    .from(qualityProbeRuns)
+    .where(eq(qualityProbeRuns.resultId, resultId))
+    .orderBy(qualityProbeRuns.measuredAt);
+
+  const runs: ProbeRun[] = stored.map((entry) => ({
+    id: entry.id,
+    resultId: entry.resultId,
+    measuredAt: entry.measuredAt.toISOString(),
+    overall: entry.overallScore,
+    speed: entry.speedScore,
+    quality: entry.qualityScore,
+    stability: entry.stabilityScore,
+    verdict: entry.verdict,
+    throughputMbps: entry.throughputMbps,
+    requiredMbps: entry.requiredMbps,
+    channelsPlayable: entry.channelsPlayable,
+    channelsProbed: entry.channelsProbed,
+  }));
+
+  const summary = summariseHistory(runs);
+  return { runs, ewma: summary.ewma, trend: summary.trend };
+}
+
+// ============================================================================
+// UA ROTATION HELPERS
+// ============================================================================
+
+/** First MAC address of the job (used for the pre-scan handshake probe). */
+function firstMacForProbe(macPrefix: string, macList: string[] | null): string {
+  if (macList && macList.length > 0) return macList[0];
+  return buildMacAddressFromIndex(macPrefix, 0);
 }
