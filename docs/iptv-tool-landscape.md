@@ -176,6 +176,10 @@ dishonest claim to fix — it is a future integration, not a bug.
 ### 🔴 Gap 14 — UDP/multicast and RTSP/RTMP ingestion — **low**
 *Seen in:* multicast-checker, Wisp. Stalker portals are HTTP/HLS-first; low priority.
 
+### 📋 Decision table
+A prioritized, tabular version of these gaps — with added value, implementation path, effort and a
+suggested sequence — lives in [`feature-gap-roadmap.md`](feature-gap-roadmap.md).
+
 ### 🟡 Smaller niceties we still lack
 * **User-agent rotation** (`agents.txt`) — zinzied. One-line support; helps when a portal blocks the MAG UA.
 * **“Second-chance” portal re-check with alternate parameters** — KiddaC. Cheap and improves validation accuracy.
