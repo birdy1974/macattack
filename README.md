@@ -366,7 +366,7 @@ npm run test:waves      # pure logic (no server needed)
 | Variable | Effect |
 |---|---|
 | `FFMPEG_PATH` | Path to `ffmpeg` when it is not on `PATH` (enables picture checks/thumbnails) |
-| `MACATTACK_DATA_DIR` | Where thumbnails are stored (default `./data/thumbnails`, pruned after 14 days; the bundled compose file mounts a volume at `/app/data` so they survive updates) |
+| `MACATTACK_DATA_DIR` | Base directory for the thumbnail cache — files land in `<dir>/thumbnails` (default `./data`, pruned after 14 days; the bundled compose file mounts a volume at `/app/data` so they survive updates) |
 | `MACATTACK_STB_USER_AGENT` | Overrides the default MAG user agent |
 | `MACATTACK_ALLOW_LOCAL_STREAMS=1` | Test escape hatch: allow loopback stream URLs (used by the fixture suites) |
 | `MACATTACK_FREEZE_NOISE`, `MACATTACK_FREEZE_MIN_SEC`, `MACATTACK_BLACK_MIN_SEC` | Tune ffmpeg freeze/black thresholds |

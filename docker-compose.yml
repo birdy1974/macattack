@@ -68,7 +68,7 @@ services:
       DATABASE_URL: postgresql://macattack:macattack_secret_pw@db:5432/macattack_db
       NODE_ENV: production
       # Captured stream thumbnails live here (optional ffmpeg pack).
-      MACATTACK_DATA_DIR: /app/data/thumbnails
+      MACATTACK_DATA_DIR: /app/data
     volumes:
       # Keeps captured thumbnails across container updates. Everything else
       # works without it; a Docker-managed volume starts writable by the app
