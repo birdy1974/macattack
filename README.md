@@ -246,13 +246,36 @@ Use the filter buttons to show/hide:
 Export to CSV or TXT when valid MACs are found. JSON exports include the complete portal responses and the detailed quality report; treat these files as sensitive because portal responses can contain credentials.
 
 ### 7. Read the quality report
-The report deliberately separates portal responsiveness from actual playback:
+The report separates portal responsiveness from actual stream delivery:
 
 - At scan start, MacAttack records eight TCP connection attempts to the portal, including the individual timings, failures, median, p95, variation, and sample window. It also records one HTTP handshake-endpoint timing breakdown (DNS, TCP, TLS, TTFB, total, and status).
 - For each saved result, it records the Stalker handshake and `account_info` request times separately and together. These are control/API timings, not channel startup times.
-- **Playback stability is marked “Not tested.”** The scanner does not open a media stream, so it cannot measure freezes, buffering, video bitrate, or playback errors. The portal and media server can be different hosts, and these measurements originate from the scanner host rather than the viewer’s device/network.
-- The result intentionally does not assign a single stream-quality score. The checks are a short, limited-confidence snapshot, not a guarantee about future or peak-hour playback. Operator-side source/server telemetry is not available to a portal-only scan.
+- **When a MAC passes your filters, MacAttack measures the real media path** (on by default, see step 8):
+  it lists the portal's channels, resolves real stream URLs with `create_link`, and probes a genre-spread
+  sample of those streams. It measures sustained throughput vs. the bitrate the stream needs, the variant
+  ladder (resolution/codec/bandwidth), HLS segment transfer time vs. segment duration (can the connection
+  keep up with real time?), MPEG-TS continuity-counter errors and scrambled packets, and DRM.
+- The result is a **speed / picture-quality / stability / overall score (0–10) with a verdict**, stored per
+  result and exportable (`Stream Quality Verdict`, `Stream Quality Score`, …). Every report lists what it
+  does **not** establish: it is a short sample from the scanner host, no video is decoded (so picture
+  freezes are not detected), and it cannot see peak-hour congestion.
 
+### 8. Stream quality check (optional, on by default)
+The **🎚️ Stream quality check** panel controls the media-path probe:
+
+- **Channels to probe (1–8)** — spread across genres so one broken category cannot dominate the verdict.
+- **Sample per channel (3–30 s)** — longer windows catch stalls and bitrate dips.
+
+The UI shows a **Streams** column per result and, in *Quality details*, a per-channel table with verdict and
+sub-scores, plus buttons to **Re-check streams** (streams change over time) and **Download M3U** (export the
+account's playable channels as a playlist — the same idea as Flux-Stream's Stalker→M3U converter). Stream
+URLs are stored with session tokens removed, so a re-check always performs a fresh `create_link`.
+
+The full reasoning, the scoring model, and a comparison against the wider tool ecosystem (IPTVChecker,
+Flux-Stream, Stalker-Portal-Checker, m3u-editor, multicast-checker, …) with the feature gaps we still have
+lives in [`docs/iptv-tool-landscape.md`](docs/iptv-tool-landscape.md).
+
+### 9. Set allowed work hours (optional)
 ### 8. Set allowed work hours (optional)
 Open **Schedule** and enable the schedule to choose allowed days and start/end
 hours in an IANA time zone (for example, `Europe/London`). A running scan pauses
@@ -349,6 +372,14 @@ Next.js server — give it a few seconds on first boot.
 │   ├── app/               # Next.js pages & API routes
 │   ├── db/                # Database schema
 │   └── lib/               # Scanner logic
+│       ├── scanner.ts         # MAC enumeration + portal validation
+│       ├── stream-probe.ts    # media-path measurement (HLS/MPEG-TS, no ffmpeg)
+│       ├── stalker-streams.ts # handshake → channels → create_link → M3U
+│       ├── mac-quality.ts     # per-MAC speed/quality/stability check
+│       └── quality-report.ts  # honest, reproducible quality reporting
+├── docs/
+│   └── iptv-tool-landscape.md # ecosystem deep dive + feature gaps
+├── scripts/               # offline test fixtures and self tests
 └── initial/               # Reference copy of the original local-build version
 ```
 

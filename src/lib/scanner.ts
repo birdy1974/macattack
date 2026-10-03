@@ -51,6 +51,7 @@ import {
   type ExpireFilterConfig,
 } from "@/lib/filters";
 import { extractPortalFields } from "@/lib/portal-result-fields";
+import { checkMacStreamQuality, formatMacQualityLog } from "@/lib/mac-quality";
 
 // ============================================================================
 // ACTIVE SCANS MANAGEMENT
@@ -989,6 +990,13 @@ export async function startScan(jobId: number, skipVerification: boolean = false
       includeUnlimited: Boolean(job.expireFilterIncludeUnlimited ?? true),
     };
 
+    // ── Stream quality check options (defaults are applied in the DB) ──
+    const qualityCheck = {
+      enabled: (job.qualityCheckEnabled ?? 1) !== 0,
+      channels: Math.max(1, Math.min(job.qualityChannels ?? 3, 8)),
+      sampleMs: Math.max(3000, Math.min(job.qualitySampleMs ?? 8000, 30000)),
+    };
+
     // Track how many valid-but-filtered MACs we rejected (for progress).
     let filteredOut = 0;
 
@@ -1009,6 +1017,18 @@ export async function startScan(jobId: number, skipVerification: boolean = false
         }${expireFilter.includeUnlimited ? " (including unlimited)" : " (excluding unlimited)"}`
       );
     }
+    if (qualityCheck.enabled) {
+      await addLog(
+        jobId,
+        "info",
+        `Stream quality check ON: ${qualityCheck.channels} channel(s) per found MAC, ${(
+          qualityCheck.sampleMs / 1000
+        ).toFixed(0)}s sample each`
+      );
+    } else {
+      await addLog(jobId, "info", "Stream quality check OFF (portal/account checks only)");
+    }
+
     if (genreFilter.enabled) {
       const types = [
         genreFilter.matchLive ? "Live" : null,
@@ -1561,7 +1581,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
           await addLog(jobId, "success", `Response time: ${responseTimeMs}ms`);
 
           // Save to database
-          await db.insert(scanResults).values({
+          const [savedResult] = await db.insert(scanResults).values({
             jobId,
             macAddress: mac,
             portalUrl: job.portalUrl,
@@ -1625,9 +1645,76 @@ export async function startScan(jobId: number, skipVerification: boolean = false
               },
               fieldProvenance: extractedFields.provenance,
             },
-          });
+            stalkerServerPath: serverPath,
+          }).returning();
 
           await addLog(jobId, "info", "Result saved successfully");
+
+          // ── Stream quality / speed / stability check ──────────────────
+          // The MAC is valid and passed the user's filters. Now measure the
+          // media path: list channels, resolve a spread of them with
+          // create_link and probe the real streams (speed, resolution/codec,
+          // transport-stream stability). Failures here never fail the scan.
+          if (qualityCheck.enabled && savedResult) {
+            if (!(await waitForAllowedWindow())) {
+              abortedEarly = true;
+              break;
+            }
+            await addLog(
+              jobId,
+              "info",
+              `Checking stream quality for ${mac} (${qualityCheck.channels} channel(s), ${(
+                qualityCheck.sampleMs / 1000
+              ).toFixed(0)}s each)...`
+            );
+
+            try {
+              const qualityReport = await checkMacStreamQuality({
+                serverPath,
+                portalBase,
+                mac,
+                timeoutMs,
+                channelsToProbe: qualityCheck.channels,
+                sampleMs: qualityCheck.sampleMs,
+                signal: controller.signal,
+              });
+
+              for (const line of formatMacQualityLog(qualityReport)) {
+                await addLog(jobId, line.level, line.message);
+              }
+
+              const aggregate = qualityReport.aggregate;
+              const measuredChannel = qualityReport.channels.find((entry) => entry.probe);
+              await db
+                .update(scanResults)
+                .set({
+                  qualityVerdict: aggregate.verdict,
+                  qualityScore: aggregate.overallScore,
+                  qualitySpeedScore: aggregate.speedScore,
+                  qualityQualityScore: aggregate.qualityScore,
+                  qualityStabilityScore: aggregate.stabilityScore,
+                  qualityResolution: measuredChannel?.probe?.resolution?.label ?? null,
+                  qualityCodec: measuredChannel?.probe?.videoCodec ?? null,
+                  qualityThroughputMbps: measuredChannel?.probe?.sustainedMbps ?? null,
+                  qualityRequiredMbps: measuredChannel?.probe?.requiredMbps ?? null,
+                  qualityChannelsPlayable: aggregate.channelsPlayable,
+                  qualityChannelsProbed: aggregate.channelsProbed,
+                  qualityCheckedAt: new Date(qualityReport.measuredAt),
+                  qualityReport,
+                })
+                .where(eq(scanResults.id, savedResult.id));
+
+              await addLog(jobId, "info", "Stream quality report saved");
+            } catch (qualityError) {
+              await addLog(
+                jobId,
+                "warning",
+                `Stream quality check failed: ${
+                  qualityError instanceof Error ? qualityError.message : "Unknown error"
+                }`
+              );
+            }
+          }
 
           // Update job progress
           await db

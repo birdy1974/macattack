@@ -25,6 +25,10 @@ export async function POST(request: NextRequest) {
       expireFilterEnabled?: boolean;
       expireFilterMinDate?: string | null;
       expireFilterIncludeUnlimited?: boolean;
+      // Stream quality / speed / stability check
+      qualityCheckEnabled?: boolean;
+      qualityChannels?: number;
+      qualitySampleMs?: number;
     };
 
     const {
@@ -62,6 +66,9 @@ export async function POST(request: NextRequest) {
       expireFilterEnabled = false,
       expireFilterMinDate = null,
       expireFilterIncludeUnlimited = true,
+      qualityCheckEnabled = true,
+      qualityChannels = 3,
+      qualitySampleMs = 8000,
     } = body;
 
     if (!portalUrl) {
@@ -94,6 +101,9 @@ export async function POST(request: NextRequest) {
         expireFilterEnabled: expireFilterEnabled ? 1 : 0,
         expireFilterMinDate: expireFilterMinDate || null,
         expireFilterIncludeUnlimited: expireFilterIncludeUnlimited ? 1 : 0,
+        qualityCheckEnabled: qualityCheckEnabled ? 1 : 0,
+        qualityChannels: Math.max(1, Math.min(Number(qualityChannels) || 3, 8)),
+        qualitySampleMs: Math.max(3000, Math.min(Number(qualitySampleMs) || 8000, 30000)),
       })
       .returning();
 

@@ -163,6 +163,9 @@ async function createSchema() {
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS expire_filter_enabled INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS expire_filter_min_date TEXT",
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS expire_filter_include_unlimited INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS quality_check_enabled INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS quality_channels INTEGER NOT NULL DEFAULT 3",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS quality_sample_ms INTEGER NOT NULL DEFAULT 8000",
     ];
     var resultAlters = [
       "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS response_time_ms INTEGER",
@@ -170,6 +173,20 @@ async function createSchema() {
       "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS account_info_time_ms INTEGER",
       "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS portal_online TEXT",
       "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS last_active TEXT",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS stalker_server_path TEXT",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_verdict TEXT",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_score REAL",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_speed_score REAL",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_quality_score REAL",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_stability_score REAL",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_resolution TEXT",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_codec TEXT",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_throughput_mbps REAL",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_required_mbps REAL",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_channels_playable INTEGER",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_channels_probed INTEGER",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_checked_at TIMESTAMP",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_report JSONB",
     ];
     for (var i = 0; i < jobAlters.length; i++) {
       try { await pool.query(jobAlters[i]); } catch (e) { /* ignore */ }

@@ -51,6 +51,18 @@ export async function GET(request: NextRequest) {
         password: scanResults.password,
         playlistGenres: scanResults.playlistGenres,
         vodCategories: scanResults.vodCategories,
+        qualityVerdict: scanResults.qualityVerdict,
+        qualityScore: scanResults.qualityScore,
+        qualitySpeedScore: scanResults.qualitySpeedScore,
+        qualityQualityScore: scanResults.qualityQualityScore,
+        qualityStabilityScore: scanResults.qualityStabilityScore,
+        qualityResolution: scanResults.qualityResolution,
+        qualityCodec: scanResults.qualityCodec,
+        qualityThroughputMbps: scanResults.qualityThroughputMbps,
+        qualityRequiredMbps: scanResults.qualityRequiredMbps,
+        qualityChannelsPlayable: scanResults.qualityChannelsPlayable,
+        qualityChannelsProbed: scanResults.qualityChannelsProbed,
+        qualityCheckedAt: scanResults.qualityCheckedAt,
         foundAt: scanResults.foundAt,
       })
       .from(scanResults)

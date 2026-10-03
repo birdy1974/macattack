@@ -72,6 +72,19 @@ interface ScanResult {
   handshakeTimeMs: number | null;
   accountInfoTimeMs: number | null;
   qualityReport: QualityReport | null;
+  // Measured stream quality (populated when a valid MAC passes the filters)
+  qualityVerdict?: string | null;
+  qualityScore?: number | null;
+  qualitySpeedScore?: number | null;
+  qualityQualityScore?: number | null;
+  qualityStabilityScore?: number | null;
+  qualityResolution?: string | null;
+  qualityCodec?: string | null;
+  qualityThroughputMbps?: number | null;
+  qualityRequiredMbps?: number | null;
+  qualityChannelsPlayable?: number | null;
+  qualityChannelsProbed?: number | null;
+  qualityCheckedAt?: string | null;
   timezone: string | null;
   portalOnline: string | null;
   lastActive: string | null;
@@ -89,6 +102,52 @@ interface LogEntry {
   level: string;
   message: string;
   createdAt: string;
+}
+
+interface StreamQualityChannelSummary {
+  name: string;
+  url: string | null;
+  linkError: string | null;
+  score: {
+    overall: number | null;
+    speed: number | null;
+    quality: number | null;
+    stability: number | null;
+    verdict: string;
+    label: string;
+    evidence: string[];
+    penalties: string[];
+  } | null;
+  probe: {
+    status: string;
+    container: string;
+    sustainedMbps: number | null;
+    requiredMbps: number | null;
+    resolution: { label: string } | null;
+    videoCodec: string | null;
+    ts: { continuityErrorsPer1000: number; bitrateMbps: number } | null;
+    hls: { segmentsOk: number; segmentsFailed: number; realtimeDeficitMs: number } | null;
+    warnings: string[];
+  } | null;
+}
+
+interface StreamQualityReportSummary {
+  measuredAt: string;
+  portal: { channelListSource: string; channelsListed: number; linksResolved: number; linksFailed: number };
+  channels: StreamQualityChannelSummary[];
+  aggregate: {
+    channelsProbed: number;
+    channelsPlayable: number;
+    speedScore: number | null;
+    qualityScore: number | null;
+    stabilityScore: number | null;
+    overallScore: number | null;
+    verdict: string;
+    label: string;
+    headroomSummary: string | null;
+  };
+  notes: string[];
+  limitations: string[];
 }
 
 interface HASettings {
@@ -113,6 +172,16 @@ const AVAILABLE_FIELDS = [
   { key: "handshakeTimeMs", label: "Portal Handshake (ms)", default: false },
   { key: "accountInfoTimeMs", label: "Account Info Request (ms)", default: false },
   { key: "qualityReport", label: "Detailed Quality Report (JSON)", default: false },
+  { key: "qualityVerdict", label: "Stream Quality Verdict (measured)", default: true },
+  { key: "qualityScore", label: "Stream Quality Score (0-10)", default: true },
+  { key: "qualitySpeedScore", label: "Stream Speed Score (0-10)", default: false },
+  { key: "qualityStabilityScore", label: "Stream Stability Score (0-10)", default: false },
+  { key: "qualityResolution", label: "Stream Resolution (measured)", default: true },
+  { key: "qualityCodec", label: "Stream Video Codec (measured)", default: false },
+  { key: "qualityThroughputMbps", label: "Stream Throughput (Mbps)", default: true },
+  { key: "qualityRequiredMbps", label: "Stream Required Bitrate (Mbps)", default: false },
+  { key: "qualityChannels", label: "Stream Channels Playable/Probed", default: false },
+  { key: "qualityMeasured", label: "Stream Quality Measured At", default: false },
   { key: "tariffPlan", label: "Tariff Plan", default: true },
   { key: "maxConnections", label: "Max Connections", default: true },
   { key: "activeConnections", label: "Active Connections", default: true },
@@ -155,6 +224,9 @@ export default function MacAttackPage() {
   const [genreMatchLive, setGenreMatchLive] = useState(true);
   const [genreMatchVod, setGenreMatchVod] = useState(true);
   const [genreMatchSeries, setGenreMatchSeries] = useState(true);
+  const [qualityCheckEnabled, setQualityCheckEnabled] = useState(true);
+  const [qualityChannels, setQualityChannels] = useState(3);
+  const [qualitySampleMs, setQualitySampleMs] = useState(8000);
   const [expireFilterEnabled, setExpireFilterEnabled] = useState(false);
   const [expireMinDate, setExpireMinDate] = useState<string>("");
   const [expireIncludeUnlimited, setExpireIncludeUnlimited] = useState(true);
@@ -196,6 +268,10 @@ export default function MacAttackPage() {
   const [results, setResults] = useState<ScanResult[]>([]);
   const [expandedResultId, setExpandedResultId] = useState<number | null>(null);
   const [expandedQualityId, setExpandedQualityId] = useState<number | null>(null);
+  const [qualityDetailByResult, setQualityDetailByResult] = useState<Record<number, StreamQualityReportSummary>>({});
+  const [qualityDetailLoadingId, setQualityDetailLoadingId] = useState<number | null>(null);
+  const [qualityActionId, setQualityActionId] = useState<number | null>(null);
+  const [qualityActionError, setQualityActionError] = useState<string | null>(null);
   const [rawDataByResult, setRawDataByResult] = useState<Record<number, unknown>>({});
   const [rawDataLoadingId, setRawDataLoadingId] = useState<number | null>(null);
   const [rawDataError, setRawDataError] = useState<string | null>(null);
@@ -442,6 +518,10 @@ export default function MacAttackPage() {
           expireFilterEnabled,
           expireFilterMinDate: expireFilterEnabled ? expireMinDate || null : null,
           expireFilterIncludeUnlimited: expireIncludeUnlimited,
+          // Stream quality / speed / stability check for every found MAC
+          qualityCheckEnabled,
+          qualityChannels,
+          qualitySampleMs,
         }),
       });
 
@@ -706,6 +786,23 @@ export default function MacAttackPage() {
     if (field === "qualityReport") {
       return report ? JSON.stringify(report) : "—";
     }
+    if (field === "qualityVerdict") {
+      return result.qualityVerdict ? `${result.qualityVerdict.replace(/^./, (c) => c.toUpperCase())}${result.qualityScore != null ? ` (${result.qualityScore}/10)` : ""}` : "not measured";
+    }
+    if (field === "qualityChannels") {
+      return result.qualityChannelsProbed != null
+        ? `${result.qualityChannelsPlayable ?? 0}/${result.qualityChannelsProbed} playable`
+        : "—";
+    }
+    if (field === "qualityMeasured") {
+      return result.qualityCheckedAt ? new Date(result.qualityCheckedAt).toLocaleString() : "—";
+    }
+    if (field === "qualityThroughputMbps") {
+      return result.qualityThroughputMbps != null ? `${result.qualityThroughputMbps.toFixed(2)} Mbps` : "—";
+    }
+    if (field === "qualityRequiredMbps") {
+      return result.qualityRequiredMbps != null ? `${result.qualityRequiredMbps.toFixed(2)} Mbps` : "—";
+    }
 
     const value = result[field as keyof ScanResult];
     if (value === null || value === undefined || value === "") return "—";
@@ -730,6 +827,115 @@ export default function MacAttackPage() {
     if (v < 300) return "text-cyan-400";
     if (v < 700) return "text-yellow-400";
     return "text-red-400";
+  };
+
+  /** Load the stored per-channel stream-quality report for one result. */
+  const loadQualityDetail = async (resultId: number) => {
+    setQualityDetailLoadingId(resultId);
+    setQualityActionError(null);
+    try {
+      const res = await fetch(`/api/scan/quality?resultId=${resultId}`);
+      const data = (await res.json()) as { report?: StreamQualityReportSummary | null; error?: string };
+      if (!res.ok) {
+        setQualityActionError(data.error || "Could not load the stream-quality report");
+        return;
+      }
+      if (data.report) {
+        setQualityDetailByResult((current) => ({ ...current, [resultId]: data.report as StreamQualityReportSummary }));
+      } else {
+        setQualityActionError("No stream-quality report was stored for this result");
+      }
+    } catch {
+      setQualityActionError("Could not load the stream-quality report");
+    } finally {
+      setQualityDetailLoadingId(null);
+    }
+  };
+
+  /** Re-measure the streams for a stored result (streams change over time). */
+  const recheckQuality = async (resultId: number) => {
+    setQualityActionId(resultId);
+    setQualityActionError(null);
+    try {
+      const res = await fetch("/api/scan/quality", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resultId }),
+      });
+      const data = (await res.json()) as {
+        error?: string;
+        qualityVerdict?: string;
+        qualityScore?: number | null;
+        qualitySpeedScore?: number | null;
+        qualityQualityScore?: number | null;
+        qualityStabilityScore?: number | null;
+        qualityResolution?: string | null;
+        qualityCodec?: string | null;
+        qualityThroughputMbps?: number | null;
+        qualityRequiredMbps?: number | null;
+        qualityChannelsPlayable?: number | null;
+        qualityChannelsProbed?: number | null;
+        qualityCheckedAt?: string | null;
+        qualityReport?: StreamQualityReportSummary | null;
+      };
+      if (!res.ok) {
+        setQualityActionError(data.error || "Stream quality check failed");
+        return;
+      }
+      setResults((current) =>
+        current.map((result) =>
+          result.id === resultId
+            ? {
+                ...result,
+                qualityVerdict: data.qualityVerdict ?? result.qualityVerdict,
+                qualityScore: data.qualityScore ?? result.qualityScore,
+                qualitySpeedScore: data.qualitySpeedScore ?? result.qualitySpeedScore,
+                qualityQualityScore: data.qualityQualityScore ?? result.qualityQualityScore,
+                qualityStabilityScore: data.qualityStabilityScore ?? result.qualityStabilityScore,
+                qualityResolution: data.qualityResolution ?? result.qualityResolution,
+                qualityCodec: data.qualityCodec ?? result.qualityCodec,
+                qualityThroughputMbps: data.qualityThroughputMbps ?? result.qualityThroughputMbps,
+                qualityRequiredMbps: data.qualityRequiredMbps ?? result.qualityRequiredMbps,
+                qualityChannelsPlayable: data.qualityChannelsPlayable ?? result.qualityChannelsPlayable,
+                qualityChannelsProbed: data.qualityChannelsProbed ?? result.qualityChannelsProbed,
+                qualityCheckedAt: data.qualityCheckedAt ?? result.qualityCheckedAt,
+              }
+            : result
+        )
+      );
+      if (data.qualityReport) {
+        setQualityDetailByResult((current) => ({ ...current, [resultId]: data.qualityReport as StreamQualityReportSummary }));
+      }
+    } catch {
+      setQualityActionError("Stream quality check failed");
+    } finally {
+      setQualityActionId(null);
+    }
+  };
+
+  /** Colour a stream-quality verdict for the results table. */
+  const verdictColor = (verdict: string | null | undefined): string => {
+    switch ((verdict || "").toLowerCase()) {
+      case "excellent":
+        return "text-green-300";
+      case "good":
+        return "text-emerald-300";
+      case "fair":
+        return "text-yellow-300";
+      case "poor":
+        return "text-orange-300";
+      case "unusable":
+        return "text-red-300";
+      default:
+        return "text-gray-400";
+    }
+  };
+
+  const scoreColor = (score: number | null | undefined): string => {
+    if (score === null || score === undefined || !Number.isFinite(score)) return "text-gray-400";
+    if (score >= 7) return "text-green-300";
+    if (score >= 5) return "text-yellow-300";
+    return "text-red-300";
   };
 
   const getPortalCheckAssessment = (currentJob: ScanJob) => {
@@ -1523,6 +1729,64 @@ export default function MacAttackPage() {
               </div>
             </div>
 
+            {/* Stream quality check */}
+            <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
+              <label className="flex items-start gap-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={qualityCheckEnabled}
+                  onChange={(e) => setQualityCheckEnabled(e.target.checked)}
+                  disabled={isRunning}
+                  className="mt-1 w-4 h-4 rounded border-gray-600 text-cyan-500 focus:ring-cyan-500 bg-gray-700"
+                />
+                <span>
+                  <span className="text-sm font-semibold text-gray-200">
+                    🎚️ Stream quality check for every found MAC
+                  </span>
+                  <span className="block text-xs text-gray-500 mt-1">
+                    When a MAC passes the filters, MacAttack lists the portal&apos;s channels, resolves real
+                    stream URLs with <em>create_link</em> and measures throughput vs. required bitrate,
+                    resolution/codec and transport-stream stability. Adds roughly 10–30 seconds per found MAC.
+                  </span>
+                </span>
+              </label>
+
+              {qualityCheckEnabled && (
+                <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <label className="block">
+                    <span className="text-xs text-gray-400">Channels to probe (1–8)</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={8}
+                      value={qualityChannels}
+                      onChange={(e) => setQualityChannels(Math.max(1, Math.min(8, Number(e.target.value) || 1)))}
+                      disabled={isRunning}
+                      className="mt-1 w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 focus:outline-none focus:border-cyan-500 disabled:opacity-50"
+                    />
+                    <span className="block text-xs text-gray-500 mt-1">
+                      Spread across genres so one broken category cannot dominate the verdict.
+                    </span>
+                  </label>
+                  <label className="block">
+                    <span className="text-xs text-gray-400">Sample per channel (3–30 seconds)</span>
+                    <input
+                      type="number"
+                      min={3}
+                      max={30}
+                      value={Math.round(qualitySampleMs / 1000)}
+                      onChange={(e) => setQualitySampleMs(Math.max(3, Math.min(30, Number(e.target.value) || 8)) * 1000)}
+                      disabled={isRunning}
+                      className="mt-1 w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 focus:outline-none focus:border-cyan-500 disabled:opacity-50"
+                    />
+                    <span className="block text-xs text-gray-500 mt-1">
+                      Longer windows catch stalls and bitrate dips; shorter windows keep scans fast.
+                    </span>
+                  </label>
+                </div>
+              )}
+            </div>
+
             {/* Output Fields Selection */}
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
               <div className="flex items-center justify-between mb-4">
@@ -1944,7 +2208,23 @@ export default function MacAttackPage() {
                                     ? "Portal check issue"
                                     : "Portal check unavailable"}
                               </p>
-                              <p className="text-xs text-amber-300 mt-0.5">Playback not tested</p>
+                              {result.qualityVerdict && result.qualityVerdict !== "unknown" ? (
+                                <>
+                                  <p className={`text-xs mt-0.5 font-medium ${verdictColor(result.qualityVerdict)}`}>
+                                    Streams: {result.qualityVerdict}
+                                    {result.qualityScore != null ? ` · ${result.qualityScore}/10` : ""}
+                                  </p>
+                                  <p className="text-xs text-gray-400 mt-0.5">
+                                    {result.qualityResolution ?? "resolution n/a"}
+                                    {result.qualityThroughputMbps != null ? ` · ${result.qualityThroughputMbps.toFixed(2)} Mbps` : ""}
+                                    {result.qualityChannelsProbed != null
+                                      ? ` · ${result.qualityChannelsPlayable ?? 0}/${result.qualityChannelsProbed} playable`
+                                      : ""}
+                                  </p>
+                                </>
+                              ) : (
+                                <p className="text-xs text-amber-300 mt-0.5">Streams not measured</p>
+                              )}
                               <button
                                 type="button"
                                 onClick={() => setExpandedQualityId((current) => current === result.id ? null : result.id)}
@@ -2084,6 +2364,147 @@ export default function MacAttackPage() {
                                         <p className="text-sm text-amber-200 mt-1">{result.qualityReport.confidence.label}</p>
                                         <p className="text-xs text-gray-400 mt-1">{result.qualityReport.confidence.explanation}</p>
                                       </div>
+                                    </div>
+
+                                    {/* ── Measured stream quality (real media path) ── */}
+                                    <div className="rounded-lg border border-cyan-900/60 bg-cyan-950/10 p-3 space-y-2">
+                                      <div className="flex flex-wrap items-center justify-between gap-2">
+                                        <div>
+                                          <p className="text-xs font-semibold text-cyan-200">
+                                            Measured stream quality (real media path)
+                                          </p>
+                                          <p className="text-xs text-gray-400 mt-0.5">
+                                            Probe of the channels this MAC can open: throughput vs. required bitrate,
+                                            resolution/codec, and transport-stream stability.
+                                          </p>
+                                        </div>
+                                        <div className="flex flex-wrap gap-2">
+                                          <button
+                                            type="button"
+                                            onClick={() => void recheckQuality(result.id)}
+                                            disabled={qualityActionId === result.id}
+                                            className="px-2 py-1 text-xs text-cyan-200 hover:text-cyan-100 border border-cyan-800 rounded disabled:opacity-50"
+                                          >
+                                            {qualityActionId === result.id ? "Measuring…" : "Re-check streams"}
+                                          </button>
+                                          <a
+                                            href={`/api/scan/playlist?resultId=${result.id}&limit=200`}
+                                            className="px-2 py-1 text-xs text-green-200 hover:text-green-100 border border-green-900 rounded"
+                                          >
+                                            Download M3U
+                                          </a>
+                                          <button
+                                            type="button"
+                                            onClick={() => void loadQualityDetail(result.id)}
+                                            disabled={qualityDetailLoadingId === result.id}
+                                            className="px-2 py-1 text-xs text-gray-300 hover:text-gray-100 border border-gray-700 rounded disabled:opacity-50"
+                                          >
+                                            {qualityDetailLoadingId === result.id ? "Loading…" : "Per-channel detail"}
+                                          </button>
+                                        </div>
+                                      </div>
+
+                                      {qualityActionError && <p className="text-xs text-red-300">{qualityActionError}</p>}
+
+                                      {result.qualityVerdict ? (
+                                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                                          <div className="bg-gray-900 rounded-lg p-2">
+                                            <p className="text-xs uppercase tracking-wide text-gray-500">Verdict</p>
+                                            <p className={`text-sm font-medium ${verdictColor(result.qualityVerdict)}`}>
+                                              {result.qualityVerdict}
+                                            </p>
+                                            <p className="text-xs text-gray-500 mt-0.5">
+                                              overall {result.qualityScore ?? "—"}/10 · {result.qualityResolution ?? "resolution n/a"}
+                                            </p>
+                                          </div>
+                                          <div className="bg-gray-900 rounded-lg p-2">
+                                            <p className="text-xs uppercase tracking-wide text-gray-500">Speed</p>
+                                            <p className={`text-sm font-mono ${scoreColor(result.qualitySpeedScore)}`}>
+                                              {result.qualitySpeedScore ?? "—"}/10
+                                            </p>
+                                            <p className="text-xs text-gray-500 mt-0.5">
+                                              {result.qualityThroughputMbps != null ? `${result.qualityThroughputMbps.toFixed(2)} Mbps delivered` : "no throughput figure"}
+                                              {result.qualityRequiredMbps != null ? ` of ${result.qualityRequiredMbps.toFixed(2)} required` : ""}
+                                            </p>
+                                          </div>
+                                          <div className="bg-gray-900 rounded-lg p-2">
+                                            <p className="text-xs uppercase tracking-wide text-gray-500">Picture quality</p>
+                                            <p className={`text-sm font-mono ${scoreColor(result.qualityQualityScore)}`}>
+                                              {result.qualityQualityScore ?? "—"}/10
+                                            </p>
+                                            <p className="text-xs text-gray-500 mt-0.5">{result.qualityCodec ?? "codec unknown"}</p>
+                                          </div>
+                                          <div className="bg-gray-900 rounded-lg p-2">
+                                            <p className="text-xs uppercase tracking-wide text-gray-500">Stability</p>
+                                            <p className={`text-sm font-mono ${scoreColor(result.qualityStabilityScore)}`}>
+                                              {result.qualityStabilityScore ?? "—"}/10
+                                            </p>
+                                            <p className="text-xs text-gray-500 mt-0.5">
+                                              {result.qualityChannelsProbed != null
+                                                ? `${result.qualityChannelsPlayable ?? 0}/${result.qualityChannelsProbed} channels playable`
+                                                : "channels not probed"}
+                                              {result.qualityCheckedAt ? ` · ${new Date(result.qualityCheckedAt).toLocaleString()}` : ""}
+                                            </p>
+                                          </div>
+                                        </div>
+                                      ) : (
+                                        <p className="text-xs text-gray-500">
+                                          No stream measurement recorded for this MAC yet — use “Re-check streams” to measure it now.
+                                        </p>
+                                      )}
+
+                                      {qualityDetailByResult[result.id] && (
+                                        <div className="space-y-2">
+                                          <p className="text-xs text-gray-400">
+                                            {qualityDetailByResult[result.id].aggregate.label}
+                                            {qualityDetailByResult[result.id].aggregate.headroomSummary
+                                              ? ` · ${qualityDetailByResult[result.id].aggregate.headroomSummary}`
+                                              : ""}
+                                          </p>
+                                          <div className="overflow-x-auto">
+                                            <table className="w-full text-xs">
+                                              <thead>
+                                                <tr className="text-gray-500">
+                                                  <th className="text-left py-1 pr-3">Channel</th>
+                                                  <th className="text-left py-1 pr-3">Verdict</th>
+                                                  <th className="text-left py-1 pr-3">Overall</th>
+                                                  <th className="text-left py-1 pr-3">Speed</th>
+                                                  <th className="text-left py-1 pr-3">Quality</th>
+                                                  <th className="text-left py-1 pr-3">Stability</th>
+                                                  <th className="text-left py-1">Evidence</th>
+                                                </tr>
+                                              </thead>
+                                              <tbody className="divide-y divide-gray-800/60">
+                                                {qualityDetailByResult[result.id].channels.map((channel, index) => (
+                                                  <tr key={`${channel.name}-${index}`}>
+                                                    <td className="py-1 pr-3 text-gray-300 max-w-48 truncate" title={channel.name}>
+                                                      {channel.name}
+                                                    </td>
+                                                    <td className={`py-1 pr-3 ${verdictColor(channel.score?.verdict)}`}>
+                                                      {channel.score?.verdict ?? channel.linkError ?? "not measured"}
+                                                    </td>
+                                                    <td className="py-1 pr-3 font-mono">{channel.score?.overall ?? "—"}</td>
+                                                    <td className="py-1 pr-3 font-mono">{channel.score?.speed ?? "—"}</td>
+                                                    <td className="py-1 pr-3 font-mono">{channel.score?.quality ?? "—"}</td>
+                                                    <td className="py-1 pr-3 font-mono">{channel.score?.stability ?? "—"}</td>
+                                                    <td className="py-1 text-gray-500 max-w-96 whitespace-pre-wrap break-words">
+                                                      {channel.score?.evidence?.slice(0, 2).join(" · ") ?? "—"}
+                                                      {channel.score?.penalties && channel.score.penalties.length > 0
+                                                        ? `\n! ${channel.score.penalties.join(" · ")}`
+                                                        : ""}
+                                                    </td>
+                                                  </tr>
+                                                ))}
+                                              </tbody>
+                                            </table>
+                                          </div>
+                                          <ul className="list-disc pl-5 space-y-0.5 text-xs text-gray-500">
+                                            {qualityDetailByResult[result.id].limitations.map((limitation) => (
+                                              <li key={limitation}>{limitation}</li>
+                                            ))}
+                                          </ul>
+                                        </div>
+                                      )}
                                     </div>
 
                                     <div className="rounded-lg border border-gray-800 bg-gray-900 p-3">

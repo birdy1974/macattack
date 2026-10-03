@@ -55,6 +55,11 @@ export const scanJobs = pgTable("scan_jobs", {
   serverIp: text("server_ip"),
   serverGeoRaw: jsonb("server_geo_raw"),
 
+  // ── Stream quality check (runs for every MAC that passes the filters) ──
+  qualityCheckEnabled: integer("quality_check_enabled").notNull().default(1),
+  qualityChannels: integer("quality_channels").notNull().default(3),
+  qualitySampleMs: integer("quality_sample_ms").notNull().default(8000),
+
   // ── Filters (applied at scan time; stored so history/UI can replay them) ──
   genreFilterEnabled: integer("genre_filter_enabled").notNull().default(0), // 0/1 boolean
   genreFilterKeywords: text("genre_filter_keywords").notNull().default(""),
@@ -98,6 +103,24 @@ export const scanResults = pgTable("scan_results", {
   password: text("password"),
   playlistGenres: text("playlist_genres"),
   vodCategories: text("vod_categories"),
+
+  // ── Measured stream quality for this MAC (see src/lib/mac-quality.ts) ──
+  // Populated right after the MAC is validated and passes the user's filters.
+  stalkerServerPath: text("stalker_server_path"),
+  qualityVerdict: text("quality_verdict"), // excellent | good | fair | poor | unusable | unknown
+  qualityScore: real("quality_score"), // 0-10 aggregate
+  qualitySpeedScore: real("quality_speed_score"),
+  qualityQualityScore: real("quality_quality_score"),
+  qualityStabilityScore: real("quality_stability_score"),
+  qualityResolution: text("quality_resolution"), // e.g. "1080p"
+  qualityCodec: text("quality_codec"), // e.g. "H.264"
+  qualityThroughputMbps: real("quality_throughput_mbps"),
+  qualityRequiredMbps: real("quality_required_mbps"),
+  qualityChannelsPlayable: integer("quality_channels_playable"),
+  qualityChannelsProbed: integer("quality_channels_probed"),
+  qualityCheckedAt: timestamp("quality_checked_at"),
+  qualityReport: jsonb("quality_report").$type<unknown>(),
+
   rawData: jsonb("raw_data"),
   foundAt: timestamp("found_at").defaultNow().notNull(),
 });
