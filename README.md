@@ -243,9 +243,17 @@ Use the filter buttons to show/hide:
 - ❌ Error messages
 
 ### 6. Download Results
-Export to CSV or TXT when valid MACs are found.
+Export to CSV or TXT when valid MACs are found. JSON exports include the complete portal responses and the detailed quality report; treat these files as sensitive because portal responses can contain credentials.
 
-### 7. Set allowed work hours (optional)
+### 7. Read the quality report
+The report deliberately separates portal responsiveness from actual playback:
+
+- At scan start, MacAttack records eight TCP connection attempts to the portal, including the individual timings, failures, median, p95, variation, and sample window. It also records one HTTP handshake-endpoint timing breakdown (DNS, TCP, TLS, TTFB, total, and status).
+- For each saved result, it records the Stalker handshake and `account_info` request times separately and together. These are control/API timings, not channel startup times.
+- **Playback stability is marked “Not tested.”** The scanner does not open a media stream, so it cannot measure freezes, buffering, video bitrate, or playback errors. The portal and media server can be different hosts, and these measurements originate from the scanner host rather than the viewer’s device/network.
+- The result intentionally does not assign a single stream-quality score. The checks are a short, limited-confidence snapshot, not a guarantee about future or peak-hour playback. Operator-side source/server telemetry is not available to a portal-only scan.
+
+### 8. Set allowed work hours (optional)
 Open **Schedule** and enable the schedule to choose allowed days and start/end
 hours in an IANA time zone (for example, `Europe/London`). A running scan pauses
 automatically outside those windows and resumes when the next window opens;

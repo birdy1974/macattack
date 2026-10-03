@@ -1,11 +1,15 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
+import { BRAND_IMAGE_URL } from "@/lib/branding";
 import "./globals.css";
 
 export const metadata: Metadata = {
   title: "MacAttack – IPTV Stalker Portal Scanner",
   description:
     "Scan and test IPTV Stalker middleware portals for valid MAC addresses. For authorized testing only.",
+  icons: {
+    icon: BRAND_IMAGE_URL,
+  },
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {

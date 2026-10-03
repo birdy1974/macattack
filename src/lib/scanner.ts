@@ -42,6 +42,7 @@ import {
   tcpPing,
   measureHttpRequest,
   parseHostPort,
+  type TcpPingResult,
 } from "@/lib/network-diags";
 import {
   genresPassFilter,
@@ -49,6 +50,7 @@ import {
   type GenreFilterConfig,
   type ExpireFilterConfig,
 } from "@/lib/filters";
+import { extractPortalFields } from "@/lib/portal-result-fields";
 
 // ============================================================================
 // ACTIVE SCANS MANAGEMENT
@@ -247,6 +249,11 @@ const PORTAL_PATTERNS = [
   { path: "load.php", base: "" },
 ];
 
+// This is the timezone sent by this scanner in the STB request cookie. Keep it
+// distinct from timezone values returned by the portal: the cookie is a
+// client-supplied request value, not evidence of the subscriber's timezone.
+const STB_REQUEST_TIMEZONE = "Europe/London";
+
 function getBaseUrl(url: string): string {
   let base = url.trim();
 
@@ -274,7 +281,7 @@ const STB_HEADERS = {
 };
 
 function makeCookie(mac: string): string {
-  return `mac=${encodeURIComponent(mac)}; stb_lang=en; timezone=Europe/London`;
+  return `mac=${encodeURIComponent(mac)}; stb_lang=en; timezone=${STB_REQUEST_TIMEZONE}`;
 }
 
 // ============================================================================
@@ -441,7 +448,7 @@ async function findWorkingEndpoint(
         method: "GET",
         headers: {
           ...STB_HEADERS,
-          Cookie: "mac=00:1A:79:00:00:00; stb_lang=en; timezone=Europe/London",
+          Cookie: `mac=00:1A:79:00:00:00; stb_lang=en; timezone=${STB_REQUEST_TIMEZONE}`,
         },
         signal: controller.signal,
       });
@@ -506,7 +513,7 @@ export async function validateStalkerPortal(
         method: "GET",
         headers: {
           ...STB_HEADERS,
-          Cookie: "mac=00:1A:79:00:00:00; stb_lang=en; timezone=Europe/London",
+          Cookie: `mac=00:1A:79:00:00:00; stb_lang=en; timezone=${STB_REQUEST_TIMEZONE}`,
         },
         signal: controller.signal,
       });
@@ -586,6 +593,62 @@ async function doHandshake(
   }
 }
 
+interface PortalResponse<T> {
+  payload: T;
+  rawResponse: unknown;
+  statusCode: number;
+  endpoint: string;
+  receivedAt: string;
+}
+
+interface PortalCategoryResponse {
+  entries: Array<{ id: string; title: string }>;
+  rawResponse: unknown;
+  statusCode: number;
+  endpoint: string;
+  receivedAt: string;
+}
+
+function asPortalRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function getPortalObjectPayload(rawResponse: unknown): Record<string, unknown> | null {
+  const root = asPortalRecord(rawResponse);
+  if (!root) return null;
+  return asPortalRecord(root.js) || root;
+}
+
+function responseEndpoint(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.pathname}${parsed.search}`;
+  } catch {
+    return url;
+  }
+}
+
+function responseForStorage(
+  response:
+    | {
+        rawResponse: unknown;
+        statusCode: number;
+        endpoint: string;
+        receivedAt: string;
+      }
+    | null
+) {
+  if (!response) return null;
+  return {
+    statusCode: response.statusCode,
+    endpoint: response.endpoint,
+    receivedAt: response.receivedAt,
+    body: response.rawResponse,
+  };
+}
+
 async function fetchProfile(
   serverPath: string,
   portalBase: string,
@@ -593,7 +656,7 @@ async function fetchProfile(
   token: string,
   timeoutMs: number,
   aborted: () => boolean
-): Promise<Record<string, unknown> | null> {
+): Promise<PortalResponse<Record<string, unknown>> | null> {
   if (aborted()) return null;
 
   const url = `${serverPath}?type=stb&action=get_profile&hd=1&num_banks=1&stb_type=MAG250&JsHttpRequest=1-xml`;
@@ -616,8 +679,17 @@ async function fetchProfile(
     clearTimeout(t);
     if (!res.ok) return null;
 
-    const data = (await res.json()) as { js?: Record<string, unknown> };
-    return data?.js || null;
+    const rawResponse: unknown = await res.json();
+    const payload = getPortalObjectPayload(rawResponse);
+    if (!payload) return null;
+
+    return {
+      payload,
+      rawResponse,
+      statusCode: res.status,
+      endpoint: responseEndpoint(url),
+      receivedAt: new Date().toISOString(),
+    };
   } catch {
     return null;
   }
@@ -630,7 +702,7 @@ async function fetchAccountInfo(
   token: string,
   timeoutMs: number,
   aborted: () => boolean
-): Promise<Record<string, unknown> | null> {
+): Promise<PortalResponse<Record<string, unknown>> | null> {
   if (aborted()) return null;
 
   const url = `${serverPath}?type=account_info&action=get_main_info&JsHttpRequest=1-xml`;
@@ -653,8 +725,17 @@ async function fetchAccountInfo(
     clearTimeout(t);
     if (!res.ok) return null;
 
-    const data = (await res.json()) as { js?: Record<string, unknown> };
-    return data?.js || null;
+    const rawResponse: unknown = await res.json();
+    const payload = getPortalObjectPayload(rawResponse);
+    if (!payload) return null;
+
+    return {
+      payload,
+      rawResponse,
+      statusCode: res.status,
+      endpoint: responseEndpoint(url),
+      receivedAt: new Date().toISOString(),
+    };
   } catch {
     return null;
   }
@@ -668,7 +749,7 @@ async function fetchGenres(
   type: "itv" | "vod" | "series",
   timeoutMs: number,
   aborted: () => boolean
-): Promise<Array<{ id: string; title: string }> | null> {
+): Promise<PortalCategoryResponse | null> {
   if (aborted()) return null;
 
   // Stalker endpoints:
@@ -696,20 +777,33 @@ async function fetchGenres(
     clearTimeout(t);
     if (!res.ok) return null;
 
-    const data = (await res.json()) as {
-      js?: Array<{ id?: string; title?: string; name?: string }>;
+    const rawResponse: unknown = await res.json();
+    const root = asPortalRecord(rawResponse);
+    const rawEntries = Array.isArray(root?.js)
+      ? root.js
+      : Array.isArray(rawResponse)
+        ? rawResponse
+        : [];
+    const entries = rawEntries
+      .map((entry) => {
+        const item = asPortalRecord(entry);
+        if (!item) return null;
+        const rawId = item.id ?? item.genre_id ?? item.category_id ?? item.number;
+        const rawTitle = item.title ?? item.name ?? item.label ?? item.alias;
+        return {
+          id: rawId === null || rawId === undefined ? "" : String(rawId),
+          title: rawTitle === null || rawTitle === undefined ? "" : String(rawTitle),
+        };
+      })
+      .filter((entry): entry is { id: string; title: string } => Boolean(entry?.id && entry?.title));
+
+    return {
+      entries,
+      rawResponse,
+      statusCode: res.status,
+      endpoint: responseEndpoint(url),
+      receivedAt: new Date().toISOString(),
     };
-
-    if (Array.isArray(data?.js)) {
-      return data.js
-        .map((g) => ({
-          id: String(g.id || ""),
-          title: g.title || g.name || "",
-        }))
-        .filter((g) => g.id && g.title);
-    }
-
-    return null;
   } catch {
     return null;
   }
@@ -979,55 +1073,47 @@ export async function startScan(jobId: number, skipVerification: boolean = false
       await addLog(jobId, "warning", "Could not determine server geolocation");
     }
 
-    // ── TCP ping diagnostics ──────────────────────────────────────────
+    // ── TCP portal-connectivity diagnostics ───────────────────────────
     if (!(await waitForAllowedWindow())) return;
-    await addLog(jobId, "info", "Measuring network latency (TCP ping)...");
+    await addLog(jobId, "info", "Measuring portal connectivity (TCP connection probes)...");
 
-    let pingStats: {
-      minMs: number | null;
-      avgMs: number | null;
-      maxMs: number | null;
-      stdevMs: number | null;
-      lossPct: number;
-      probes: number;
-      error?: string;
-    } = {
-      minMs: null, avgMs: null, maxMs: null, stdevMs: null,
-      lossPct: 100, probes: 0, error: undefined,
-    };
+    // This is deliberately a short portal-path spot check, not a packet-loss
+    // or video-stream test. A bounded timeout prevents a filtered TCP port
+    // from delaying scan startup indefinitely.
+    const tcpProbeCount = 8;
+    const tcpProbeIntervalMs = 250;
+    let pingStats: TcpPingResult | null = null;
+    let pingError: string | null = null;
 
     try {
       const { host, port } = parseHostPort(serverPath);
-      await addLog(jobId, "info", `TCP-pinging ${host}:${port} (5 probes)...`);
-      const ping = await tcpPing(host, port, {
-        probes: 5,
-        intervalMs: 200,
-        timeoutMs: Math.max(2000, timeoutMs),
+      await addLog(
+        jobId,
+        "info",
+        `Testing TCP connection to portal ${host}:${port} (${tcpProbeCount} probes, ${tcpProbeIntervalMs}ms apart)...`
+      );
+      pingStats = await tcpPing(host, port, {
+        probes: tcpProbeCount,
+        intervalMs: tcpProbeIntervalMs,
+        timeoutMs: Math.min(2000, Math.max(1000, timeoutMs)),
       });
-      pingStats = {
-        minMs: ping.minMs,
-        avgMs: ping.avgMs,
-        maxMs: ping.maxMs,
-        stdevMs: ping.stdevMs,
-        lossPct: ping.lossPct,
-        probes: ping.probes,
-      };
 
-      if (ping.successful > 0) {
+      if (pingStats.successful > 0) {
         await addLog(
           jobId,
           "success",
-          `TCP ping: min ${ping.minMs?.toFixed(1)}ms · avg ${ping.avgMs?.toFixed(1)}ms · ` +
-            `max ${ping.maxMs?.toFixed(1)}ms · stdev ${ping.stdevMs?.toFixed(1)}ms · ` +
-            `loss ${ping.lossPct.toFixed(0)}% (${ping.successful}/${ping.probes} ok)`
+          `Portal TCP connect: min ${pingStats.minMs?.toFixed(1)}ms · median ${pingStats.p50Ms?.toFixed(1)}ms · ` +
+            `p95 ${pingStats.p95Ms?.toFixed(1)}ms · max ${pingStats.maxMs?.toFixed(1)}ms · ` +
+            `${pingStats.successful}/${pingStats.probes} connected · ` +
+            `${pingStats.failed} failed (${pingStats.failurePct.toFixed(1)}%) over ${pingStats.sampleWindowMs.toFixed(0)}ms`
         );
       } else {
-        await addLog(jobId, "warning", "TCP ping failed — all probes timed out or were rejected");
-        pingStats.error = "All TCP probes failed";
+        pingError = "All TCP connection probes failed or timed out";
+        await addLog(jobId, "warning", pingError);
       }
     } catch (err) {
-      pingStats.error = err instanceof Error ? err.message : "Unknown error";
-      await addLog(jobId, "warning", `TCP ping failed: ${pingStats.error}`);
+      pingError = err instanceof Error ? err.message : "Unknown error";
+      await addLog(jobId, "warning", `Portal TCP connection probe failed: ${pingError}`);
     }
 
     // ── HTTP timing waterfall ─────────────────────────────────────────
@@ -1053,7 +1139,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
       const timing = await measureHttpRequest(handshakeUrl, {
         timeoutMs: Math.max(5000, timeoutMs * 2),
         headers: {
-          Cookie: "mac=00:1A:79:00:00:00; stb_lang=en; timezone=Europe/London",
+          Cookie: `mac=00:1A:79:00:00:00; stb_lang=en; timezone=${STB_REQUEST_TIMEZONE}`,
           Referer: portalBase,
         },
       });
@@ -1082,27 +1168,35 @@ export async function startScan(jobId: number, skipVerification: boolean = false
     }
 
     // ── Persist diagnostics + geolocation on the job row ──────────────
+    const diagnosticsAt = new Date();
     await db
       .update(scanJobs)
       .set({
         status: "running",
         updatedAt: new Date(),
-        // TCP ping
-        pingMinMs: pingStats.minMs,
-        pingAvgMs: pingStats.avgMs,
-        pingMaxMs: pingStats.maxMs,
-        pingStdevMs: pingStats.stdevMs,
-        pingLossPct: pingStats.lossPct,
-        pingProbes: pingStats.probes,
-        pingProbeMs: 200,
-        pingError: pingStats.error || null,
-        // HTTP waterfall
+        // TCP connection sampling (not packet loss or stream jitter)
+        pingMinMs: pingStats?.minMs ?? null,
+        pingAvgMs: pingStats?.avgMs ?? null,
+        pingMaxMs: pingStats?.maxMs ?? null,
+        pingStdevMs: pingStats?.stdevMs ?? null,
+        pingLossPct: pingStats?.failurePct ?? null,
+        pingProbes: pingStats?.probes ?? 0,
+        pingSuccessful: pingStats?.successful ?? 0,
+        pingProbeMs: tcpProbeIntervalMs,
+        pingP50Ms: pingStats?.p50Ms ?? null,
+        pingP95Ms: pingStats?.p95Ms ?? null,
+        pingWindowMs: pingStats ? Math.round(pingStats.sampleWindowMs) : null,
+        pingRtts: pingStats?.rtts ?? null,
+        diagnosticsAt,
+        pingError,
+        // Single HTTP timing sample for the Stalker handshake endpoint
         httpDnsMs: httpTimings.dnsMs,
         httpTcpMs: httpTimings.tcpMs,
         httpTlsMs: httpTimings.tlsMs,
         httpTtfbMs: httpTimings.ttfbMs,
         httpTotalMs: httpTimings.totalMs,
         httpStatusCode: httpTimings.statusCode,
+        httpError: httpTimings.error || null,
         // Geolocation
         serverIp: serverGeo.ip,
         serverGeoRaw: serverGeo.raw,
@@ -1228,12 +1322,12 @@ export async function startScan(jobId: number, skipVerification: boolean = false
         }
 
         try {
-          // STEP 1 – Handshake (token alone does NOT mean the MAC is valid)
-          // We measure the total elapsed time for handshake + account_info
-          // as the "response time" for this MAC — this tells the user how
-          // snappy (or slow) the portal actually is during real requests.
+          // STEP 1 – Handshake (token alone does NOT mean the MAC is valid).
+          // Time the two portal requests separately so schedule pauses between
+          // them are not mistaken for slow server response time.
           const macTestStart = performance.now();
           const token = await doHandshake(serverPath, portalBase, mac, timeoutMs, isAborted);
+          const handshakeTimeMs = Math.round(performance.now() - macTestStart);
           if (!token) {
             continue;
           }
@@ -1243,7 +1337,8 @@ export async function startScan(jobId: number, skipVerification: boolean = false
           }
 
           // STEP 2 – Account info (the REAL validation)
-          const accountInfo = await fetchAccountInfo(
+          const accountInfoStart = performance.now();
+          const accountResponse = await fetchAccountInfo(
             serverPath,
             portalBase,
             mac,
@@ -1251,21 +1346,25 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             timeoutMs,
             isAborted
           );
+          const accountInfoTimeMs = Math.round(performance.now() - accountInfoStart);
 
-          if (!accountInfo || !isAccountInfoValid(accountInfo)) {
+          if (!accountResponse || !isAccountInfoValid(accountResponse.payload)) {
             continue;
           }
+          const accountInfo = accountResponse.payload;
 
-          const responseTimeMs = Math.round(performance.now() - macTestStart);
+          // Combined portal API time excludes scheduling waits and later
+          // profile/category requests; it is not media startup time.
+          const responseTimeMs = handshakeTimeMs + accountInfoTimeMs;
 
           // ── Early-expire filter (cheap — no extra HTTP needed) ────────
           // We need the combined expiry value the same way the saver does.
           const earlyExpiry = String(
-            (accountInfo as Record<string, unknown>).end_date ||
-              (accountInfo as Record<string, unknown>).expire_billing_date ||
-              (accountInfo as Record<string, unknown>).phone ||
-              (accountInfo as Record<string, unknown>).expire ||
-              (accountInfo as Record<string, unknown>).expiry ||
+            accountInfo.end_date ||
+              accountInfo.expire_billing_date ||
+              accountInfo.phone ||
+              accountInfo.expire ||
+              accountInfo.expiry ||
               ""
           );
           if (expireFilter.enabled) {
@@ -1300,10 +1399,11 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             abortedEarly = true;
             break;
           }
-          const profileInfo = await fetchProfile(
+          const profileResponse = await fetchProfile(
             serverPath, portalBase, mac, token, timeoutMs, isAborted
           );
-          if (profileInfo) {
+          const profileInfo = profileResponse?.payload ?? null;
+          if (profileResponse) {
             await addLog(jobId, "info", "✓ Profile data retrieved");
           } else {
             await addLog(jobId, "warning", "✗ Could not retrieve profile data");
@@ -1322,15 +1422,19 @@ export async function startScan(jobId: number, skipVerification: boolean = false
           let itvGenres: Array<{ id: string; title: string }> | null = null;
           let vodCategories: Array<{ id: string; title: string }> | null = null;
           let seriesCategories: Array<{ id: string; title: string }> | null = null;
+          let itvResponse: PortalCategoryResponse | null = null;
+          let vodResponse: PortalCategoryResponse | null = null;
+          let seriesResponse: PortalCategoryResponse | null = null;
 
           if (!(await waitForAllowedWindow())) {
             abortedEarly = true;
             break;
           }
           if (needLive) {
-            itvGenres = await fetchGenres(
+            itvResponse = await fetchGenres(
               serverPath, portalBase, mac, token, "itv", timeoutMs, isAborted
             );
+            itvGenres = itvResponse?.entries ?? null;
             if (itvGenres && itvGenres.length > 0) {
               await addLog(jobId, "info", `✓ Retrieved ${itvGenres.length} ITV genres`);
             } else {
@@ -1343,9 +1447,10 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             break;
           }
           if (needVod) {
-            vodCategories = await fetchGenres(
+            vodResponse = await fetchGenres(
               serverPath, portalBase, mac, token, "vod", timeoutMs, isAborted
             );
+            vodCategories = vodResponse?.entries ?? null;
             if (vodCategories && vodCategories.length > 0) {
               await addLog(jobId, "info", `✓ Retrieved ${vodCategories.length} VOD categories`);
             } else {
@@ -1358,9 +1463,10 @@ export async function startScan(jobId: number, skipVerification: boolean = false
               abortedEarly = true;
               break;
             }
-            seriesCategories = await fetchGenres(
+            seriesResponse = await fetchGenres(
               serverPath, portalBase, mac, token, "series", timeoutMs, isAborted
             );
+            seriesCategories = seriesResponse?.entries ?? null;
             if (seriesCategories && seriesCategories.length > 0) {
               await addLog(jobId, "info", `✓ Retrieved ${seriesCategories.length} Series categories`);
             } else {
@@ -1395,11 +1501,15 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             }
           }
 
-          // Extract and format data
+          // Extract common fields for the results table while keeping every
+          // original endpoint response in rawData below. Field provenance is
+          // saved separately so a portal default is not mistaken for a
+          // device/account setting.
           const combined = { ...profileInfo, ...accountInfo };
+          const extractedFields = extractPortalFields(profileInfo, accountInfo);
           const password = String(profileInfo?.password || profileInfo?.pass || "");
           const login = String(profileInfo?.login || profileInfo?.username || mac);
-          const timezone = String(profileInfo?.timezone || profileInfo?.time_zone || "");
+          const timezone = extractedFields.timezone ?? "";
           const playlistGenres = itvGenres ? itvGenres.map((g) => g.title).join(", ") : "";
           const vodCats = vodCategories ? vodCategories.map((g) => g.title).join(", ") : "";
           const tariff =
@@ -1432,14 +1542,20 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             "";
           const phoneNumber = String(rawPhone);
 
-          // Log all found data
+          // Log the normalized fields and their values. All original response
+          // bodies and field-source paths are also retained in rawData.
           await addLog(jobId, "success", `Expiry: ${expiry || "N/A"}`);
           await addLog(jobId, "success", `Plan: ${tariff || "N/A"}`);
           await addLog(jobId, "success", `Phone Number: ${phoneNumber || "N/A"}`);
           await addLog(jobId, "success", `Password: ${password || "N/A"}`);
-          await addLog(jobId, "success", `Timezone: ${timezone || "N/A"}`);
+          await addLog(jobId, "success", `Max Connections: ${extractedFields.maxConnections ?? "N/A"}`);
+          await addLog(jobId, "success", `Active Connections: ${extractedFields.activeConnections ?? "N/A"}`);
+          await addLog(jobId, "success", `Portal Timezone: ${timezone || "N/A"}`);
+          await addLog(jobId, "success", `Created At: ${extractedFields.createdAt?.toISOString() || "N/A"}`);
+          await addLog(jobId, "success", `Portal Online: ${extractedFields.portalOnline ?? "N/A"}`);
+          await addLog(jobId, "success", `Last Active: ${extractedFields.lastActive ?? "N/A"}`);
           await addLog(jobId, "success", `Server Location: ${serverGeo.label}`);
-          await addLog(jobId, "info", "Saving valid result to database...");
+          await addLog(jobId, "info", "Saving valid result and complete responses from requested portal endpoints...");
 
           // Log response time alongside the result.
           await addLog(jobId, "success", `Response time: ${responseTimeMs}ms`);
@@ -1452,28 +1568,62 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             expireDate: expiry,
             serverLocation: serverGeo.label,
             tariffPlan: tariff,
-            maxConnections: String(combined.max_connections || combined.max_con || ""),
-            activeConnections: String(
-              combined.active_cons || combined.active_connections || ""
-            ),
-            createdAt: combined.created_at
-              ? new Date(combined.created_at as string)
-              : null,
+            maxConnections: extractedFields.maxConnections,
+            activeConnections: extractedFields.activeConnections,
+            createdAt: extractedFields.createdAt,
+            portalOnline: extractedFields.portalOnline,
+            lastActive: extractedFields.lastActive,
             accountStatus: String(combined.status ?? ""),
             phoneNumber,
             responseTimeMs,
+            handshakeTimeMs,
+            accountInfoTimeMs,
             timezone,
             username: login,
             password,
             playlistGenres,
             vodCategories: vodCats,
             rawData: {
+              // Keep the decoded profile/account payloads for existing readers.
               profile: profileInfo,
               account: accountInfo,
+              // Also keep the complete JSON envelopes and response metadata so
+              // fields outside the current normalized mapping are not lost.
+              portalResponses: {
+                profile: {
+                  requested: true,
+                  response: responseForStorage(profileResponse),
+                },
+                accountInfo: {
+                  requested: true,
+                  response: responseForStorage(accountResponse),
+                },
+                categories: {
+                  itv: {
+                    requested: needLive,
+                    response: responseForStorage(itvResponse),
+                  },
+                  vod: {
+                    requested: needVod,
+                    response: responseForStorage(vodResponse),
+                  },
+                  series: {
+                    requested: needSeries,
+                    response: responseForStorage(seriesResponse),
+                  },
+                },
+              },
+              // These lists remain convenient for the table/filter code. The
+              // full category objects are preserved under portalResponses.
               itvGenres,
               vodCategories,
               seriesCategories,
               serverGeo,
+              requestContext: {
+                timezoneCookieSent: STB_REQUEST_TIMEZONE,
+                note: "Client-supplied request value; not a portal-reported device timezone.",
+              },
+              fieldProvenance: extractedFields.provenance,
             },
           });
 

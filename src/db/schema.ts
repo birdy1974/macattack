@@ -25,15 +25,22 @@ export const scanJobs = pgTable("scan_jobs", {
   haEntityId: text("ha_entity_id"),
   blockSize: integer("block_size").notNull().default(8000),
 
-  // ── Server diagnostics (one measurement per job, done at start-up) ──
-  // TCP ping (SYN/ACK) to the portal host:port
+  // ── Portal connectivity diagnostics (one short sample per job) ──
+  // TCP connect timing to the portal host:port (not ICMP packet loss)
   pingMinMs: real("ping_min_ms"),
   pingAvgMs: real("ping_avg_ms"),
   pingMaxMs: real("ping_max_ms"),
   pingStdevMs: real("ping_stdev_ms"),
+  // Legacy property/SQL name; this stores failed TCP connection attempts, not packet loss.
   pingLossPct: real("ping_loss_pct"),
   pingProbes: integer("ping_probes"),
+  pingSuccessful: integer("ping_successful"),
   pingProbeMs: integer("ping_probe_ms"), // delay between probes in ms
+  pingP50Ms: real("ping_p50_ms"),
+  pingP95Ms: real("ping_p95_ms"),
+  pingWindowMs: integer("ping_window_ms"), // actual wall-clock probe window
+  pingRtts: jsonb("ping_rtts").$type<Array<number | null>>(), // per-probe connect times; null = failed
+  diagnosticsAt: timestamp("diagnostics_at"),
   // Instrumented HTTP waterfall to the handshake endpoint (ms)
   httpDnsMs: real("http_dns_ms"),
   httpTcpMs: real("http_tcp_ms"),
@@ -41,7 +48,8 @@ export const scanJobs = pgTable("scan_jobs", {
   httpTtfbMs: real("http_ttfb_ms"),
   httpTotalMs: real("http_total_ms"),
   httpStatusCode: integer("http_status_code"),
-  pingError: text("ping_error"), // non-fatal error message if diagnostics failed
+  httpError: text("http_error"), // non-fatal HTTP timing error
+  pingError: text("ping_error"), // non-fatal TCP probe error message
 
   // Server geolocation (resolved once at start-up)
   serverIp: text("server_ip"),
@@ -78,8 +86,14 @@ export const scanResults = pgTable("scan_results", {
   phoneNumber: text("phone_number"),
   // Network performance for this specific MAC's account_info call (ms)
   responseTimeMs: integer("response_time_ms"),
+  handshakeTimeMs: integer("handshake_time_ms"),
+  accountInfoTimeMs: integer("account_info_time_ms"),
   // New fields
   timezone: text("timezone"),
+  // Device/account activity fields when a portal includes them in a requested
+  // profile or account_info response (null when not exposed by that portal).
+  portalOnline: text("portal_online"),
+  lastActive: text("last_active"),
   username: text("username"),
   password: text("password"),
   playlistGenres: text("playlist_genres"),

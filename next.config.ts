@@ -2,13 +2,18 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   output: "standalone",
-  // MacAttack renders no images and the Docker image ships without `sharp`
-  // (it is x86_64-only in the standalone output and would break the arm64
-  // image used on a Raspberry Pi 4). This keeps the image optimizer out of
-  // the picture entirely, so a future <Image> serves the original file
-  // instead of crashing at runtime.
+  // Keep image optimization disabled: the Docker image ships without `sharp`
+  // and targets ARM as well as x86_64. The brand mark is served directly from
+  // its source URL instead of going through Next's image optimizer.
   images: {
     unoptimized: true,
+    remotePatterns: [
+      {
+        protocol: "https",
+        hostname: "ih1.redbubble.net",
+        pathname: "/image.5307335794.8778/**",
+      },
+    ],
   },
 };
 
