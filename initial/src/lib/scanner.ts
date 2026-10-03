@@ -703,16 +703,68 @@ async function fetchGenres(
 }
 
 // ============================================================================
-// ACCOUNT VALIDATION
+// ACCOUNT VALIDATION & EXPIRY EXTRACTION
 // ============================================================================
+
+const ZERO_DATE_PATTERN =
+  /^0{2,4}[-./]0{1,2}[-./]0{1,4}(?:[T\s]+0{1,2}:0{1,2}(?::0{1,2}(?:\.\d+)?)?\s*(?:Z|[+-]\d{2}:?\d{2})?)?$/i;
+const PLACEHOLDER_TEXT_PATTERN = /^(0|-1|null|undefined|none|n\/a|na|-+|false)$/i;
+
+function isMeaningfulExpiryValue(value: unknown): boolean {
+  if (value === null || value === undefined || typeof value === "boolean") return false;
+  if (value instanceof Date) return Number.isFinite(value.getTime());
+  if (typeof value === "object") return false;
+  const text = String(value).trim();
+  if (!text) return false;
+  if (PLACEHOLDER_TEXT_PATTERN.test(text)) return false;
+  if (ZERO_DATE_PATTERN.test(text)) return false;
+  return true;
+}
+
+function extractPortalExpiry(
+  profile: Record<string, unknown> | null | undefined,
+  account: Record<string, unknown> | null | undefined
+): string {
+  const candidates: unknown[] = [
+    account?.phone,
+    profile?.phone,
+    account?.end_date,
+    account?.endDate,
+    account?.expire_billing_date,
+    account?.expireBillingDate,
+    account?.expire_date,
+    account?.expireDate,
+    account?.exp_date,
+    account?.expDate,
+    account?.expire,
+    account?.expiry,
+    profile?.end_date,
+    profile?.endDate,
+    profile?.expire_billing_date,
+    profile?.expireBillingDate,
+    profile?.expire_date,
+    profile?.expireDate,
+    profile?.exp_date,
+    profile?.expDate,
+    profile?.expire,
+    profile?.expiry,
+  ];
+  for (const candidate of candidates) {
+    if (isMeaningfulExpiryValue(candidate)) {
+      return String(candidate).trim();
+    }
+  }
+  return "";
+}
 
 function isAccountInfoValid(info: Record<string, unknown>): boolean {
   if (Object.keys(info).length === 0) return false;
 
   const mac = info.mac || info.login;
-  // NOTE: `info.phone` in Stalker responses is the EXPIRATION DATE (YYYY-MM-DD),
+  // NOTE: `info.phone` in Stalker responses is the EXPIRATION DATE,
   // not a real telephone number. It is included here as an expiry signal.
   const expiry =
+    extractPortalExpiry(null, info) ||
     info.phone ||
     info.end_date ||
     info.expire_billing_date ||
@@ -1158,15 +1210,8 @@ export async function startScan(jobId: number, skipVerification: boolean = false
           const responseTimeMs = Math.round(performance.now() - macTestStart);
 
           // ── Early-expire filter (cheap — no extra HTTP needed) ──────
-          const earlyExpiry = String(
-            (accountInfo as Record<string, unknown>).end_date ||
-              (accountInfo as Record<string, unknown>).expire_billing_date ||
-              (accountInfo as Record<string, unknown>).phone ||
-              (accountInfo as Record<string, unknown>).expire ||
-              (accountInfo as Record<string, unknown>).expiry ||
-              ""
-          );
-          if (expireFilter.enabled) {
+          const earlyExpiry = extractPortalExpiry(null, accountInfo as Record<string, unknown>);
+          if (expireFilter.enabled && earlyExpiry) {
             const expiryCheck = expiryPassesFilter(expireFilter, earlyExpiry);
             if (!expiryCheck.pass) {
               filteredOut += 1;
@@ -1198,6 +1243,24 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             await addLog(jobId, "info", "✓ Profile data retrieved");
           } else {
             await addLog(jobId, "warning", "✗ Could not retrieve profile data");
+          }
+
+          const expiry = extractPortalExpiry(
+            profileInfo as Record<string, unknown> | null,
+            accountInfo as Record<string, unknown>
+          );
+          if (expireFilter.enabled) {
+            const expiryCheck = expiryPassesFilter(expireFilter, expiry);
+            if (!expiryCheck.pass) {
+              filteredOut += 1;
+              found -= 1;
+              await addLog(
+                jobId,
+                "info",
+                `MAC ${mac} valid but filtered out by expire date (${expiryCheck.reason})`
+              );
+              continue;
+            }
           }
 
           const needLive = !genreFilter.enabled || genreFilter.matchLive;
@@ -1278,21 +1341,6 @@ export async function startScan(jobId: number, skipVerification: boolean = false
           const tariff =
             (combined.tariff_plan as { name?: string })?.name ||
             String(combined.tariff_plan || "");
-
-          // IMPORTANT: In Stalker middleware responses the `phone` field
-          // contains the subscription EXPIRATION DATE (YYYY-MM-DD), NOT a
-          // real telephone number.  Always treat it as an expiry source.
-          // Real phone numbers (rarely provided) live in fields like
-          // `phone_number`, `mobile`, `contact_phone`, `telephone`.
-          const expiry = String(
-            combined.end_date ||
-              combined.expire_billing_date ||
-              combined.phone ||
-              combined.expire ||
-              combined.expiry ||
-              combined.endDate ||
-              ""
-          );
 
           // Only accept values from fields that actually hold telephone numbers.
           // Skip `combined.phone` here because that is an expiry date in Stalker.

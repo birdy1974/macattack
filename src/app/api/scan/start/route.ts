@@ -54,6 +54,7 @@ export async function POST(request: NextRequest) {
         "macAddress",
         "portalUrl",
         "expireDate",
+        "quality",
         "serverLocation",
         "responseTimeMs",
         "portalCheckStatus",

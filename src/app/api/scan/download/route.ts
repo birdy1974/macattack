@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/db";
+import { db, ensureMigrations } from "@/db";
 import { scanJobs, scanResults } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { buildQualityReport } from "@/lib/quality-report";
+import { extractPortalExpiry, isMeaningfulExpiryValue } from "@/lib/portal-result-fields";
 
 function extractDomainFromUrl(url: string): string {
   try {
@@ -35,6 +36,7 @@ function formatDateForFilename(): string {
 
 export async function GET(request: NextRequest) {
   try {
+    await ensureMigrations();
     const jobId = request.nextUrl.searchParams.get("jobId");
     const format = request.nextUrl.searchParams.get("format") || "csv";
 
@@ -60,11 +62,34 @@ export async function GET(request: NextRequest) {
       .from(scanResults)
       .where(eq(scanResults.jobId, parseInt(jobId)));
 
-    const selectedFields = (job.selectedFields as string[]) || [
+    const rawSelectedFields = (job.selectedFields as string[]) || [
       "macAddress",
       "portalUrl",
       "expireDate",
+      "quality",
+      "serverLocation",
     ];
+    const normalizeSelectedFields = (fields: string[]): string[] => {
+      const withoutQuality = fields.filter((f) => f !== "quality");
+      const expireIdx = withoutQuality.indexOf("expireDate");
+      if (expireIdx !== -1) {
+        return [
+          ...withoutQuality.slice(0, expireIdx + 1),
+          "quality",
+          ...withoutQuality.slice(expireIdx + 1),
+        ];
+      }
+      const locIdx = withoutQuality.indexOf("serverLocation");
+      if (locIdx !== -1) {
+        return [
+          ...withoutQuality.slice(0, locIdx),
+          "quality",
+          ...withoutQuality.slice(locIdx),
+        ];
+      }
+      return [...withoutQuality, "quality"];
+    };
+    const selectedFields = normalizeSelectedFields(rawSelectedFields);
     const qualityReportCache = new Map<number, ReturnType<typeof buildQualityReport>>();
     const getQualityReport = (result: (typeof results)[number]) => {
       const cached = qualityReportCache.get(result.id);
@@ -78,6 +103,7 @@ export async function GET(request: NextRequest) {
       macAddress: "MAC Address",
       portalUrl: "Portal URL",
       expireDate: "Expire Date",
+      quality: "Quality",
       serverLocation: "Server Location",
       responseTimeMs: "Portal Check Response (ms)",
       handshakeTimeMs: "Portal Handshake (ms)",
@@ -93,7 +119,7 @@ export async function GET(request: NextRequest) {
       qualityStabilityScore: "Stream Stability Score (0-10)",
       qualityResolution: "Stream Resolution (measured)",
       qualityCodec: "Stream Video Codec (measured)",
-      qualityThroughputMbps: "Stream Throughput (Mbps, measured)",
+      qualityThroughputMbps: "Stream Throughput (Mbps measured)",
       qualityRequiredMbps: "Stream Required Bitrate (Mbps)",
       qualityChannels: "Stream Channels Playable/Probed",
       qualityMeasured: "Stream Quality Measured At",
@@ -121,6 +147,22 @@ export async function GET(request: NextRequest) {
       vodCategories: "VOD Categories",
     };
 
+    const resolveExpireDate = (result: (typeof results)[0]): string => {
+      const rawRecord =
+        result.rawData && typeof result.rawData === "object" && !Array.isArray(result.rawData)
+          ? (result.rawData as Record<string, unknown>)
+          : null;
+      const fromRaw = rawRecord ? extractPortalExpiry(rawRecord.profile, rawRecord.account) : "";
+      if (fromRaw) return fromRaw;
+      if (isMeaningfulExpiryValue(result.expireDate)) {
+        return String(result.expireDate).trim();
+      }
+      if (isMeaningfulExpiryValue(result.phoneNumber)) {
+        return String(result.phoneNumber).trim();
+      }
+      return "";
+    };
+
     const getFieldValue = (
       result: (typeof results)[0],
       field: string
@@ -131,7 +173,33 @@ export async function GET(request: NextRequest) {
         case "portalUrl":
           return result.portalUrl || "";
         case "expireDate":
-          return result.expireDate || "";
+          return resolveExpireDate(result);
+        case "quality": {
+          const report = getQualityReport(result);
+          const portalLabel =
+            report.portal.status === "response_received"
+              ? "Portal responded"
+              : report.portal.status === "check_error" || report.portal.status === "http_status_issue"
+                ? "Portal check issue"
+                : "Portal check unavailable";
+          if (result.qualityVerdict && result.qualityVerdict !== "unknown") {
+            const scorePart =
+              result.qualityScore !== null && result.qualityScore !== undefined
+                ? ` · ${result.qualityScore}/10`
+                : "";
+            const resPart = result.qualityResolution || "resolution n/a";
+            const speedPart =
+              result.qualityThroughputMbps !== null && result.qualityThroughputMbps !== undefined
+                ? ` · ${result.qualityThroughputMbps.toFixed(2)} Mbps`
+                : "";
+            const chPart =
+              result.qualityChannelsProbed !== null && result.qualityChannelsProbed !== undefined
+                ? ` · ${result.qualityChannelsPlayable ?? 0}/${result.qualityChannelsProbed} playable`
+                : "";
+            return `${portalLabel} · Streams: ${result.qualityVerdict}${scorePart} · ${resPart}${speedPart}${chPart}`;
+          }
+          return `${portalLabel} · Streams not measured`;
+        }
         case "serverLocation":
           return result.serverLocation || "";
         case "responseTimeMs":
@@ -276,7 +344,7 @@ export async function GET(request: NextRequest) {
           status: job.status,
           timeoutMs: job.timeoutMs,
           blockSize: job.blockSize,
-          selectedFields: job.selectedFields,
+          selectedFields,
           totalTested: job.totalTested,
           totalFound: job.totalFound,
           serverIp: job.serverIp,
@@ -317,10 +385,21 @@ export async function GET(request: NextRequest) {
           createdAt: job.createdAt,
           updatedAt: job.updatedAt,
         },
-        results: results.map((result) => ({
-          ...result,
-          qualityReport: getQualityReport(result),
-        })),
+        results: results.map((result) => {
+          const { id, jobId, macAddress, portalUrl, expireDate: _unusedExpireDate, serverLocation, ...rest } = result;
+          void _unusedExpireDate;
+          return {
+            id,
+            jobId,
+            macAddress,
+            portalUrl,
+            expireDate: resolveExpireDate(result),
+            quality: getFieldValue(result, "quality"),
+            serverLocation,
+            ...rest,
+            qualityReport: getQualityReport(result),
+          };
+        }),
       };
 
       return new NextResponse(JSON.stringify(fullExport, null, 2), {
