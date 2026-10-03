@@ -22,6 +22,13 @@ import { parseBlackIntervals, parseFreezeIntervals, parseFfmpegStats } from "../
 import { deleteThumbnail, readThumbnail, saveThumbnail } from "../src/lib/thumbnail-store";
 import { parseXtreamUrl, xtreamStreamUrl } from "../src/lib/xtream-streams";
 import { detectStreamProtocol, probeStream, scoreStreamProbe, type StreamProbeResult } from "../src/lib/stream-probe";
+import {
+  extractPortalExpiry,
+  extractPortalFields,
+  isMeaningfulExpiryValue,
+  parsePortalDate,
+} from "../src/lib/portal-result-fields";
+import { expiryPassesFilter, isUnlimitedDate, parseStalkerDate } from "../src/lib/filters";
 
 let passed = 0;
 let failed = 0;
@@ -341,6 +348,88 @@ section("Xtream URL parsing");
     "m3u8"
   );
   check("builds an HLS variant URL", m3u8.endsWith("/4321.m3u8"), m3u8);
+}
+
+// ============================================================================
+// 11. STALKER EXPIRY / `phone` FIELD EXTRACTION & PARSING
+// ============================================================================
+section("Stalker expire date extraction (from `phone` field)");
+{
+  // Classic Stalker bug: get_profile has expire_billing_date = "0000-00-00 00:00:00"
+  // while get_main_info has the actual expiry date in `phone`.
+  const profileWithZeroBilling = {
+    id: "123",
+    mac: "00:1A:79:11:22:33",
+    phone: "",
+    expire_billing_date: "0000-00-00 00:00:00",
+    end_date: "0000-00-00",
+  };
+  const accountWithPhoneExpiry = {
+    mac: "00:1A:79:11:22:33",
+    phone: "March 15, 2027, 2:30 pm",
+  };
+  const fields1 = extractPortalFields(profileWithZeroBilling, accountWithPhoneExpiry);
+  check(
+    "records account.phone instead of profile.expire_billing_date zero placeholder",
+    fields1.expireDate === "March 15, 2027, 2:30 pm",
+    fields1.expireDate ?? "null"
+  );
+  check("records provenance as account.phone", fields1.provenance.expireDate === "account.phone");
+  check("leaves phoneNumber empty when only Stalker `phone` is present", fields1.phoneNumber === null);
+
+  // When get_main_info returns empty `phone` and get_profile carries `phone`,
+  // profile.phone must not be overwritten by the empty string.
+  const profileWithPhoneDate = {
+    id: "123",
+    phone: "2027-08-19 23:59:59",
+    expire_billing_date: "0000-00-00 00:00:00",
+  };
+  const accountWithEmptyPhone = {
+    mac: "00:1A:79:11:22:33",
+    phone: "",
+  };
+  check(
+    "falls back to profile.phone when account.phone is empty",
+    extractPortalExpiry(profileWithPhoneDate, accountWithEmptyPhone) === "2027-08-19 23:59:59"
+  );
+
+  // When `phone` has the real expiry date and `expire_billing_date` has a stale
+  // internal timestamp, `phone` (the original "phone number" field) wins.
+  check(
+    "prioritises `phone` over stale `expire_billing_date`",
+    extractPortalExpiry(
+      { expire_billing_date: "2021-01-01 00:00:00" },
+      { phone: "2027-12-31" }
+    ) === "2027-12-31"
+  );
+
+  // When `phone` is absent/empty and `end_date` is "0000-00-00", a real
+  // `expire_billing_date` is still recovered.
+  check(
+    "skips zero end_date to find valid expire_billing_date",
+    extractPortalExpiry(
+      { end_date: "0000-00-00", expire_billing_date: "2027-06-01 00:00:00" },
+      { mac: "00:1A:79:11:22:33" }
+    ) === "2027-06-01 00:00:00"
+  );
+
+  // When only zero-date placeholders exist, returns "" instead of "0000-00-00 00:00:00".
+  check(
+    "does not record 0000-00-00 00:00:00 as an expire date",
+    extractPortalExpiry(profileWithZeroBilling, accountWithEmptyPhone) === ""
+  );
+  check("rejects zero-date in isMeaningfulExpiryValue", !isMeaningfulExpiryValue("0000-00-00 00:00:00"));
+
+  // Date parsing across Stalker `phone` formats.
+  check("parses human-readable Stalker `phone` date", parseStalkerDate("March 15, 2027, 2:30 pm")?.toISOString().startsWith("2027-03-15") === true);
+  check("parses DD-MM-YYYY Stalker `phone` date", parseStalkerDate("15-03-2027")?.toISOString().slice(0, 10) === "2027-03-15");
+  check("parses DD.MM.YYYY HH:MM Stalker `phone` date", parseStalkerDate("15.03.2027 14:30")?.toISOString().slice(0, 10) === "2027-03-15");
+  check("parses 15 Mar 2027", parsePortalDate("15 Mar 2027")?.toISOString().slice(0, 10) === "2027-03-15");
+  check("treats 'Unlimited' as unlimited", isUnlimitedDate("Unlimited"));
+  check(
+    "expire filter accepts human-readable future `phone` date",
+    expiryPassesFilter({ enabled: true, minDate: "2027-01-01", includeUnlimited: false }, "March 15, 2027, 2:30 pm").pass
+  );
 }
 
 // ============================================================================

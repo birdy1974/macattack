@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/db";
+import { db, ensureMigrations } from "@/db";
 import { scanJobs, scanResults, scanLogs } from "@/db/schema";
 import { eq, desc } from "drizzle-orm";
 
 export async function GET(request: NextRequest) {
   try {
+    await ensureMigrations();
     const jobId = request.nextUrl.searchParams.get("jobId");
 
     if (!jobId) {

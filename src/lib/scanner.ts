@@ -50,7 +50,7 @@ import {
   type GenreFilterConfig,
   type ExpireFilterConfig,
 } from "@/lib/filters";
-import { extractPortalFields } from "@/lib/portal-result-fields";
+import { extractPortalExpiry, extractPortalFields } from "@/lib/portal-result-fields";
 import { checkMacStreamQuality, formatMacQualityLog } from "@/lib/mac-quality";
 import { HostRateLimiter, hostOf } from "@/lib/parallel";
 import { buildUserAgentCandidates, parseUserAgentList, userAgentSettingKey } from "@/lib/user-agents";
@@ -645,7 +645,15 @@ function asPortalRecord(value: unknown): Record<string, unknown> | null {
 function getPortalObjectPayload(rawResponse: unknown): Record<string, unknown> | null {
   const root = asPortalRecord(rawResponse);
   if (!root) return null;
-  return asPortalRecord(root.js) || root;
+  if ("js" in root) {
+    const jsObj = asPortalRecord(root.js);
+    if (jsObj) return jsObj;
+    if (Array.isArray(root.js) && root.js.length > 0) {
+      return asPortalRecord(root.js[0]);
+    }
+    return null;
+  }
+  return root;
 }
 
 function responseEndpoint(url: string): string {
@@ -682,7 +690,8 @@ async function fetchProfile(
   mac: string,
   token: string,
   timeoutMs: number,
-  aborted: () => boolean
+  aborted: () => boolean,
+  options?: PortalRequestOptions
 ): Promise<PortalResponse<Record<string, unknown>> | null> {
   if (aborted()) return null;
 
@@ -695,10 +704,8 @@ async function fetchProfile(
     const res = await fetch(url, {
       method: "GET",
       headers: {
-        ...STB_HEADERS,
-        Cookie: makeCookie(mac),
+        ...portalHeaders(portalBase, mac, options),
         Authorization: `Bearer ${token}`,
-        Referer: portalBase,
       },
       signal: controller.signal,
     });
@@ -774,7 +781,8 @@ async function fetchGenres(
   token: string,
   type: "itv" | "vod" | "series",
   timeoutMs: number,
-  aborted: () => boolean
+  aborted: () => boolean,
+  options?: PortalRequestOptions
 ): Promise<PortalCategoryResponse | null> {
   if (aborted()) return null;
 
@@ -792,10 +800,8 @@ async function fetchGenres(
     const res = await fetch(url, {
       method: "GET",
       headers: {
-        ...STB_HEADERS,
-        Cookie: makeCookie(mac),
+        ...portalHeaders(portalBase, mac, options),
         Authorization: `Bearer ${token}`,
-        Referer: portalBase,
       },
       signal: controller.signal,
     });
@@ -843,9 +849,10 @@ function isAccountInfoValid(info: Record<string, unknown>): boolean {
   if (Object.keys(info).length === 0) return false;
 
   const mac = info.mac || info.login;
-  // NOTE: `info.phone` in Stalker responses is the EXPIRATION DATE (YYYY-MM-DD),
+  // NOTE: `info.phone` in Stalker responses is the EXPIRATION DATE,
   // not a real telephone number. It is included here as an expiry signal.
   const expiry =
+    extractPortalExpiry(null, info) ||
     info.phone ||
     info.end_date ||
     info.expire_billing_date ||
@@ -1569,16 +1576,13 @@ export async function startScan(jobId: number, skipVerification: boolean = false
           const responseTimeMs = handshakeTimeMs + accountInfoTimeMs;
 
           // ── Early-expire filter (cheap — no extra HTTP needed) ────────
-          // We need the combined expiry value the same way the saver does.
-          const earlyExpiry = String(
-            accountInfo.end_date ||
-              accountInfo.expire_billing_date ||
-              accountInfo.phone ||
-              accountInfo.expire ||
-              accountInfo.expiry ||
-              ""
-          );
-          if (expireFilter.enabled) {
+          // Extract the expiry from account_info (`phone` first, ignoring
+          // zero-date placeholders). When account_info already provides a
+          // concrete expiry date, we can filter immediately before fetching
+          // profile/categories; if account_info has no expiry date yet, we
+          // re-check after fetchProfile below.
+          const earlyExpiry = extractPortalExpiry(null, accountInfo);
+          if (expireFilter.enabled && earlyExpiry) {
             const expiryCheck = expiryPassesFilter(expireFilter, earlyExpiry);
             if (!expiryCheck.pass) {
               filteredOut += 1;
@@ -1611,13 +1615,40 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             break;
           }
           const profileResponse = await fetchProfile(
-            macTarget.serverPath, macTarget.portalBase, mac, token, timeoutMs, isAborted
+            macTarget.serverPath,
+            macTarget.portalBase,
+            mac,
+            token,
+            timeoutMs,
+            isAborted,
+            scanRequestOptions
           );
           const profileInfo = profileResponse?.payload ?? null;
           if (profileResponse) {
             await addLog(jobId, "info", "✓ Profile data retrieved");
           } else {
             await addLog(jobId, "warning", "✗ Could not retrieve profile data");
+          }
+
+          // Extract common fields for the results table while keeping every
+          // original endpoint response in rawData below. Field provenance is
+          // saved separately so a portal default is not mistaken for a
+          // device/account setting.
+          const extractedFields = extractPortalFields(profileInfo, accountInfo);
+          const expiry = extractedFields.expireDate ?? "";
+
+          if (expireFilter.enabled) {
+            const expiryCheck = expiryPassesFilter(expireFilter, expiry);
+            if (!expiryCheck.pass) {
+              filteredOut += 1;
+              found -= 1; // don't count as a successful find
+              await addLog(
+                jobId,
+                "info",
+                `MAC ${mac} valid but filtered out by expire date (${expiryCheck.reason})`
+              );
+              continue;
+            }
           }
 
           // Decide which category lists we actually need.  We ALWAYS need
@@ -1643,7 +1674,14 @@ export async function startScan(jobId: number, skipVerification: boolean = false
           }
           if (needLive) {
             itvResponse = await fetchGenres(
-              macTarget.serverPath, macTarget.portalBase, mac, token, "itv", timeoutMs, isAborted
+              macTarget.serverPath,
+              macTarget.portalBase,
+              mac,
+              token,
+              "itv",
+              timeoutMs,
+              isAborted,
+              scanRequestOptions
             );
             itvGenres = itvResponse?.entries ?? null;
             if (itvGenres && itvGenres.length > 0) {
@@ -1659,7 +1697,14 @@ export async function startScan(jobId: number, skipVerification: boolean = false
           }
           if (needVod) {
             vodResponse = await fetchGenres(
-              macTarget.serverPath, macTarget.portalBase, mac, token, "vod", timeoutMs, isAborted
+              macTarget.serverPath,
+              macTarget.portalBase,
+              mac,
+              token,
+              "vod",
+              timeoutMs,
+              isAborted,
+              scanRequestOptions
             );
             vodCategories = vodResponse?.entries ?? null;
             if (vodCategories && vodCategories.length > 0) {
@@ -1675,7 +1720,14 @@ export async function startScan(jobId: number, skipVerification: boolean = false
               break;
             }
             seriesResponse = await fetchGenres(
-              macTarget.serverPath, macTarget.portalBase, mac, token, "series", timeoutMs, isAborted
+              macTarget.serverPath,
+              macTarget.portalBase,
+              mac,
+              token,
+              "series",
+              timeoutMs,
+              isAborted,
+              scanRequestOptions
             );
             seriesCategories = seriesResponse?.entries ?? null;
             if (seriesCategories && seriesCategories.length > 0) {
@@ -1712,12 +1764,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             }
           }
 
-          // Extract common fields for the results table while keeping every
-          // original endpoint response in rawData below. Field provenance is
-          // saved separately so a portal default is not mistaken for a
-          // device/account setting.
           const combined = { ...profileInfo, ...accountInfo };
-          const extractedFields = extractPortalFields(profileInfo, accountInfo);
           const password = String(profileInfo?.password || profileInfo?.pass || "");
           const login = String(profileInfo?.login || profileInfo?.username || mac);
           const timezone = extractedFields.timezone ?? "";
@@ -1728,30 +1775,12 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             String(combined.tariff_plan || "");
 
           // IMPORTANT: In Stalker middleware responses the `phone` field
-          // contains the subscription EXPIRATION DATE (YYYY-MM-DD), NOT a
-          // real telephone number.  Always treat it as an expiry source.
-          // Real phone numbers (rarely provided) live in fields like
-          // `phone_number`, `mobile`, `contact_phone`, `telephone`.
-          const expiry = String(
-            combined.end_date ||
-              combined.expire_billing_date ||
-              combined.phone ||
-              combined.expire ||
-              combined.expiry ||
-              combined.endDate ||
-              ""
-          );
-
-          // Only accept values from fields that actually hold telephone numbers.
-          // Skip `combined.phone` here because that is an expiry date in Stalker.
-          const rawPhone =
-            combined.phone_number ||
-            combined.mobile ||
-            combined.contact_phone ||
-            combined.telephone ||
-            combined.tel ||
-            "";
-          const phoneNumber = String(rawPhone);
+          // contains the subscription EXPIRATION DATE, NOT a real telephone
+          // number. `extractPortalFields` prioritizes `phone` (from
+          // `account_info`, then `get_profile`) before `end_date` /
+          // `expire_billing_date` and skips MySQL zero-date placeholders such
+          // as "0000-00-00 00:00:00".
+          const phoneNumber = extractedFields.phoneNumber ?? "";
 
           // Log the normalized fields and their values. All original response
           // bodies and field-source paths are also retained in rawData.

@@ -10,6 +10,7 @@ if (!databaseUrl) {
 const globalForDb = globalThis as typeof globalThis & {
   __arenaNextJsPostgresqlPool?: Pool;
   __arenaMigrationRun?: boolean;
+  __arenaMigrationPromise?: Promise<void>;
 };
 
 export const pool =
@@ -212,25 +213,71 @@ async function runMigrations(): Promise<void> {
       }
     }
 
-    // Match Stalker-style dates: YYYY-MM-DD (optionally with HH:MM:SS).
-    const dateLikePattern = "^\\d{4}-\\d{2}-\\d{2}(\\s\\d{2}:\\d{2}(:\\d{2})?)?$";
+    // Match zero-date / empty placeholders such as "0000-00-00 00:00:00" or "0".
+    const placeholderPattern =
+      "^(0|-1|null|undefined|none|n/a|na|-+|false|0{2,4}[-./]0{1,2}[-./]0{1,4}([T\\s]+0{1,2}:0{1,2}(:0{1,2}(\\.\\d+)?)?(\\s*(Z|[+-]\\d{2}:?\\d{2}))?)?)$";
 
-    // 1. Back-fill expire_date from phone_number when expire_date is empty.
+    // 1. Repair expire_date from Stalker's `phone` field in raw_data (or
+    //    legacy phone_number / other non-placeholder expiry fields) whenever
+    //    expire_date is empty, a zero-date placeholder ("0000-00-00 00:00:00"),
+    //    or out of sync with the portal's `phone` expiry field.
     const backfillResult = await pool.query(
-      `UPDATE scan_results
-         SET expire_date = phone_number
-       WHERE (expire_date IS NULL OR expire_date = '')
-         AND phone_number IS NOT NULL
-         AND phone_number ~ $1`,
-      [dateLikePattern]
+      `WITH extracted AS (
+         SELECT
+           id,
+           COALESCE(
+             CASE WHEN BTRIM(raw_data->'account'->>'phone') <> '' AND BTRIM(raw_data->'account'->>'phone') !~* $1 THEN BTRIM(raw_data->'account'->>'phone') END,
+             CASE WHEN BTRIM(raw_data->'portalResponses'->'accountInfo'->'response'->'body'->'js'->>'phone') <> '' AND BTRIM(raw_data->'portalResponses'->'accountInfo'->'response'->'body'->'js'->>'phone') !~* $1 THEN BTRIM(raw_data->'portalResponses'->'accountInfo'->'response'->'body'->'js'->>'phone') END,
+             CASE WHEN BTRIM(raw_data->'profile'->>'phone') <> '' AND BTRIM(raw_data->'profile'->>'phone') !~* $1 THEN BTRIM(raw_data->'profile'->>'phone') END,
+             CASE WHEN BTRIM(raw_data->'portalResponses'->'profile'->'response'->'body'->'js'->>'phone') <> '' AND BTRIM(raw_data->'portalResponses'->'profile'->'response'->'body'->'js'->>'phone') !~* $1 THEN BTRIM(raw_data->'portalResponses'->'profile'->'response'->'body'->'js'->>'phone') END
+           ) AS phone_expiry,
+           COALESCE(
+             CASE WHEN BTRIM(phone_number) <> '' AND BTRIM(phone_number) !~* $1 THEN BTRIM(phone_number) END,
+             CASE WHEN BTRIM(raw_data->'account'->>'end_date') <> '' AND BTRIM(raw_data->'account'->>'end_date') !~* $1 THEN BTRIM(raw_data->'account'->>'end_date') END,
+             CASE WHEN BTRIM(raw_data->'account'->>'expire_billing_date') <> '' AND BTRIM(raw_data->'account'->>'expire_billing_date') !~* $1 THEN BTRIM(raw_data->'account'->>'expire_billing_date') END,
+             CASE WHEN BTRIM(raw_data->'account'->>'expire') <> '' AND BTRIM(raw_data->'account'->>'expire') !~* $1 THEN BTRIM(raw_data->'account'->>'expire') END,
+             CASE WHEN BTRIM(raw_data->'account'->>'expiry') <> '' AND BTRIM(raw_data->'account'->>'expiry') !~* $1 THEN BTRIM(raw_data->'account'->>'expiry') END,
+             CASE WHEN BTRIM(raw_data->'profile'->>'end_date') <> '' AND BTRIM(raw_data->'profile'->>'end_date') !~* $1 THEN BTRIM(raw_data->'profile'->>'end_date') END,
+             CASE WHEN BTRIM(raw_data->'profile'->>'expire_billing_date') <> '' AND BTRIM(raw_data->'profile'->>'expire_billing_date') !~* $1 THEN BTRIM(raw_data->'profile'->>'expire_billing_date') END,
+             CASE WHEN BTRIM(raw_data->'profile'->>'expire') <> '' AND BTRIM(raw_data->'profile'->>'expire') !~* $1 THEN BTRIM(raw_data->'profile'->>'expire') END,
+             CASE WHEN BTRIM(raw_data->'profile'->>'expiry') <> '' AND BTRIM(raw_data->'profile'->>'expiry') !~* $1 THEN BTRIM(raw_data->'profile'->>'expiry') END
+           ) AS fallback_expiry
+         FROM scan_results
+       ),
+       target AS (
+         SELECT
+           sr.id,
+           CASE
+             WHEN ex.phone_expiry IS NOT NULL THEN ex.phone_expiry
+             WHEN (sr.expire_date IS NULL OR BTRIM(sr.expire_date) = '' OR BTRIM(sr.expire_date) ~* $1) AND ex.fallback_expiry IS NOT NULL THEN ex.fallback_expiry
+             WHEN sr.expire_date IS NOT NULL AND BTRIM(sr.expire_date) ~* $1 THEN ''
+             ELSE sr.expire_date
+           END AS next_expire_date
+         FROM scan_results sr
+         JOIN extracted ex ON ex.id = sr.id
+       )
+       UPDATE scan_results sr
+          SET expire_date = target.next_expire_date
+         FROM target
+        WHERE sr.id = target.id
+          AND sr.expire_date IS DISTINCT FROM target.next_expire_date`,
+      [placeholderPattern]
     );
 
-    // 2. Clear phone_number whenever it holds a date (it was never a phone).
+    // 2. Clear phone_number whenever it duplicates expire_date or holds a date/placeholder.
+    const dateLikePattern =
+      "^(\\d{4}[-./]\\d{1,2}[-./]\\d{1,2}|\\d{1,2}[-./]\\d{1,2}[-./]\\d{4}|[A-Za-z]+\\s+\\d{1,2},\\s*\\d{4}|\\d{1,2}\\s+[A-Za-z]+\\s+\\d{4})";
     const clearResult = await pool.query(
       `UPDATE scan_results
-         SET phone_number = NULL
-       WHERE phone_number ~ $1`,
-      [dateLikePattern]
+          SET phone_number = NULL
+        WHERE phone_number IS NOT NULL
+          AND phone_number <> ''
+          AND (
+            BTRIM(phone_number) = COALESCE(BTRIM(expire_date), '')
+            OR BTRIM(phone_number) ~* $1
+            OR BTRIM(phone_number) ~* $2
+          )`,
+      [placeholderPattern, dateLikePattern]
     );
 
     const fixed = (backfillResult.rowCount ?? 0) + (clearResult.rowCount ?? 0);
@@ -251,5 +298,12 @@ async function runMigrations(): Promise<void> {
   }
 }
 
+export function ensureMigrations(): Promise<void> {
+  if (!globalForDb.__arenaMigrationPromise) {
+    globalForDb.__arenaMigrationPromise = runMigrations();
+  }
+  return globalForDb.__arenaMigrationPromise;
+}
+
 // Kick off the migration without blocking exports.
-void runMigrations();
+void ensureMigrations();

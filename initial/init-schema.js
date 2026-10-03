@@ -166,6 +166,53 @@ async function createSchema() {
     for (var j = 0; j < resultAlters.length; j++) {
       try { await pool.query(resultAlters[j]); } catch (e) { /* ignore */ }
     }
+
+    var placeholderPattern =
+      "^(0|-1|null|undefined|none|n/a|na|-+|false|0{2,4}[-./]0{1,2}[-./]0{1,4}([T\\s]+0{1,2}:0{1,2}(:0{1,2}(\\.\\d+)?)?(\\s*(Z|[+-]\\d{2}:?\\d{2}))?)?)$";
+    var dateLikePattern =
+      "^(\\d{4}[-./]\\d{1,2}[-./]\\d{1,2}|\\d{1,2}[-./]\\d{1,2}[-./]\\d{4}|[A-Za-z]+\\s+\\d{1,2},\\s*\\d{4}|\\d{1,2}\\s+[A-Za-z]+\\s+\\d{4})";
+    try {
+      await pool.query(
+        "WITH extracted AS (" +
+          " SELECT id," +
+          " COALESCE(" +
+          "   CASE WHEN BTRIM(raw_data->'account'->>'phone') <> '' AND BTRIM(raw_data->'account'->>'phone') !~* $1 THEN BTRIM(raw_data->'account'->>'phone') END," +
+          "   CASE WHEN BTRIM(raw_data->'profile'->>'phone') <> '' AND BTRIM(raw_data->'profile'->>'phone') !~* $1 THEN BTRIM(raw_data->'profile'->>'phone') END" +
+          " ) AS phone_expiry," +
+          " COALESCE(" +
+          "   CASE WHEN BTRIM(phone_number) <> '' AND BTRIM(phone_number) !~* $1 THEN BTRIM(phone_number) END," +
+          "   CASE WHEN BTRIM(raw_data->'account'->>'end_date') <> '' AND BTRIM(raw_data->'account'->>'end_date') !~* $1 THEN BTRIM(raw_data->'account'->>'end_date') END," +
+          "   CASE WHEN BTRIM(raw_data->'account'->>'expire_billing_date') <> '' AND BTRIM(raw_data->'account'->>'expire_billing_date') !~* $1 THEN BTRIM(raw_data->'account'->>'expire_billing_date') END," +
+          "   CASE WHEN BTRIM(raw_data->'account'->>'expire') <> '' AND BTRIM(raw_data->'account'->>'expire') !~* $1 THEN BTRIM(raw_data->'account'->>'expire') END," +
+          "   CASE WHEN BTRIM(raw_data->'account'->>'expiry') <> '' AND BTRIM(raw_data->'account'->>'expiry') !~* $1 THEN BTRIM(raw_data->'account'->>'expiry') END," +
+          "   CASE WHEN BTRIM(raw_data->'profile'->>'end_date') <> '' AND BTRIM(raw_data->'profile'->>'end_date') !~* $1 THEN BTRIM(raw_data->'profile'->>'end_date') END," +
+          "   CASE WHEN BTRIM(raw_data->'profile'->>'expire_billing_date') <> '' AND BTRIM(raw_data->'profile'->>'expire_billing_date') !~* $1 THEN BTRIM(raw_data->'profile'->>'expire_billing_date') END," +
+          "   CASE WHEN BTRIM(raw_data->'profile'->>'expire') <> '' AND BTRIM(raw_data->'profile'->>'expire') !~* $1 THEN BTRIM(raw_data->'profile'->>'expire') END," +
+          "   CASE WHEN BTRIM(raw_data->'profile'->>'expiry') <> '' AND BTRIM(raw_data->'profile'->>'expiry') !~* $1 THEN BTRIM(raw_data->'profile'->>'expiry') END" +
+          " ) AS fallback_expiry" +
+          " FROM scan_results" +
+          "), target AS (" +
+          " SELECT sr.id," +
+          " CASE" +
+          "   WHEN ex.phone_expiry IS NOT NULL THEN ex.phone_expiry" +
+          "   WHEN (sr.expire_date IS NULL OR BTRIM(sr.expire_date) = '' OR BTRIM(sr.expire_date) ~* $1) AND ex.fallback_expiry IS NOT NULL THEN ex.fallback_expiry" +
+          "   WHEN sr.expire_date IS NOT NULL AND BTRIM(sr.expire_date) ~* $1 THEN ''" +
+          "   ELSE sr.expire_date" +
+          " END AS next_expire_date" +
+          " FROM scan_results sr JOIN extracted ex ON ex.id = sr.id" +
+          ") UPDATE scan_results sr SET expire_date = target.next_expire_date" +
+          " FROM target WHERE sr.id = target.id AND sr.expire_date IS DISTINCT FROM target.next_expire_date",
+        [placeholderPattern]
+      );
+      await pool.query(
+        "UPDATE scan_results SET phone_number = NULL" +
+          " WHERE phone_number IS NOT NULL AND phone_number <> ''" +
+          " AND (BTRIM(phone_number) = COALESCE(BTRIM(expire_date), '') OR BTRIM(phone_number) ~* $1 OR BTRIM(phone_number) ~* $2)",
+        [placeholderPattern, dateLikePattern]
+      );
+    } catch (e) {
+      /* ignore */
+    }
   } catch (err) {
     console.log("[init-schema] Schema note: " + err.message);
   } finally {

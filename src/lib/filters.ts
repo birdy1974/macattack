@@ -134,44 +134,114 @@ export function genresPassFilter(
 }
 
 /**
- * Parse a Stalker-format date string into a JS Date (end of day, to be
- * inclusive of the cutoff date).  Returns null when the string cannot be
- * parsed as a real date.
+ * Parse a Stalker-format date string into a JS Date. Returns null when the
+ * string cannot be parsed as a real date.
+ *
+ * Supports the date formats Stalker/Ministra/Xtream-UI portals return in the
+ * `phone` and expiry fields:
+ *   - YYYY-MM-DD / YYYY-MM-DD HH:MM[:SS] (also / or . separators)
+ *   - DD-MM-YYYY / DD.MM.YYYY / DD/MM/YYYY (and MM/DD/YYYY when day > 12)
+ *   - Human-readable English strings (e.g. "March 15, 2027, 2:30 pm", "15 Mar 2027")
+ *   - Unix timestamps in seconds (9–10 digits) or milliseconds (12–13 digits)
  */
 export function parseStalkerDate(raw: unknown): Date | null {
-  if (raw === null || raw === undefined) return null;
+  if (raw === null || raw === undefined || typeof raw === "boolean") return null;
+  if (raw instanceof Date) {
+    return Number.isFinite(raw.getTime()) ? raw : null;
+  }
   const s = String(raw).trim();
-  if (!s) return null;
+  if (!s || s === "0" || s === "-1") return null;
 
   // Stalker "never expires" markers are handled by isUnlimitedDate, not here.
-  if (/^0000-00-00/.test(s)) return null;
-
-  // Try numeric (unix seconds or ms).
-  if (/^\d{10,13}$/.test(s)) {
-    const n = Number(s);
-    const d = new Date(s.length === 13 ? n : n * 1000);
-    return Number.isFinite(d.getTime()) ? d : null;
+  if (
+    /^0{2,4}[-./]0{1,2}[-./]0{1,4}(?:[T\s]+0{1,2}:0{1,2}(?::0{1,2}(?:\.\d+)?)?\s*(?:Z|[+-]\d{2}:?\d{2})?)?$/i.test(
+      s
+    )
+  ) {
+    return null;
   }
 
-  // YYYY-MM-DD or YYYY-MM-DD HH:MM:SS — treat as UTC-ish by replacing space with T.
-  const iso = s.replace(" ", "T");
-  const d = new Date(iso);
-  return Number.isFinite(d.getTime()) ? d : null;
+  // Try numeric (unix seconds or ms).
+  if (/^\d{9,13}$/.test(s)) {
+    const n = Number(s);
+    const d = new Date(s.length >= 12 ? n : n * 1000);
+    const y = d.getUTCFullYear();
+    return Number.isFinite(d.getTime()) && y >= 1970 && y <= 2200 ? d : null;
+  }
+
+  // ISO timestamp with explicit timezone offset.
+  if (
+    /^\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?\s*(?:Z|[+-]\d{2}:?\d{2})$/i.test(
+      s
+    )
+  ) {
+    const d = new Date(s.replace(/^(\d{4}-\d{2}-\d{2})\s+/, "$1T"));
+    if (Number.isFinite(d.getTime()) && d.getUTCFullYear() >= 1970) return d;
+  }
+
+  // YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD (optionally with time or surrounding text).
+  const ymd =
+    /(?:^|\b)(\d{4})[-./](\d{1,2})[-./](\d{1,2})(?:[T\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?(?:\b|$)/.exec(
+      s
+    );
+  if (ymd) {
+    const year = Number(ymd[1]);
+    const month = Number(ymd[2]);
+    const day = Number(ymd[3]);
+    const hour = ymd[4] ? Number(ymd[4]) : 0;
+    const min = ymd[5] ? Number(ymd[5]) : 0;
+    const sec = ymd[6] ? Number(ymd[6]) : 0;
+    if (year >= 1970 && year <= 2200 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      const d = new Date(Date.UTC(year, month - 1, day, hour, min, sec));
+      if (Number.isFinite(d.getTime())) return d;
+    }
+  }
+
+  // DD-MM-YYYY / DD.MM.YYYY / DD/MM/YYYY (or MM/DD/YYYY when second number > 12).
+  const dmy =
+    /(?:^|\b)(\d{1,2})[-./](\d{1,2})[-./](\d{4})(?:[T\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?(?:\b|$)/.exec(
+      s
+    );
+  if (dmy) {
+    const first = Number(dmy[1]);
+    const second = Number(dmy[2]);
+    const year = Number(dmy[3]);
+    const hour = dmy[4] ? Number(dmy[4]) : 0;
+    const min = dmy[5] ? Number(dmy[5]) : 0;
+    const sec = dmy[6] ? Number(dmy[6]) : 0;
+    const day = second > 12 && first <= 12 ? second : first;
+    const month = second > 12 && first <= 12 ? first : second;
+    if (year >= 1970 && year <= 2200 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      const d = new Date(Date.UTC(year, month - 1, day, hour, min, sec));
+      if (Number.isFinite(d.getTime())) return d;
+    }
+  }
+
+  const d = new Date(s);
+  return Number.isFinite(d.getTime()) && d.getUTCFullYear() >= 1970 ? d : null;
 }
 
 /**
  * Treat a Stalker expiry value as "unlimited / never expires" if:
  *   - it's null/empty/whitespace
- *   - it equals "0000-00-00" (with or without time)
+ *   - it equals "0000-00-00" (with or without time) or other zero-date
+ *   - it contains an explicit unlimited marker ("Unlimited", "Never", "Lifetime")
  *   - it parses to a year >= 2099 (common operator sentinel)
  */
 export function isUnlimitedDate(raw: unknown): boolean {
   if (raw === null || raw === undefined) return true;
   const s = String(raw).trim();
-  if (!s) return true;
-  if (/^0000-00-00/.test(s)) return true;
+  if (!s || s === "0") return true;
+  if (
+    /^0{2,4}[-./]0{1,2}[-./]0{1,4}(?:[T\s]+0{1,2}:0{1,2}(?::0{1,2}(?:\.\d+)?)?\s*(?:Z|[+-]\d{2}:?\d{2})?)?$/i.test(
+      s
+    )
+  ) {
+    return true;
+  }
+  if (/\b(unlimited|never|lifetime|no\s*limit|infinite)\b|∞/i.test(s)) return true;
   const d = parseStalkerDate(s);
-  if (d && d.getFullYear() >= 2099) return true;
+  if (d && d.getUTCFullYear() >= 2099) return true;
   return false;
 }
 
@@ -248,11 +318,12 @@ export function expiryPassesFilter(
     };
   }
 
-  const pass = date.getTime() >= new Date(
+  const cutoffStartMs = Date.UTC(
     cutoff.getFullYear(),
     cutoff.getMonth(),
     cutoff.getDate()
-  ).getTime(); // start-of-cutoff-day compare
+  );
+  const pass = date.getTime() >= cutoffStartMs; // start-of-cutoff-day compare (UTC)
   return {
     pass,
     reason: pass

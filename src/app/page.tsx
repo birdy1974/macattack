@@ -181,6 +181,7 @@ const AVAILABLE_FIELDS = [
   { key: "macAddress", label: "MAC Address", default: true },
   { key: "portalUrl", label: "Portal URL", default: true },
   { key: "expireDate", label: "Expire Date", default: true },
+  { key: "quality", label: "Quality", default: true },
   { key: "serverLocation", label: "Server Location", default: true },
   { key: "responseTimeMs", label: "Portal Check Response (ms)", default: true },
   { key: "portalCheckStatus", label: "Portal Check Status", default: true },
@@ -195,7 +196,7 @@ const AVAILABLE_FIELDS = [
   { key: "qualityStabilityScore", label: "Stream Stability Score (0-10)", default: false },
   { key: "qualityResolution", label: "Stream Resolution (measured)", default: true },
   { key: "qualityCodec", label: "Stream Video Codec (measured)", default: false },
-  { key: "qualityThroughputMbps", label: "Stream Throughput (Mbps)", default: true },
+  { key: "qualityThroughputMbps", label: "Stream Throughput (Mbps measured)", default: true },
   { key: "qualityRequiredMbps", label: "Stream Required Bitrate (Mbps)", default: false },
   { key: "qualityChannels", label: "Stream Channels Playable/Probed", default: false },
   { key: "qualityMeasured", label: "Stream Quality Measured At", default: false },
@@ -222,6 +223,27 @@ const AVAILABLE_FIELDS = [
   { key: "vodCategories", label: "VOD Categories", default: false },
   { key: "createdAt", label: "Created At", default: true },
 ];
+
+function normalizeSelectedFields(fields: string[]): string[] {
+  const withoutQuality = fields.filter((f) => f !== "quality");
+  const expireIdx = withoutQuality.indexOf("expireDate");
+  if (expireIdx !== -1) {
+    return [
+      ...withoutQuality.slice(0, expireIdx + 1),
+      "quality",
+      ...withoutQuality.slice(expireIdx + 1),
+    ];
+  }
+  const locIdx = withoutQuality.indexOf("serverLocation");
+  if (locIdx !== -1) {
+    return [
+      ...withoutQuality.slice(0, locIdx),
+      "quality",
+      ...withoutQuality.slice(locIdx),
+    ];
+  }
+  return [...withoutQuality, "quality"];
+}
 
 // ============================================================================
 // MAIN COMPONENT
@@ -444,7 +466,7 @@ export default function MacAttackPage() {
             setMacPrefix(data.job.macPrefix);
             setTimeoutMs(data.job.timeoutMs);
             if (data.job.selectedFields) {
-              setSelectedFields(data.job.selectedFields);
+              setSelectedFields(normalizeSelectedFields(data.job.selectedFields));
             }
             if (data.job.haEntityId) {
               setHaEntityId(data.job.haEntityId);
@@ -713,9 +735,12 @@ export default function MacAttackPage() {
   // ========================================================================
 
   const toggleField = (key: string) => {
-    setSelectedFields((prev) =>
-      prev.includes(key) ? prev.filter((f) => f !== key) : [...prev, key]
-    );
+    setSelectedFields((prev) => {
+      const next = prev.includes(key)
+        ? prev.filter((f) => f !== key)
+        : [...prev, key];
+      return AVAILABLE_FIELDS.map((f) => f.key).filter((k) => next.includes(k));
+    });
   };
 
   const selectAllFields = () => {
@@ -883,6 +908,26 @@ export default function MacAttackPage() {
 
   const getFieldValue = (result: ScanResult, field: string): string => {
     const report = result.qualityReport;
+    if (field === "quality") {
+      const portalLabel =
+        report?.portal.status === "response_received"
+          ? "Portal responded"
+          : report?.portal.status === "check_error" || report?.portal.status === "http_status_issue"
+            ? "Portal check issue"
+            : "Portal check unavailable";
+      if (result.qualityVerdict && result.qualityVerdict !== "unknown") {
+        const scorePart = result.qualityScore != null ? ` · ${result.qualityScore}/10` : "";
+        const resPart = result.qualityResolution ?? "resolution n/a";
+        const speedPart =
+          result.qualityThroughputMbps != null ? ` · ${result.qualityThroughputMbps.toFixed(2)} Mbps` : "";
+        const chPart =
+          result.qualityChannelsProbed != null
+            ? ` · ${result.qualityChannelsPlayable ?? 0}/${result.qualityChannelsProbed} playable`
+            : "";
+        return `${portalLabel} · Streams: ${result.qualityVerdict}${scorePart} · ${resPart}${speedPart}${chPart}`;
+      }
+      return `${portalLabel} · Streams not measured`;
+    }
     if (field === "portalCheckStatus") {
       return report?.portal.label ?? "Portal check not available";
     }
@@ -2900,9 +2945,6 @@ export default function MacAttackPage() {
                           </th>
                         ))}
                         <th className="px-3 py-3 text-left text-xs font-semibold text-gray-400 uppercase whitespace-nowrap">
-                          Quality
-                        </th>
-                        <th className="px-3 py-3 text-left text-xs font-semibold text-gray-400 uppercase whitespace-nowrap">
                           Server Data
                         </th>
                       </tr>
@@ -2914,67 +2956,70 @@ export default function MacAttackPage() {
                             <td className="px-3 py-3 text-gray-500 font-mono text-xs">
                               {idx + 1}
                             </td>
-                            {selectedFields.map((field) => (
-                              <td
-                                key={field}
-                                className={`px-3 py-3 text-xs max-w-48 truncate ${
-                                  field === "macAddress"
-                                    ? "font-mono text-cyan-400"
-                                    : field === "password"
-                                    ? "font-mono text-green-400"
-                                    : field === "expireDate"
-                                    ? "text-yellow-400"
-                                    : field === "responseTimeMs"
-                                    ? `font-mono ${latencyColor(result.responseTimeMs)}`
-                                    : "text-gray-300"
-                                }`}
-                                title={getFieldValue(result, field)}
-                              >
-                                {getFieldValue(result, field)}
-                              </td>
-                            ))}
-                            <td className="px-3 py-2 min-w-44">
-                              <p className={`text-xs font-medium ${
-                                result.qualityReport?.portal.status === "response_received"
-                                  ? "text-green-300"
-                                  : result.qualityReport?.portal.status === "check_error"
-                                    ? "text-red-300"
-                                    : result.qualityReport?.portal.status === "http_status_issue"
-                                      ? "text-yellow-300"
-                                      : "text-gray-400"
-                              }`}>
-                                {result.qualityReport?.portal.status === "response_received"
-                                  ? "Portal responded"
-                                  : result.qualityReport?.portal.status === "check_error" || result.qualityReport?.portal.status === "http_status_issue"
-                                    ? "Portal check issue"
-                                    : "Portal check unavailable"}
-                              </p>
-                              {result.qualityVerdict && result.qualityVerdict !== "unknown" ? (
-                                <>
-                                  <p className={`text-xs mt-0.5 font-medium ${verdictColor(result.qualityVerdict)}`}>
-                                    Streams: {result.qualityVerdict}
-                                    {result.qualityScore != null ? ` · ${result.qualityScore}/10` : ""}
+                            {selectedFields.map((field) =>
+                              field === "quality" ? (
+                                <td key={field} className="px-3 py-2 min-w-44">
+                                  <p className={`text-xs font-medium ${
+                                    result.qualityReport?.portal.status === "response_received"
+                                      ? "text-green-300"
+                                      : result.qualityReport?.portal.status === "check_error"
+                                        ? "text-red-300"
+                                        : result.qualityReport?.portal.status === "http_status_issue"
+                                          ? "text-yellow-300"
+                                          : "text-gray-400"
+                                  }`}>
+                                    {result.qualityReport?.portal.status === "response_received"
+                                      ? "Portal responded"
+                                      : result.qualityReport?.portal.status === "check_error" || result.qualityReport?.portal.status === "http_status_issue"
+                                        ? "Portal check issue"
+                                        : "Portal check unavailable"}
                                   </p>
-                                  <p className="text-xs text-gray-400 mt-0.5">
-                                    {result.qualityResolution ?? "resolution n/a"}
-                                    {result.qualityThroughputMbps != null ? ` · ${result.qualityThroughputMbps.toFixed(2)} Mbps` : ""}
-                                    {result.qualityChannelsProbed != null
-                                      ? ` · ${result.qualityChannelsPlayable ?? 0}/${result.qualityChannelsProbed} playable`
-                                      : ""}
-                                  </p>
-                                </>
+                                  {result.qualityVerdict && result.qualityVerdict !== "unknown" ? (
+                                    <>
+                                      <p className={`text-xs mt-0.5 font-medium ${verdictColor(result.qualityVerdict)}`}>
+                                        Streams: {result.qualityVerdict}
+                                        {result.qualityScore != null ? ` · ${result.qualityScore}/10` : ""}
+                                      </p>
+                                      <p className="text-xs text-gray-400 mt-0.5">
+                                        {result.qualityResolution ?? "resolution n/a"}
+                                        {result.qualityThroughputMbps != null ? ` · ${result.qualityThroughputMbps.toFixed(2)} Mbps` : ""}
+                                        {result.qualityChannelsProbed != null
+                                          ? ` · ${result.qualityChannelsPlayable ?? 0}/${result.qualityChannelsProbed} playable`
+                                          : ""}
+                                      </p>
+                                    </>
+                                  ) : (
+                                    <p className="text-xs text-amber-300 mt-0.5">Streams not measured</p>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={() => setExpandedQualityId((current) => current === result.id ? null : result.id)}
+                                    aria-expanded={expandedQualityId === result.id}
+                                    className="mt-1 whitespace-nowrap px-2 py-1 text-xs text-amber-200 hover:text-amber-100 border border-amber-900 rounded"
+                                  >
+                                    {expandedQualityId === result.id ? "Hide quality" : "Quality details"}
+                                  </button>
+                                </td>
                               ) : (
-                                <p className="text-xs text-amber-300 mt-0.5">Streams not measured</p>
-                              )}
-                              <button
-                                type="button"
-                                onClick={() => setExpandedQualityId((current) => current === result.id ? null : result.id)}
-                                aria-expanded={expandedQualityId === result.id}
-                                className="mt-1 whitespace-nowrap px-2 py-1 text-xs text-amber-200 hover:text-amber-100 border border-amber-900 rounded"
-                              >
-                                {expandedQualityId === result.id ? "Hide quality" : "Quality details"}
-                              </button>
-                            </td>
+                                <td
+                                  key={field}
+                                  className={`px-3 py-3 text-xs max-w-48 truncate ${
+                                    field === "macAddress"
+                                      ? "font-mono text-cyan-400"
+                                      : field === "password"
+                                      ? "font-mono text-green-400"
+                                      : field === "expireDate"
+                                      ? "text-yellow-400"
+                                      : field === "responseTimeMs"
+                                      ? `font-mono ${latencyColor(result.responseTimeMs)}`
+                                      : "text-gray-300"
+                                  }`}
+                                  title={getFieldValue(result, field)}
+                                >
+                                  {getFieldValue(result, field)}
+                                </td>
+                              )
+                            )}
                             <td className="px-3 py-2">
                               <button
                                 type="button"
@@ -2993,7 +3038,7 @@ export default function MacAttackPage() {
                           </tr>
                           {expandedQualityId === result.id && (
                             <tr>
-                              <td colSpan={selectedFields.length + 3} className="px-4 py-4 bg-gray-950/70">
+                              <td colSpan={selectedFields.length + 2} className="px-4 py-4 bg-gray-950/70">
                                 {result.qualityReport ? (
                                   <div className="space-y-3">
                                     <div className="flex flex-wrap items-start justify-between gap-3">
@@ -3504,7 +3549,7 @@ export default function MacAttackPage() {
                           {expandedResultId === result.id && (
                             <tr>
                               <td
-                                colSpan={selectedFields.length + 3}
+                                colSpan={selectedFields.length + 2}
                                 className="px-4 py-3 bg-gray-950/70"
                               >
                                 <p className="text-xs text-gray-400 mb-2">
