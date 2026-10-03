@@ -25,7 +25,9 @@ if (process.env.NODE_ENV !== "production") {
 export const db = drizzle(pool);
 
 // Columns added after initial release — we add them idempotently on boot so
-// upgrades from older MacAttack installs don't break.
+// upgrades from older MacAttack installs don't break. The historical SQL name
+// ping_loss_pct is retained for compatibility; it stores TCP probe failures,
+// not IP packet loss.
 const JOB_ALTERS = [
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_min_ms REAL",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_avg_ms REAL",
@@ -33,13 +35,20 @@ const JOB_ALTERS = [
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_stdev_ms REAL",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_loss_pct REAL",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_probes INTEGER",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_successful INTEGER",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_probe_ms INTEGER",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_p50_ms REAL",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_p95_ms REAL",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_window_ms INTEGER",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_rtts JSONB",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS diagnostics_at TIMESTAMP",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_dns_ms REAL",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_tcp_ms REAL",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_tls_ms REAL",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_ttfb_ms REAL",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_total_ms REAL",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_status_code INTEGER",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_error TEXT",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_error TEXT",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS server_ip TEXT",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS server_geo_raw JSONB",
@@ -55,6 +64,10 @@ const JOB_ALTERS = [
 ];
 const RESULT_ALTERS = [
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS response_time_ms INTEGER",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS handshake_time_ms INTEGER",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS account_info_time_ms INTEGER",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS portal_online TEXT",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS last_active TEXT",
 ];
 
 // ============================================================================

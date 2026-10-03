@@ -1,11 +1,14 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { Fragment, useState, useEffect, useRef, useCallback } from "react";
+import Image from "next/image";
 import {
   DEFAULT_WEEK_SCHEDULE,
   WEEKDAYS,
   type ScheduleSettings,
 } from "@/lib/schedule";
+import { BRAND_IMAGE_URL } from "@/lib/branding";
+import { buildQualityReport, type QualityReport } from "@/lib/quality-report";
 
 // ============================================================================
 // TYPE DEFINITIONS
@@ -33,7 +36,15 @@ interface ScanJob {
   pingStdevMs: number | null;
   pingLossPct: number | null;
   pingProbes: number | null;
+  pingSuccessful: number | null;
+  pingProbeMs: number | null;
+  pingP50Ms: number | null;
+  pingP95Ms: number | null;
+  pingWindowMs: number | null;
+  pingRtts: Array<number | null> | null;
+  diagnosticsAt: string | null;
   pingError: string | null;
+  httpError: string | null;
   httpDnsMs: number | null;
   httpTcpMs: number | null;
   httpTlsMs: number | null;
@@ -58,7 +69,12 @@ interface ScanResult {
   accountStatus: string | null;
   phoneNumber: string | null;
   responseTimeMs: number | null;
+  handshakeTimeMs: number | null;
+  accountInfoTimeMs: number | null;
+  qualityReport: QualityReport | null;
   timezone: string | null;
+  portalOnline: string | null;
+  lastActive: string | null;
   username: string | null;
   password: string | null;
   playlistGenres: string | null;
@@ -90,18 +106,26 @@ const AVAILABLE_FIELDS = [
   { key: "portalUrl", label: "Portal URL", default: true },
   { key: "expireDate", label: "Expire Date", default: true },
   { key: "serverLocation", label: "Server Location", default: true },
-  { key: "responseTimeMs", label: "Response (ms)", default: true },
+  { key: "responseTimeMs", label: "Portal Check Response (ms)", default: true },
+  { key: "portalCheckStatus", label: "Portal Check Status", default: true },
+  { key: "playbackStability", label: "Playback Stability", default: true },
+  { key: "qualityConfidence", label: "Quality Test Scope/Confidence", default: false },
+  { key: "handshakeTimeMs", label: "Portal Handshake (ms)", default: false },
+  { key: "accountInfoTimeMs", label: "Account Info Request (ms)", default: false },
+  { key: "qualityReport", label: "Detailed Quality Report (JSON)", default: false },
   { key: "tariffPlan", label: "Tariff Plan", default: true },
-  { key: "maxConnections", label: "Max Connections", default: false },
-  { key: "activeConnections", label: "Active Connections", default: false },
+  { key: "maxConnections", label: "Max Connections", default: true },
+  { key: "activeConnections", label: "Active Connections", default: true },
+  { key: "portalOnline", label: "Portal Online State", default: true },
+  { key: "lastActive", label: "Last Active", default: true },
   { key: "accountStatus", label: "Account Status", default: true },
   { key: "phoneNumber", label: "Phone Number", default: false },
-  { key: "timezone", label: "Location/Timezone", default: true },
+  { key: "timezone", label: "Portal/Device Timezone", default: true },
   { key: "username", label: "Username", default: true },
   { key: "password", label: "Password", default: true },
   { key: "playlistGenres", label: "Playlist/Genres", default: false },
   { key: "vodCategories", label: "VOD Categories", default: false },
-  { key: "createdAt", label: "Created At", default: false },
+  { key: "createdAt", label: "Created At", default: true },
 ];
 
 // ============================================================================
@@ -170,6 +194,11 @@ export default function MacAttackPage() {
   const [activeJobId, setActiveJobId] = useState<number | null>(null);
   const [job, setJob] = useState<ScanJob | null>(null);
   const [results, setResults] = useState<ScanResult[]>([]);
+  const [expandedResultId, setExpandedResultId] = useState<number | null>(null);
+  const [expandedQualityId, setExpandedQualityId] = useState<number | null>(null);
+  const [rawDataByResult, setRawDataByResult] = useState<Record<number, unknown>>({});
+  const [rawDataLoadingId, setRawDataLoadingId] = useState<number | null>(null);
+  const [rawDataError, setRawDataError] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -300,11 +329,17 @@ export default function MacAttackPage() {
       if (!res.ok) return;
       const data = (await res.json()) as {
         job: ScanJob;
-        results: ScanResult[];
+        results: Omit<ScanResult, "qualityReport">[];
         logs: LogEntry[];
       };
       setJob(data.job);
-      setResults(data.results);
+      // Build the verbose report in the browser from compact job/result fields.
+      // The polling API stays lean instead of repeating shared diagnostics for
+      // every result row on every 1.5-second refresh.
+      setResults(data.results.map((result) => ({
+        ...result,
+        qualityReport: buildQualityReport(data.job, result),
+      })));
       setLogs(data.logs);
 
       // Stop polling if scan is done
@@ -446,7 +481,37 @@ export default function MacAttackPage() {
     }
   };
 
-  const handleDownload = (format: "csv" | "txt") => {
+  const toggleRawData = async (resultId: number) => {
+    if (expandedResultId === resultId) {
+      setExpandedResultId(null);
+      setRawDataError(null);
+      return;
+    }
+
+    setExpandedResultId(resultId);
+    setRawDataError(null);
+    if (Object.prototype.hasOwnProperty.call(rawDataByResult, resultId)) return;
+    if (!activeJobId) return;
+
+    setRawDataLoadingId(resultId);
+    try {
+      const response = await fetch(
+        `/api/scan/result-data?jobId=${activeJobId}&resultId=${resultId}`
+      );
+      const payload = (await response.json()) as {
+        rawData?: unknown;
+        error?: string;
+      };
+      if (!response.ok) throw new Error(payload.error || "Failed to load raw data");
+      setRawDataByResult((current) => ({ ...current, [resultId]: payload.rawData ?? null }));
+    } catch (err) {
+      setRawDataError(err instanceof Error ? err.message : "Failed to load raw data");
+    } finally {
+      setRawDataLoadingId(null);
+    }
+  };
+
+  const handleDownload = (format: "csv" | "txt" | "json") => {
     if (!activeJobId) return;
     window.open(
       `/api/scan/download?jobId=${activeJobId}&format=${format}`,
@@ -554,6 +619,28 @@ export default function MacAttackPage() {
     job.status === "paused" ||
     job.status === "error";
 
+  // Distribution of real account-validation request times for saved results.
+  // These are portal API timings, not playback-start measurements.
+  const accountResponseSamples = results
+    .map((result) => result.responseTimeMs)
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value))
+    .sort((a, b) => a - b);
+  const responsePercentile = (fraction: number): number | null => {
+    if (accountResponseSamples.length === 0) return null;
+    const position = fraction * (accountResponseSamples.length - 1);
+    const lower = Math.floor(position);
+    const upper = Math.ceil(position);
+    return accountResponseSamples[lower] +
+      (accountResponseSamples[upper] - accountResponseSamples[lower]) * (position - lower);
+  };
+  const accountResponseSummary = {
+    count: accountResponseSamples.length,
+    min: accountResponseSamples[0] ?? null,
+    median: responsePercentile(0.5),
+    p95: responsePercentile(0.95),
+    max: accountResponseSamples[accountResponseSamples.length - 1] ?? null,
+  };
+
   // Filter logs based on selected log levels
   const filteredLogs = logs.filter((log) => {
     return logFilters[log.level as keyof typeof logFilters] ?? true;
@@ -606,9 +693,23 @@ export default function MacAttackPage() {
   };
 
   const getFieldValue = (result: ScanResult, field: string): string => {
+    const report = result.qualityReport;
+    if (field === "portalCheckStatus") {
+      return report?.portal.label ?? "Portal check not available";
+    }
+    if (field === "playbackStability") {
+      return report?.playback.label ?? "Not tested";
+    }
+    if (field === "qualityConfidence") {
+      return report?.confidence.label ?? "Limited — portal-only spot check";
+    }
+    if (field === "qualityReport") {
+      return report ? JSON.stringify(report) : "—";
+    }
+
     const value = result[field as keyof ScanResult];
     if (value === null || value === undefined || value === "") return "—";
-    if (field === "responseTimeMs") {
+    if (["responseTimeMs", "handshakeTimeMs", "accountInfoTimeMs"].includes(field)) {
       const n = Number(value);
       if (!Number.isFinite(n)) return "—";
       return `${Math.round(n)} ms`;
@@ -629,6 +730,31 @@ export default function MacAttackPage() {
     if (v < 300) return "text-cyan-400";
     if (v < 700) return "text-yellow-400";
     return "text-red-400";
+  };
+
+  const getPortalCheckAssessment = (currentJob: ScanJob) => {
+    if (currentJob.httpError) {
+      return { label: "HTTP check failed", color: "text-red-300" };
+    }
+    if (currentJob.httpStatusCode !== null) {
+      return currentJob.httpStatusCode >= 200 && currentJob.httpStatusCode < 300
+        ? { label: `Portal HTTP responded (${currentJob.httpStatusCode})`, color: "text-green-300" }
+        : { label: `Portal HTTP status ${currentJob.httpStatusCode}`, color: "text-yellow-300" };
+    }
+    return currentJob.diagnosticsAt
+      ? { label: "No HTTP response recorded", color: "text-yellow-300" }
+      : { label: "Portal check pending", color: "text-gray-400" };
+  };
+
+  const getTcpSuccessfulCount = (currentJob: ScanJob): number | null => {
+    if (currentJob.pingSuccessful !== null) return currentJob.pingSuccessful;
+    if (
+      currentJob.pingProbes !== null && currentJob.pingProbes > 0 &&
+      currentJob.pingLossPct !== null
+    ) {
+      return Math.round(currentJob.pingProbes * (1 - currentJob.pingLossPct / 100));
+    }
+    return null;
   };
 
   const toggleLogFilter = (level: keyof typeof logFilters) => {
@@ -681,9 +807,15 @@ export default function MacAttackPage() {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-950">
         <div className="text-center">
-          <div className="w-16 h-16 mx-auto mb-4 rounded-xl bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center text-3xl font-bold animate-pulse">
-            M
-          </div>
+          <Image
+            src={BRAND_IMAGE_URL}
+            alt=""
+            aria-hidden="true"
+            width={64}
+            height={64}
+            className="w-16 h-16 mx-auto mb-4 rounded-xl object-cover animate-pulse"
+            unoptimized
+          />
           <p className="text-gray-400">Connecting to MacAttack...</p>
           <p className="text-gray-500 text-sm mt-2">Checking for active scans...</p>
           <div className="mt-4 flex justify-center gap-1">
@@ -706,9 +838,15 @@ export default function MacAttackPage() {
       <header className="border-b border-gray-800 bg-gray-900/80 backdrop-blur-sm sticky top-0 z-50">
         <div style={{ maxWidth: "80rem", margin: "0 auto", padding: "0.75rem 1rem", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
           <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
-            <div style={{ width: "2.5rem", height: "2.5rem", borderRadius: "0.5rem", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "1.25rem", fontWeight: "bold" }} className="bg-gradient-to-br from-cyan-500 to-blue-600">
-              M
-            </div>
+            <Image
+              src={BRAND_IMAGE_URL}
+              alt=""
+              aria-hidden="true"
+              width={40}
+              height={40}
+              style={{ width: "2.5rem", height: "2.5rem", borderRadius: "0.5rem", objectFit: "cover", flexShrink: 0 }}
+              unoptimized
+            />
             <div>
               <h1 style={{ fontSize: "1.25rem", fontWeight: "bold" }} className="bg-gradient-to-r from-cyan-400 to-blue-400 bg-clip-text text-transparent">
                 MacAttack
@@ -1471,20 +1609,31 @@ export default function MacAttackPage() {
                 )}
 
                 {activeJobId && results.length > 0 && (
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.5rem" }}>
-                    <button
-                      onClick={() => handleDownload("csv")}
-                      className="py-2 px-3 bg-gray-800 hover:bg-gray-700 border border-gray-700 text-sm font-medium rounded-lg transition-colors"
-                    >
-                      📥 Download CSV
-                    </button>
-                    <button
-                      onClick={() => handleDownload("txt")}
-                      className="py-2 px-3 bg-gray-800 hover:bg-gray-700 border border-gray-700 text-sm font-medium rounded-lg transition-colors"
-                    >
-                      📥 Download TXT
-                    </button>
-                  </div>
+                  <>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.5rem" }}>
+                      <button
+                        onClick={() => handleDownload("csv")}
+                        className="py-2 px-3 bg-gray-800 hover:bg-gray-700 border border-gray-700 text-sm font-medium rounded-lg transition-colors"
+                      >
+                        📥 Download CSV
+                      </button>
+                      <button
+                        onClick={() => handleDownload("txt")}
+                        className="py-2 px-3 bg-gray-800 hover:bg-gray-700 border border-gray-700 text-sm font-medium rounded-lg transition-colors"
+                      >
+                        📥 Download TXT
+                      </button>
+                      <button
+                        onClick={() => handleDownload("json")}
+                        className="col-span-2 py-2 px-3 bg-cyan-950/60 hover:bg-cyan-900/70 border border-cyan-800/70 text-cyan-200 text-sm font-medium rounded-lg transition-colors"
+                      >
+                        📥 Full JSON (all captured server data)
+                      </button>
+                    </div>
+                    <p className="text-xs text-gray-500">
+                      JSON includes complete responses from portal endpoints already requested by the scan, even for fields not shown in the table. Raw responses may contain account credentials; store the export securely.
+                    </p>
+                  </>
                 )}
               </div>
             </div>
@@ -1524,91 +1673,124 @@ export default function MacAttackPage() {
               </div>
             )}
 
-            {/* Network Diagnostics Card */}
-            {job && (job.pingAvgMs !== null || job.httpTotalMs !== null) && (
+            {/* Portal connectivity and playback-scope report */}
+            {job && (job.diagnosticsAt || job.pingAvgMs !== null || job.httpTotalMs !== null) && (
               <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
-                <div className="flex items-center justify-between mb-4">
-                  <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">
-                    🌐 Server Diagnostics
-                  </h2>
-                  {job.pingError && (
-                    <span className="text-xs text-yellow-500">
-                      ⚠ {job.pingError}
-                    </span>
-                  )}
+                <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
+                  <div>
+                    <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">
+                      🌐 Portal Connectivity &amp; Quality Report
+                    </h2>
+                    <p className="text-xs text-gray-500 mt-1">
+                      Scanner host → Stalker portal · {job.diagnosticsAt
+                        ? `measured ${new Date(job.diagnosticsAt).toLocaleString()}`
+                        : "measurement time unavailable"}
+                    </p>
+                  </div>
+                  <span className="px-3 py-1.5 rounded-full border border-amber-800 bg-amber-950/50 text-xs font-semibold text-amber-300">
+                    Playback stability: NOT TESTED
+                  </span>
                 </div>
 
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+                <div className="mb-4 rounded-lg border border-amber-900/70 bg-amber-950/25 p-3">
+                  <p className="text-sm font-semibold text-amber-200">
+                    No stream-quality score is available from this scan.
+                  </p>
+                  <p className="text-xs leading-relaxed text-gray-300 mt-1">
+                    These checks measure the scanner server&apos;s connection to the portal and its control API. The scanner does not open a channel or play media, so it cannot report startup time, bitrate, stalls, or freeze likelihood. The media server and the viewer&apos;s device/network may use a different route.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3 mb-4">
                   <div className="bg-gray-800/60 rounded-lg p-3">
-                    <p className="text-xs text-gray-500 uppercase tracking-wide">
-                      TCP Ping (avg)
+                    <p className="text-xs text-gray-500 uppercase tracking-wide">Portal HTTP check</p>
+                    <p className={`text-base font-semibold mt-1 ${getPortalCheckAssessment(job).color}`}>
+                      {getPortalCheckAssessment(job).label}
                     </p>
-                    <p className={`text-lg font-mono font-bold ${latencyColor(job.pingAvgMs)}`}>
-                      {fmtMs(job.pingAvgMs)}
+                    <p className="text-xs text-gray-500 mt-1">
+                      One handshake-endpoint HTTP timing sample · body not inspected · status {job.httpStatusCode ?? "—"}
                     </p>
-                    <p className="text-xs text-gray-500 mt-0.5">
-                      min {fmtMs(job.pingMinMs)} · max {fmtMs(job.pingMaxMs)}
-                      {job.pingStdevMs !== null ? ` · σ ${Math.round(job.pingStdevMs)}ms` : ""}
+                    {job.httpError && <p className="text-xs text-red-300 mt-1 break-words">{job.httpError}</p>}
+                  </div>
+
+                  <div className="bg-gray-800/60 rounded-lg p-3">
+                    <p className="text-xs text-gray-500 uppercase tracking-wide">TCP connection time</p>
+                    <p className={`text-lg font-mono font-bold mt-1 ${latencyColor(job.pingP50Ms ?? job.pingAvgMs)}`}>
+                      Median {fmtMs(job.pingP50Ms ?? job.pingAvgMs)}
+                    </p>
+                    <p className="text-xs text-gray-400 mt-1">
+                      P95 {fmtMs(job.pingP95Ms)} · min {fmtMs(job.pingMinMs)} · max {fmtMs(job.pingMaxMs)}
+                    </p>
+                    <p className="text-xs text-gray-500 mt-1">
+                      σ {fmtMs(job.pingStdevMs)} variation · connect timing is not media jitter
                     </p>
                   </div>
 
                   <div className="bg-gray-800/60 rounded-lg p-3">
-                    <p className="text-xs text-gray-500 uppercase tracking-wide">
-                      HTTP Total
+                    <p className="text-xs text-gray-500 uppercase tracking-wide">TCP probe outcomes</p>
+                    <p className="text-lg font-mono font-bold text-cyan-300 mt-1">
+                      {(job.pingProbes ?? 0) > 0
+                        ? `${getTcpSuccessfulCount(job) ?? "—"} / ${job.pingProbes} connected`
+                        : "No TCP probes recorded"}
                     </p>
-                    <p className={`text-lg font-mono font-bold ${latencyColor(job.httpTotalMs)}`}>
-                      {fmtMs(job.httpTotalMs)}
+                    <p className="text-xs text-gray-400 mt-1">
+                      {job.pingProbes !== null && job.pingSuccessful !== null
+                        ? `${job.pingProbes - job.pingSuccessful} failed`
+                        : job.pingLossPct !== null
+                          ? `${job.pingLossPct.toFixed(1)}% TCP connection failures`
+                          : "No failed-probe estimate available"}
+                      {job.pingLossPct !== null ? ` · ${job.pingLossPct.toFixed(1)}% failure rate` : ""}
                     </p>
-                    <p className="text-xs text-gray-500 mt-0.5">
-                      status{" "}
-                      <span className="text-cyan-400">
-                        {job.httpStatusCode ?? "—"}
-                      </span>
+                    <p className="text-xs text-gray-500 mt-1">
+                      {job.pingProbeMs ?? 250}ms spacing · {job.pingWindowMs !== null
+                        ? `${(job.pingWindowMs / 1000).toFixed(2)}s observed window`
+                        : "short sample window"}
                     </p>
+                    {job.pingError && <p className="text-xs text-yellow-300 mt-1 break-words">{job.pingError}</p>}
                   </div>
 
                   <div className="bg-gray-800/60 rounded-lg p-3">
-                    <p className="text-xs text-gray-500 uppercase tracking-wide">
-                      Time to First Byte
-                    </p>
-                    <p className={`text-lg font-mono font-bold ${latencyColor(job.httpTtfbMs)}`}>
+                    <p className="text-xs text-gray-500 uppercase tracking-wide">HTTP time to first byte</p>
+                    <p className={`text-lg font-mono font-bold mt-1 ${latencyColor(job.httpTtfbMs)}`}>
                       {fmtMs(job.httpTtfbMs)}
                     </p>
-                    <p className="text-xs text-gray-500 mt-0.5">
-                      server processing + RTT
+                    <p className="text-xs text-gray-500 mt-1">
+                      Portal response after connection setup; not video startup time
+                    </p>
+                  </div>
+
+                  <div className="bg-gray-800/60 rounded-lg p-3">
+                    <p className="text-xs text-gray-500 uppercase tracking-wide">HTTP request total</p>
+                    <p className={`text-lg font-mono font-bold mt-1 ${latencyColor(job.httpTotalMs)}`}>
+                      {fmtMs(job.httpTotalMs)}
+                    </p>
+                    <p className="text-xs text-gray-500 mt-1">
+                      DNS {fmtMs(job.httpDnsMs)} · TCP {fmtMs(job.httpTcpMs)} · TLS {fmtMs(job.httpTlsMs)}
                     </p>
                   </div>
 
                   <div className="bg-gray-800/60 rounded-lg p-3">
                     <p className="text-xs text-gray-500 uppercase tracking-wide">
-                      Packet Loss
+                      Valid-result account checks
                     </p>
-                    <p
-                      className={`text-lg font-mono font-bold ${
-                        job.pingLossPct === null
-                          ? "text-gray-400"
-                          : job.pingLossPct === 0
-                          ? "text-green-400"
-                          : job.pingLossPct < 30
-                          ? "text-yellow-400"
-                          : "text-red-400"
-                      }`}
-                    >
-                      {job.pingLossPct !== null ? `${job.pingLossPct.toFixed(0)}%` : "—"}
+                    <p className={`text-lg font-mono font-bold mt-1 ${latencyColor(accountResponseSummary.median)}`}>
+                      Median {fmtMs(accountResponseSummary.median)}
                     </p>
-                    <p className="text-xs text-gray-500 mt-0.5">
-                      {job.pingProbes ?? 0} probes
-                      {job.serverIp ? ` · IP ${job.serverIp}` : ""}
+                    <p className="text-xs text-gray-400 mt-1">
+                      P95 {fmtMs(accountResponseSummary.p95)} · min {fmtMs(accountResponseSummary.min)} · max {fmtMs(accountResponseSummary.max)}
+                    </p>
+                    <p className="text-xs text-gray-500 mt-1">
+                      {accountResponseSummary.count} saved results · handshake + account_info only
                     </p>
                   </div>
                 </div>
 
-                {/* HTTP waterfall bar — each phase is a duration in ms. */}
+                {/* HTTP waterfall describes the one portal timing request only. */}
                 {job.httpTotalMs !== null && job.httpTotalMs > 0 && (
-                  <div>
-                    <p className="text-xs text-gray-500 mb-2">HTTP Timing Waterfall</p>
+                  <div className="mb-4">
+                    <p className="text-xs text-gray-500 mb-2">Portal HTTP timing breakdown (one sample)</p>
                     {(() => {
-                      const total = job.httpTotalMs;
+                      const total = job.httpTotalMs!;
                       const phases: Array<{
                         key: string;
                         label: string;
@@ -1625,33 +1807,33 @@ export default function MacAttackPage() {
                       if (job.httpTtfbMs && job.httpTtfbMs > 0)
                         phases.push({ key: "ttfb", label: "TTFB", ms: job.httpTtfbMs, bg: "bg-cyan-700", fg: "text-cyan-100" });
 
-                      const accounted = phases.reduce((s, p) => s + p.ms, 0);
+                      const accounted = phases.reduce((sum, phase) => sum + phase.ms, 0);
                       const transferMs = Math.max(0, total - accounted);
                       if (transferMs > 1)
-                        phases.push({ key: "transfer", label: "TX", ms: transferMs, bg: "bg-green-700", fg: "text-green-100" });
+                        phases.push({ key: "transfer", label: "Other", ms: transferMs, bg: "bg-green-700", fg: "text-green-100" });
 
                       return (
                         <>
                           <div className="flex h-6 w-full rounded overflow-hidden bg-gray-800 text-xs font-mono">
-                            {phases.map((p) => {
-                              const pct = (p.ms / total) * 100;
+                            {phases.map((phase) => {
+                              const percent = (phase.ms / total) * 100;
                               return (
                                 <div
-                                  key={p.key}
-                                  className={`${p.bg} ${p.fg} flex items-center justify-center`}
-                                  style={{ width: `${pct}%` }}
-                                  title={`${p.label}: ${Math.round(p.ms)}ms`}
+                                  key={phase.key}
+                                  className={`${phase.bg} ${phase.fg} flex items-center justify-center`}
+                                  style={{ width: `${percent}%` }}
+                                  title={`${phase.label}: ${Math.round(phase.ms)}ms`}
                                 >
-                                  {pct > 10 ? `${p.label} ${Math.round(p.ms)}ms` : ""}
+                                  {percent > 10 ? `${phase.label} ${Math.round(phase.ms)}ms` : ""}
                                 </div>
                               );
                             })}
                           </div>
                           <div className="flex flex-wrap gap-3 mt-2 text-xs text-gray-400">
-                            {phases.map((p) => (
-                              <span key={p.key}>
-                                <span className={`inline-block w-3 h-3 ${p.bg} rounded-sm mr-1 align-middle`} />
-                                {p.label} {Math.round(p.ms)}ms
+                            {phases.map((phase) => (
+                              <span key={phase.key}>
+                                <span className={`inline-block w-3 h-3 ${phase.bg} rounded-sm mr-1 align-middle`} />
+                                {phase.label} {Math.round(phase.ms)}ms
                               </span>
                             ))}
                           </div>
@@ -1660,6 +1842,11 @@ export default function MacAttackPage() {
                     })()}
                   </div>
                 )}
+
+                <p className="text-xs leading-relaxed text-gray-500 border-t border-gray-800 pt-3">
+                  Interpretation: TCP probe failures are connection-attempt failures, not packet-loss measurements. These short scanner-to-portal observations have limited confidence and do not test the actual media host, sustained segment throughput, player buffering, or the viewer&apos;s local network.
+                  {job.serverIp ? ` Portal IP: ${job.serverIp}.` : ""}
+                </p>
               </div>
             )}
 
@@ -1707,37 +1894,237 @@ export default function MacAttackPage() {
                             {AVAILABLE_FIELDS.find((f) => f.key === field)?.label || field}
                           </th>
                         ))}
+                        <th className="px-3 py-3 text-left text-xs font-semibold text-gray-400 uppercase whitespace-nowrap">
+                          Quality
+                        </th>
+                        <th className="px-3 py-3 text-left text-xs font-semibold text-gray-400 uppercase whitespace-nowrap">
+                          Server Data
+                        </th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-gray-800/50">
                       {results.map((result, idx) => (
-                        <tr
-                          key={result.id}
-                          className="hover:bg-gray-800/50 transition-colors"
-                        >
-                          <td className="px-3 py-3 text-gray-500 font-mono text-xs">
-                            {idx + 1}
-                          </td>
-                          {selectedFields.map((field) => (
-                            <td
-                              key={field}
-                              className={`px-3 py-3 text-xs max-w-48 truncate ${
-                                field === "macAddress"
-                                  ? "font-mono text-cyan-400"
-                                  : field === "password"
-                                  ? "font-mono text-green-400"
-                                  : field === "expireDate"
-                                  ? "text-yellow-400"
-                                  : field === "responseTimeMs"
-                                  ? `font-mono ${latencyColor(result.responseTimeMs)}`
-                                  : "text-gray-300"
-                              }`}
-                              title={getFieldValue(result, field)}
-                            >
-                              {getFieldValue(result, field)}
+                        <Fragment key={result.id}>
+                          <tr className="hover:bg-gray-800/50 transition-colors">
+                            <td className="px-3 py-3 text-gray-500 font-mono text-xs">
+                              {idx + 1}
                             </td>
-                          ))}
-                        </tr>
+                            {selectedFields.map((field) => (
+                              <td
+                                key={field}
+                                className={`px-3 py-3 text-xs max-w-48 truncate ${
+                                  field === "macAddress"
+                                    ? "font-mono text-cyan-400"
+                                    : field === "password"
+                                    ? "font-mono text-green-400"
+                                    : field === "expireDate"
+                                    ? "text-yellow-400"
+                                    : field === "responseTimeMs"
+                                    ? `font-mono ${latencyColor(result.responseTimeMs)}`
+                                    : "text-gray-300"
+                                }`}
+                                title={getFieldValue(result, field)}
+                              >
+                                {getFieldValue(result, field)}
+                              </td>
+                            ))}
+                            <td className="px-3 py-2 min-w-44">
+                              <p className={`text-xs font-medium ${
+                                result.qualityReport?.portal.status === "response_received"
+                                  ? "text-green-300"
+                                  : result.qualityReport?.portal.status === "check_error"
+                                    ? "text-red-300"
+                                    : result.qualityReport?.portal.status === "http_status_issue"
+                                      ? "text-yellow-300"
+                                      : "text-gray-400"
+                              }`}>
+                                {result.qualityReport?.portal.status === "response_received"
+                                  ? "Portal responded"
+                                  : result.qualityReport?.portal.status === "check_error" || result.qualityReport?.portal.status === "http_status_issue"
+                                    ? "Portal check issue"
+                                    : "Portal check unavailable"}
+                              </p>
+                              <p className="text-xs text-amber-300 mt-0.5">Playback not tested</p>
+                              <button
+                                type="button"
+                                onClick={() => setExpandedQualityId((current) => current === result.id ? null : result.id)}
+                                aria-expanded={expandedQualityId === result.id}
+                                className="mt-1 whitespace-nowrap px-2 py-1 text-xs text-amber-200 hover:text-amber-100 border border-amber-900 rounded"
+                              >
+                                {expandedQualityId === result.id ? "Hide quality" : "Quality details"}
+                              </button>
+                            </td>
+                            <td className="px-3 py-2">
+                              <button
+                                type="button"
+                                onClick={() => void toggleRawData(result.id)}
+                                aria-expanded={expandedResultId === result.id}
+                                disabled={rawDataLoadingId !== null}
+                                className="whitespace-nowrap px-2 py-1 text-xs text-cyan-300 hover:text-cyan-100 border border-cyan-900 rounded disabled:opacity-50"
+                              >
+                                {rawDataLoadingId === result.id
+                                  ? "Loading…"
+                                  : expandedResultId === result.id
+                                    ? "Hide JSON"
+                                    : "View JSON"}
+                              </button>
+                            </td>
+                          </tr>
+                          {expandedQualityId === result.id && (
+                            <tr>
+                              <td colSpan={selectedFields.length + 3} className="px-4 py-4 bg-gray-950/70">
+                                {result.qualityReport ? (
+                                  <div className="space-y-3">
+                                    <div className="flex flex-wrap items-start justify-between gap-3">
+                                      <div>
+                                        <h3 className="text-sm font-semibold text-gray-200">{result.qualityReport.assessment.label}</h3>
+                                        <p className="text-xs text-gray-400 mt-1">{result.qualityReport.assessment.explanation}</p>
+                                      </div>
+                                      <span className="px-2.5 py-1 rounded border border-amber-900 bg-amber-950/40 text-xs text-amber-200">
+                                        Playback: {result.qualityReport.playback.label}
+                                      </span>
+                                    </div>
+
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+                                      <div className="bg-gray-900 rounded-lg p-3">
+                                        <p className="text-xs uppercase tracking-wide text-gray-500">Measurement source</p>
+                                        <p className="text-sm text-gray-200 mt-1">{result.qualityReport.source.label}</p>
+                                        <p className="text-xs font-mono text-gray-400 mt-1">{result.qualityReport.source.target ?? "Portal target unavailable"}</p>
+                                        <p className="text-xs text-gray-500 mt-1">
+                                          {result.qualityReport.measuredAt
+                                            ? new Date(result.qualityReport.measuredAt).toLocaleString()
+                                            : "Measurement time unavailable"}
+                                        </p>
+                                      </div>
+
+                                      <div className="bg-gray-900 rounded-lg p-3">
+                                        <p className="text-xs uppercase tracking-wide text-gray-500">TCP connection sample</p>
+                                        <p className="text-sm text-gray-200 mt-1">
+                                          {result.qualityReport.portal.tcpConnect.successful ?? "—"} / {result.qualityReport.portal.tcpConnect.probes} connected
+                                        </p>
+                                        <p className="text-xs text-gray-400 mt-1">
+                                          {result.qualityReport.portal.tcpConnect.failed ?? "—"} failed · {result.qualityReport.portal.tcpConnect.failureRatePct !== null
+                                            ? `${result.qualityReport.portal.tcpConnect.failureRatePct.toFixed(1)}%`
+                                            : "failure rate unknown"}
+                                        </p>
+                                        <p className="text-xs text-gray-500 mt-1">
+                                          {result.qualityReport.portal.tcpConnect.windowMs !== null
+                                            ? `${result.qualityReport.portal.tcpConnect.windowEstimated ? "Estimated " : ""}${(result.qualityReport.portal.tcpConnect.windowMs / 1000).toFixed(2)}s window`
+                                            : "Window unavailable"}
+                                          {result.qualityReport.portal.tcpConnect.intervalMs !== null
+                                            ? ` · ${result.qualityReport.portal.tcpConnect.intervalMs}ms interval`
+                                            : ""}
+                                        </p>
+                                        {result.qualityReport.portal.tcpConnect.observationsMs && (
+                                          <p className="text-xs font-mono text-gray-500 mt-1 break-words">
+                                            Samples: {result.qualityReport.portal.tcpConnect.observationsMs
+                                              .map((value) => value === null ? "timeout" : `${value.toFixed(1)}ms`)
+                                              .join(" · ")}
+                                          </p>
+                                        )}
+                                        {result.qualityReport.portal.tcpConnect.error && (
+                                          <p className="text-xs text-yellow-300 mt-1 break-words">
+                                            {result.qualityReport.portal.tcpConnect.error}
+                                          </p>
+                                        )}
+                                      </div>
+
+                                      <div className="bg-gray-900 rounded-lg p-3">
+                                        <p className="text-xs uppercase tracking-wide text-gray-500">TCP connect-time spread</p>
+                                        <p className={`text-sm font-mono mt-1 ${latencyColor(result.qualityReport.portal.tcpConnect.medianMs)}`}>
+                                          Median {fmtMs(result.qualityReport.portal.tcpConnect.medianMs)} · P95 {fmtMs(result.qualityReport.portal.tcpConnect.p95Ms)}
+                                        </p>
+                                        <p className="text-xs text-gray-400 mt-1">
+                                          Min {fmtMs(result.qualityReport.portal.tcpConnect.minMs)} · mean {fmtMs(result.qualityReport.portal.tcpConnect.meanMs)} · max {fmtMs(result.qualityReport.portal.tcpConnect.maxMs)}
+                                        </p>
+                                        <p className="text-xs text-gray-500 mt-1">
+                                          σ {fmtMs(result.qualityReport.portal.tcpConnect.standardDeviationMs)} · connect-time variation, not RTP jitter
+                                        </p>
+                                      </div>
+
+                                      <div className="bg-gray-900 rounded-lg p-3">
+                                        <p className="text-xs uppercase tracking-wide text-gray-500">Portal HTTP timing</p>
+                                        <p className={`text-sm mt-1 ${
+                                          result.qualityReport.portal.status === "response_received"
+                                            ? "text-green-300"
+                                            : result.qualityReport.portal.status === "check_error"
+                                              ? "text-red-300"
+                                              : "text-yellow-300"
+                                        }`}>
+                                          {result.qualityReport.portal.http.label}
+                                        </p>
+                                        <p className="text-xs text-gray-400 mt-1">
+                                          DNS {fmtMs(result.qualityReport.portal.http.dnsMs)} · TCP {fmtMs(result.qualityReport.portal.http.tcpMs)} · TLS {fmtMs(result.qualityReport.portal.http.tlsMs)}
+                                        </p>
+                                        <p className="text-xs text-gray-400 mt-1">
+                                          TTFB {fmtMs(result.qualityReport.portal.http.ttfbMs)} · total {fmtMs(result.qualityReport.portal.http.totalMs)}
+                                        </p>
+                                        {result.qualityReport.portal.http.error && <p className="text-xs text-red-300 mt-1 break-words">{result.qualityReport.portal.http.error}</p>}
+                                      </div>
+
+                                      <div className="bg-gray-900 rounded-lg p-3">
+                                        <p className="text-xs uppercase tracking-wide text-gray-500">This MAC&apos;s portal account check</p>
+                                        <p className={`text-sm font-mono mt-1 ${latencyColor(result.qualityReport.accountCheck.totalMs)}`}>
+                                          Total {fmtMs(result.qualityReport.accountCheck.totalMs)}
+                                        </p>
+                                        <p className="text-xs text-gray-400 mt-1">
+                                          Handshake {fmtMs(result.qualityReport.accountCheck.handshakeMs)} · account_info {fmtMs(result.qualityReport.accountCheck.accountInfoMs)}
+                                        </p>
+                                        <p className="text-xs text-gray-500 mt-1">This is not channel startup/playback time.</p>
+                                      </div>
+
+                                      <div className="bg-gray-900 rounded-lg p-3">
+                                        <p className="text-xs uppercase tracking-wide text-gray-500">Operator-side server health</p>
+                                        <p className="text-sm text-gray-300 mt-1">{result.qualityReport.operatorTelemetry.label}</p>
+                                        <p className="text-xs text-gray-500 mt-1">{result.qualityReport.operatorTelemetry.reason}</p>
+                                      </div>
+
+                                      <div className="bg-gray-900 rounded-lg p-3">
+                                        <p className="text-xs uppercase tracking-wide text-gray-500">Evidence confidence</p>
+                                        <p className="text-sm text-amber-200 mt-1">{result.qualityReport.confidence.label}</p>
+                                        <p className="text-xs text-gray-400 mt-1">{result.qualityReport.confidence.explanation}</p>
+                                      </div>
+                                    </div>
+
+                                    <div className="rounded-lg border border-gray-800 bg-gray-900 p-3">
+                                      <p className="text-xs font-semibold text-gray-300 mb-1">What this does not establish</p>
+                                      <ul className="list-disc pl-5 space-y-1 text-xs text-gray-500">
+                                        {result.qualityReport.limitations.map((limitation) => <li key={limitation}>{limitation}</li>)}
+                                      </ul>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <p className="text-xs text-gray-500">No quality report is available for this result.</p>
+                                )}
+                              </td>
+                            </tr>
+                          )}
+                          {expandedResultId === result.id && (
+                            <tr>
+                              <td
+                                colSpan={selectedFields.length + 3}
+                                className="px-4 py-3 bg-gray-950/70"
+                              >
+                                <p className="text-xs text-gray-400 mb-2">
+                                  Raw responses from endpoints requested for this result, plus normalized-field provenance.
+                                </p>
+                                {rawDataLoadingId === result.id ? (
+                                  <p className="text-xs text-cyan-300">Loading captured portal data…</p>
+                                ) : rawDataError ? (
+                                  <p className="text-xs text-red-300">{rawDataError}</p>
+                                ) : rawDataByResult[result.id] === null ? (
+                                  <p className="text-xs text-gray-500">No raw portal data was stored for this result.</p>
+                                ) : Object.prototype.hasOwnProperty.call(rawDataByResult, result.id) ? (
+                                  <pre className="max-h-96 overflow-auto rounded-lg border border-gray-800 bg-black/30 p-3 text-xs leading-relaxed text-gray-300 whitespace-pre-wrap break-all">
+                                    {JSON.stringify(rawDataByResult[result.id], null, 2)}
+                                  </pre>
+                                ) : (
+                                  <p className="text-xs text-gray-500">Loading captured portal data…</p>
+                                )}
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
                       ))}
                     </tbody>
                   </table>

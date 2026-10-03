@@ -1,15 +1,15 @@
 /**
  * ============================================================================
- * Network Diagnostics — TCP ping & HTTP timing waterfall
+ * Network Diagnostics — TCP connect sampling & HTTP timing waterfall
  * ============================================================================
  *
  * Provides two measurements for a Stalker portal URL:
  *
  *  1. tcpPing(host, port, options)
- *     Measures raw TCP-handshake round-trip time by opening and immediately
- *     destroying a TCP socket. This is the closest thing to ICMP ping that
- *     works without raw-socket privileges (i.e. works inside containers).
- *     Returns { min, avg, max, stdev, loss, probes, results } in milliseconds.
+ *     Measures TCP connection setup times by opening and immediately
+ *     destroying sockets. Reports connection-attempt failures, not IP packet
+ *     loss, RTP jitter, or media throughput. Includes percentiles and the
+ *     observed duration of the probe sequence.
  *
  *  2. measureHttpRequest(url, options)
  *     Issues one HTTP(S) request to the given URL and produces a fine-grained
@@ -45,11 +45,19 @@ export interface TcpPingResult {
   probes: number;
   successful: number;
   failed: number;
+  /** Percentage of TCP connection attempts that failed or timed out. */
+  failurePct: number;
+  /** @deprecated Kept as a compatibility alias for the legacy scanner API. */
   lossPct: number;
   minMs: number | null;
   avgMs: number | null;
   maxMs: number | null;
   stdevMs: number | null;
+  /** Linearly interpolated p50/p95 of successful TCP connect times. */
+  p50Ms: number | null;
+  p95Ms: number | null;
+  /** Wall-clock duration of the complete sequence, including probe intervals. */
+  sampleWindowMs: number;
   rtts: Array<number | null>;
 }
 
@@ -113,6 +121,7 @@ export async function tcpPing(
   const intervalMs = Math.max(0, opts.intervalMs ?? 200);
   const timeoutMs = Math.max(100, opts.timeoutMs ?? 5000);
 
+  const sampleStart = process.hrtime();
   const rtts: Array<number | null> = [];
   for (let i = 0; i < probes; i++) {
     const rtt = await tcpProbe(host, port, timeoutMs);
@@ -124,7 +133,18 @@ export async function tcpPing(
 
   const successes = rtts.filter((r): r is number => r !== null);
   const failed = rtts.length - successes.length;
-  const lossPct = (failed / rtts.length) * 100;
+  const sorted = [...successes].sort((a, b) => a - b);
+  const percentile = (value: number): number | null => {
+    if (sorted.length === 0) return null;
+    const position = (value / 100) * (sorted.length - 1);
+    const lower = Math.floor(position);
+    const upper = Math.ceil(position);
+    const fraction = position - lower;
+    return sorted[lower] + (sorted[upper] - sorted[lower]) * fraction;
+  };
+  const failurePct = (failed / rtts.length) * 100;
+  const p50Ms = percentile(50);
+  const p95Ms = percentile(95);
 
   let min: number | null = null;
   let max: number | null = null;
@@ -147,11 +167,15 @@ export async function tcpPing(
     probes,
     successful: successes.length,
     failed,
-    lossPct,
+    failurePct,
+    lossPct: failurePct,
     minMs: min === null ? null : Number(min.toFixed(2)),
     avgMs: avg === null ? null : Number(avg.toFixed(2)),
     maxMs: max === null ? null : Number(max.toFixed(2)),
     stdevMs: stdev === null ? null : Number(stdev.toFixed(2)),
+    p50Ms: p50Ms === null ? null : Number(p50Ms.toFixed(2)),
+    p95Ms: p95Ms === null ? null : Number(p95Ms.toFixed(2)),
+    sampleWindowMs: Number(hrTimeMs(sampleStart).toFixed(2)),
     rtts,
   };
 }

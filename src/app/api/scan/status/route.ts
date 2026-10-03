@@ -24,8 +24,35 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: "Job not found" }, { status: 404 });
     }
 
+    // The complete raw portal response can be sizeable. Keep frequent status
+    // polling lean; the UI loads rawData on demand from /api/scan/result-data,
+    // while the full JSON export reads it directly from the database.
     const results = await db
-      .select()
+      .select({
+        id: scanResults.id,
+        jobId: scanResults.jobId,
+        macAddress: scanResults.macAddress,
+        portalUrl: scanResults.portalUrl,
+        expireDate: scanResults.expireDate,
+        serverLocation: scanResults.serverLocation,
+        tariffPlan: scanResults.tariffPlan,
+        maxConnections: scanResults.maxConnections,
+        activeConnections: scanResults.activeConnections,
+        createdAt: scanResults.createdAt,
+        accountStatus: scanResults.accountStatus,
+        phoneNumber: scanResults.phoneNumber,
+        responseTimeMs: scanResults.responseTimeMs,
+        handshakeTimeMs: scanResults.handshakeTimeMs,
+        accountInfoTimeMs: scanResults.accountInfoTimeMs,
+        timezone: scanResults.timezone,
+        portalOnline: scanResults.portalOnline,
+        lastActive: scanResults.lastActive,
+        username: scanResults.username,
+        password: scanResults.password,
+        playlistGenres: scanResults.playlistGenres,
+        vodCategories: scanResults.vodCategories,
+        foundAt: scanResults.foundAt,
+      })
       .from(scanResults)
       .where(eq(scanResults.jobId, parseInt(jobId)))
       .orderBy(desc(scanResults.foundAt));

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { scanJobs, scanResults } from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { buildQualityReport } from "@/lib/quality-report";
 
 function extractDomainFromUrl(url: string): string {
   try {
@@ -64,16 +65,32 @@ export async function GET(request: NextRequest) {
       "portalUrl",
       "expireDate",
     ];
+    const qualityReportCache = new Map<number, ReturnType<typeof buildQualityReport>>();
+    const getQualityReport = (result: (typeof results)[number]) => {
+      const cached = qualityReportCache.get(result.id);
+      if (cached) return cached;
+      const report = buildQualityReport(job, result);
+      qualityReportCache.set(result.id, report);
+      return report;
+    };
 
     const fieldMap: Record<string, string> = {
       macAddress: "MAC Address",
       portalUrl: "Portal URL",
       expireDate: "Expire Date",
       serverLocation: "Server Location",
-      responseTimeMs: "Response Time (ms)",
+      responseTimeMs: "Portal Check Response (ms)",
+      handshakeTimeMs: "Portal Handshake (ms)",
+      accountInfoTimeMs: "Account Info Request (ms)",
+      portalCheckStatus: "Portal Check Status (not playback)",
+      playbackStability: "Playback Stability",
+      qualityConfidence: "Quality Test Scope/Confidence",
+      qualityReport: "Detailed Quality Report (JSON)",
       tariffPlan: "Tariff Plan",
       maxConnections: "Max Connections",
       activeConnections: "Active Connections",
+      portalOnline: "Portal Online State",
+      lastActive: "Last Active",
       accountStatus: "Account Status",
       phoneNumber: "Phone Number",
       createdAt: "Created At",
@@ -101,12 +118,32 @@ export async function GET(request: NextRequest) {
           return result.responseTimeMs !== null && result.responseTimeMs !== undefined
             ? String(result.responseTimeMs)
             : "";
+        case "handshakeTimeMs":
+          return result.handshakeTimeMs !== null && result.handshakeTimeMs !== undefined
+            ? String(result.handshakeTimeMs)
+            : "";
+        case "accountInfoTimeMs":
+          return result.accountInfoTimeMs !== null && result.accountInfoTimeMs !== undefined
+            ? String(result.accountInfoTimeMs)
+            : "";
+        case "portalCheckStatus":
+          return getQualityReport(result).portal.label;
+        case "playbackStability":
+          return getQualityReport(result).playback.label;
+        case "qualityConfidence":
+          return getQualityReport(result).confidence.label;
+        case "qualityReport":
+          return JSON.stringify(getQualityReport(result));
         case "tariffPlan":
           return result.tariffPlan || "";
         case "maxConnections":
-          return result.maxConnections || "";
+          return result.maxConnections ?? "";
         case "activeConnections":
-          return result.activeConnections || "";
+          return result.activeConnections ?? "";
+        case "portalOnline":
+          return result.portalOnline ?? "";
+        case "lastActive":
+          return result.lastActive ?? "";
         case "accountStatus":
           return result.accountStatus || "";
         case "phoneNumber":
@@ -132,6 +169,75 @@ export async function GET(request: NextRequest) {
     const domain = extractDomainFromUrl(job.portalUrl);
     const dateStr = formatDateForFilename();
     const filename = `mac_result_${domain}_${dateStr}`;
+
+    if (format === "json") {
+      // Export every normalized result plus rawData (the complete response
+      // bodies from the portal calls made for that saved result). Project the
+      // job object explicitly so unrelated secrets such as the Home Assistant
+      // bearer token are never included in the export.
+      const fullExport = {
+        exportedAt: new Date().toISOString(),
+        job: {
+          id: job.id,
+          portalUrl: job.portalUrl,
+          macPrefix: job.macPrefix,
+          status: job.status,
+          timeoutMs: job.timeoutMs,
+          blockSize: job.blockSize,
+          selectedFields: job.selectedFields,
+          totalTested: job.totalTested,
+          totalFound: job.totalFound,
+          serverIp: job.serverIp,
+          serverGeoRaw: job.serverGeoRaw,
+          diagnostics: {
+            pingMinMs: job.pingMinMs,
+            pingAvgMs: job.pingAvgMs,
+            pingMaxMs: job.pingMaxMs,
+            pingStdevMs: job.pingStdevMs,
+            pingFailurePct: job.pingLossPct,
+            pingProbes: job.pingProbes,
+            pingSuccessful: job.pingSuccessful,
+            pingProbeMs: job.pingProbeMs,
+            pingP50Ms: job.pingP50Ms,
+            pingP95Ms: job.pingP95Ms,
+            pingWindowMs: job.pingWindowMs,
+            pingRtts: job.pingRtts,
+            diagnosticsAt: job.diagnosticsAt,
+            pingError: job.pingError,
+            httpError: job.httpError,
+            httpDnsMs: job.httpDnsMs,
+            httpTcpMs: job.httpTcpMs,
+            httpTlsMs: job.httpTlsMs,
+            httpTtfbMs: job.httpTtfbMs,
+            httpTotalMs: job.httpTotalMs,
+            httpStatusCode: job.httpStatusCode,
+          },
+          filters: {
+            genreFilterEnabled: job.genreFilterEnabled,
+            genreFilterKeywords: job.genreFilterKeywords,
+            genreFilterMatchLive: job.genreFilterMatchLive,
+            genreFilterMatchVod: job.genreFilterMatchVod,
+            genreFilterMatchSeries: job.genreFilterMatchSeries,
+            expireFilterEnabled: job.expireFilterEnabled,
+            expireFilterMinDate: job.expireFilterMinDate,
+            expireFilterIncludeUnlimited: job.expireFilterIncludeUnlimited,
+          },
+          createdAt: job.createdAt,
+          updatedAt: job.updatedAt,
+        },
+        results: results.map((result) => ({
+          ...result,
+          qualityReport: getQualityReport(result),
+        })),
+      };
+
+      return new NextResponse(JSON.stringify(fullExport, null, 2), {
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Disposition": `attachment; filename="${filename}.json"`,
+        },
+      });
+    }
 
     if (format === "csv") {
       const headers = selectedFields.map((f) => fieldMap[f] || f);

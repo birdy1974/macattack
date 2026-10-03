@@ -138,13 +138,20 @@ async function createSchema() {
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_stdev_ms REAL",
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_loss_pct REAL",
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_probes INTEGER",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_successful INTEGER",
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_probe_ms INTEGER",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_p50_ms REAL",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_p95_ms REAL",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_window_ms INTEGER",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_rtts JSONB",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS diagnostics_at TIMESTAMP",
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_dns_ms REAL",
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_tcp_ms REAL",
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_tls_ms REAL",
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_ttfb_ms REAL",
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_total_ms REAL",
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_status_code INTEGER",
+      "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS http_error TEXT",
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ping_error TEXT",
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS server_ip TEXT",
       "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS server_geo_raw JSONB",
@@ -159,6 +166,10 @@ async function createSchema() {
     ];
     var resultAlters = [
       "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS response_time_ms INTEGER",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS handshake_time_ms INTEGER",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS account_info_time_ms INTEGER",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS portal_online TEXT",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS last_active TEXT",
     ];
     for (var i = 0; i < jobAlters.length; i++) {
       try { await pool.query(jobAlters[i]); } catch (e) { /* ignore */ }
