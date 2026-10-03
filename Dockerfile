@@ -116,6 +116,10 @@ RUN addgroup --system --gid 1001 nodejs \
 #   /app/public
 COPY --from=build --chown=nextjs:nodejs /app/.next/standalone ./
 
+# Writable data directory for the optional thumbnail cache
+# (MACATTACK_DATA_DIR defaults to ./data/thumbnails inside /app).
+RUN mkdir -p /app/data && chown -R nextjs:nodejs /app/data
+
 USER nextjs
 EXPOSE 3000
 

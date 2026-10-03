@@ -86,6 +86,26 @@ export async function GET(request: NextRequest) {
       playbackStability: "Playback Stability",
       qualityConfidence: "Quality Test Scope/Confidence",
       qualityReport: "Detailed Quality Report (JSON)",
+      qualityVerdict: "Stream Quality Verdict (measured)",
+      qualityScore: "Stream Quality Score (0-10)",
+      qualitySpeedScore: "Stream Speed Score (0-10)",
+      qualityQualityScore: "Stream Picture/Quality Score (0-10)",
+      qualityStabilityScore: "Stream Stability Score (0-10)",
+      qualityResolution: "Stream Resolution (measured)",
+      qualityCodec: "Stream Video Codec (measured)",
+      qualityThroughputMbps: "Stream Throughput (Mbps, measured)",
+      qualityRequiredMbps: "Stream Required Bitrate (Mbps)",
+      qualityChannels: "Stream Channels Playable/Probed",
+      qualityMeasured: "Stream Quality Measured At",
+      qualityRetries: "Stream Retries (transient)",
+      qualityFrozen: "Stream Frozen Picture Detected",
+      qualityLabelMismatch: "Stream Label Mismatch",
+      qualityCatchUp: "Stream Catch-Up (archive) Check",
+      qualityThumbnail: "Stream Thumbnail URL",
+      qualityEwma: "Stream Score EWMA (history)",
+      qualityTrend: "Stream Score Trend (history)",
+      qualityGenres: "Stream Quality by Genre (measured)",
+      protocol: "Account Protocol",
       tariffPlan: "Tariff Plan",
       maxConnections: "Max Connections",
       activeConnections: "Active Connections",
@@ -133,7 +153,79 @@ export async function GET(request: NextRequest) {
         case "qualityConfidence":
           return getQualityReport(result).confidence.label;
         case "qualityReport":
-          return JSON.stringify(getQualityReport(result));
+          return result.qualityReport ? JSON.stringify(result.qualityReport) : JSON.stringify(getQualityReport(result));
+        case "qualityVerdict":
+          return result.qualityVerdict || "not_measured";
+        case "qualityScore":
+          return result.qualityScore !== null && result.qualityScore !== undefined
+            ? String(result.qualityScore)
+            : "";
+        case "qualitySpeedScore":
+          return result.qualitySpeedScore !== null && result.qualitySpeedScore !== undefined
+            ? String(result.qualitySpeedScore)
+            : "";
+        case "qualityQualityScore":
+          return result.qualityQualityScore !== null && result.qualityQualityScore !== undefined
+            ? String(result.qualityQualityScore)
+            : "";
+        case "qualityStabilityScore":
+          return result.qualityStabilityScore !== null && result.qualityStabilityScore !== undefined
+            ? String(result.qualityStabilityScore)
+            : "";
+        case "qualityResolution":
+          return result.qualityResolution || "";
+        case "qualityCodec":
+          return result.qualityCodec || "";
+        case "qualityThroughputMbps":
+          return result.qualityThroughputMbps !== null && result.qualityThroughputMbps !== undefined
+            ? String(result.qualityThroughputMbps)
+            : "";
+        case "qualityRequiredMbps":
+          return result.qualityRequiredMbps !== null && result.qualityRequiredMbps !== undefined
+            ? String(result.qualityRequiredMbps)
+            : "";
+        case "qualityChannels":
+          return result.qualityChannelsProbed !== null && result.qualityChannelsProbed !== undefined
+            ? `${result.qualityChannelsPlayable ?? 0}/${result.qualityChannelsProbed}`
+            : "";
+        case "qualityMeasured":
+          return result.qualityCheckedAt ? result.qualityCheckedAt.toISOString() : "";
+        case "qualityRetries":
+          return result.qualityRetries !== null && result.qualityRetries !== undefined
+            ? String(result.qualityRetries)
+            : "";
+        case "qualityFrozen":
+          return result.qualityFrozen === 1 ? "yes" : result.qualityFrozen === 0 ? "no" : "";
+        case "qualityLabelMismatch":
+          return result.qualityLabelMismatch || "";
+        case "qualityCatchUp": {
+          if (!result.qualityCatchUpStatus) return "";
+          const days = result.qualityCatchUpDays;
+          return days && days >= 1
+            ? `${result.qualityCatchUpStatus} (${days.toFixed(1)} day(s))`
+            : result.qualityCatchUpStatus;
+        }
+        case "qualityThumbnail":
+          return result.qualityThumbnail
+            ? `/api/scan/thumbnail?name=${encodeURIComponent(result.qualityThumbnail)}`
+            : "";
+        case "qualityEwma":
+          return result.qualityEwma !== null && result.qualityEwma !== undefined
+            ? String(result.qualityEwma)
+            : "";
+        case "qualityTrend":
+          return result.qualityTrend || "";
+        case "qualityGenres": {
+          const groups = (result.qualityGenreSummary as Array<{ genreTitle: string; averageOverall: number | null; channelsPlayable: number; channelsProbed: number }> | null) || [];
+          return groups
+            .map(
+              (group) =>
+                `${group.genreTitle}: ${group.averageOverall ?? "—"}/10 (${group.channelsPlayable}/${group.channelsProbed} playable)`
+            )
+            .join(" · ");
+        }
+        case "protocol":
+          return result.protocol || "stalker";
         case "tariffPlan":
           return result.tariffPlan || "";
         case "maxConnections":

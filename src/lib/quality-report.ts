@@ -16,8 +16,9 @@ export type PortalCheckStatus =
 export interface QualityReport {
   version: 1;
   assessment: {
-    status: "not_rated";
-    label: "Stream quality not rated";
+    /** "measured" only when the media path was actually probed for this MAC. */
+    status: "not_rated" | "measured";
+    label: string;
     explanation: string;
   };
   measuredAt: string | null;
@@ -66,10 +67,31 @@ export interface QualityReport {
     accountInfoMs: number | null;
     totalMs: number | null;
   };
+  /**
+   * Result of the measured media-path probe (src/lib/mac-quality.ts). Present
+   * only when the stream-quality check ran for this MAC.
+   */
+  streamCheck: {
+    status: "measured" | "not_measured";
+    verdict: string | null;
+    scores: {
+      overall: number | null;
+      speed: number | null;
+      quality: number | null;
+      stability: number | null;
+    } | null;
+    resolution: string | null;
+    codec: string | null;
+    throughputMbps: number | null;
+    requiredMbps: number | null;
+    channelsPlayable: number | null;
+    channelsProbed: number | null;
+    measuredAt: string | null;
+  } | null;
   playback: {
-    status: "not_tested";
-    label: "Not tested";
-    mediaRequests: 0;
+    status: "not_tested" | "media_path_measured";
+    label: string;
+    mediaRequests: number;
     startupTimeMs: null;
     stallCount: null;
     stalledDurationMs: null;
@@ -122,6 +144,19 @@ interface QualityResultSource {
   responseTimeMs?: number | null;
   handshakeTimeMs?: number | null;
   accountInfoTimeMs?: number | null;
+  // Measured stream quality (optional: only set when the check ran)
+  qualityVerdict?: string | null;
+  qualityScore?: number | null;
+  qualitySpeedScore?: number | null;
+  qualityQualityScore?: number | null;
+  qualityStabilityScore?: number | null;
+  qualityResolution?: string | null;
+  qualityCodec?: string | null;
+  qualityThroughputMbps?: number | null;
+  qualityRequiredMbps?: number | null;
+  qualityChannelsPlayable?: number | null;
+  qualityChannelsProbed?: number | null;
+  qualityCheckedAt?: Date | string | null;
 }
 
 function finiteNumber(value: number | null | undefined): number | null {
@@ -219,14 +254,46 @@ export function buildQualityReport(
     .filter(Boolean)
     .join(" + ");
 
+  // ── Measured media-path result (present only when the check ran) ──
+  const measuredVerdict = result.qualityVerdict && result.qualityVerdict !== "unknown"
+    ? result.qualityVerdict
+    : null;
+  const streamCheck = measuredVerdict
+    ? {
+        status: "measured" as const,
+        verdict: measuredVerdict,
+        scores: {
+          overall: finiteNumber(result.qualityScore),
+          speed: finiteNumber(result.qualitySpeedScore),
+          quality: finiteNumber(result.qualityQualityScore),
+          stability: finiteNumber(result.qualityStabilityScore),
+        },
+        resolution: result.qualityResolution ?? null,
+        codec: result.qualityCodec ?? null,
+        throughputMbps: finiteNumber(result.qualityThroughputMbps),
+        requiredMbps: finiteNumber(result.qualityRequiredMbps),
+        channelsPlayable: finiteNumber(result.qualityChannelsPlayable),
+        channelsProbed: finiteNumber(result.qualityChannelsProbed),
+        measuredAt: toIsoString(result.qualityCheckedAt),
+      }
+    : null;
+
   return {
     version: 1,
-    assessment: {
-      status: "not_rated",
-      label: "Stream quality not rated",
-      explanation:
-        "Only portal/control-API connectivity and account-request timing were measured. No media stream was played, so freeze/stall likelihood cannot be scored.",
-    },
+    assessment: streamCheck
+      ? {
+          status: "measured",
+          label: `Stream quality measured: ${streamCheck.verdict}`,
+          explanation:
+            "The real media path was probed for this MAC: throughput vs. required bitrate, resolution/codec and transport-stream stability. " +
+            "It remains a short spot check from the scanner host, not a picture-quality or freeze test.",
+        }
+      : {
+          status: "not_rated",
+          label: "Stream quality not rated",
+          explanation:
+            "Only portal/control-API connectivity and account-request timing were measured. No media stream was played, so freeze/stall likelihood cannot be scored.",
+        },
     measuredAt: toIsoString(job.diagnosticsAt),
     source: {
       vantagePoint: "scanner_host",
@@ -276,16 +343,18 @@ export function buildQualityReport(
       totalMs: resultTimeMs,
     },
     playback: {
-      status: "not_tested",
-      label: "Not tested",
-      mediaRequests: 0,
+      status: streamCheck ? ("media_path_measured" as const) : ("not_tested" as const),
+      label: streamCheck ? "Media path measured (no video decode)" : "Not tested",
+      mediaRequests: streamCheck && streamCheck.channelsProbed !== null ? streamCheck.channelsProbed : 0,
       startupTimeMs: null,
       stallCount: null,
       stalledDurationMs: null,
       rebufferRatioPct: null,
-      reason:
-        "The scanner does not request or play a channel/VOD stream. Playback start time, buffer health, freezes, and player errors are unknown.",
+      reason: streamCheck
+        ? "Segments were downloaded and transport-stream health was analysed, but no video was decoded and no player buffer was run — picture freezes and player-side buffering remain unknown."
+        : "The scanner does not request or play a channel/VOD stream. Playback start time, buffer health, freezes, and player errors are unknown.",
     },
+    streamCheck,
     operatorTelemetry: {
       status: "not_available",
       label: "Not available",
@@ -304,7 +373,15 @@ export function buildQualityReport(
         (windowMs !== null ? ` over approximately ${(windowMs / 1000).toFixed(1)} seconds` : "") +
         ". This is a short, single-time snapshot—not a prediction of future playback.",
     },
-    limitations: [
+    limitations: streamCheck
+      ? [
+          "The measured channels are a sample: other channels on the same account may behave differently.",
+          "One short sample window cannot reveal peak-hour congestion or future outages.",
+          "Measurements originate from the scanner server/container, not the viewer's device, Wi-Fi, or ISP route.",
+          "No video was decoded, so picture freezes/black frames are not detected; only delivery and transport-stream health.",
+          "Operator-side source health, server load, egress capacity, and active-client telemetry are not available to this portal scanner.",
+        ]
+      : [
       "The media server/CDN and channel path may differ from the Stalker portal host.",
       "Measurements originate from the scanner server/container, not the viewer's device, Wi-Fi, or ISP route.",
       "TCP connect failures are not the same as media-packet loss or RTP jitter; a successful connect does not prove sustained throughput.",

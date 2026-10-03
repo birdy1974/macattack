@@ -61,6 +61,19 @@ const JOB_ALTERS = [
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS expire_filter_enabled INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS expire_filter_min_date TEXT",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS expire_filter_include_unlimited INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS quality_check_enabled INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS quality_channels INTEGER NOT NULL DEFAULT 3",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS quality_sample_ms INTEGER NOT NULL DEFAULT 8000",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS portal_urls JSONB",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS scan_mode TEXT NOT NULL DEFAULT 'prefix'",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS mac_list JSONB",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS concurrency INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS ua_rotation_enabled INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS picture_checks_enabled INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS thumbnails_enabled INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS catch_up_check_enabled INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS xtream_username TEXT",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS xtream_password TEXT",
 ];
 const RESULT_ALTERS = [
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS response_time_ms INTEGER",
@@ -68,6 +81,95 @@ const RESULT_ALTERS = [
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS account_info_time_ms INTEGER",
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS portal_online TEXT",
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS last_active TEXT",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS stalker_server_path TEXT",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_verdict TEXT",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_score REAL",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_speed_score REAL",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_quality_score REAL",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_stability_score REAL",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_resolution TEXT",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_codec TEXT",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_throughput_mbps REAL",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_required_mbps REAL",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_channels_playable INTEGER",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_channels_probed INTEGER",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_checked_at TIMESTAMP",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_report JSONB",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_frozen INTEGER",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_label_mismatch TEXT",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_retries INTEGER",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_throughput_cv REAL",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_catch_up_status TEXT",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_catch_up_days REAL",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_thumbnail TEXT",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_ewma REAL",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_trend TEXT",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_genre_summary JSONB",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS protocol TEXT NOT NULL DEFAULT 'stalker'",
+];
+
+// Tables added after the initial release (probe history, playlist tokens,
+// monitoring, proxy pool). Created idempotently so upgrades need no tooling.
+const TABLE_DDL = [
+  `CREATE TABLE IF NOT EXISTS quality_probe_runs (
+     id SERIAL PRIMARY KEY,
+     result_id INTEGER NOT NULL REFERENCES scan_results(id) ON DELETE CASCADE,
+     job_id INTEGER,
+     mac_address TEXT NOT NULL,
+     measured_at TIMESTAMP NOT NULL DEFAULT NOW(),
+     overall_score REAL,
+     speed_score REAL,
+     quality_score REAL,
+     stability_score REAL,
+     verdict TEXT,
+     throughput_mbps REAL,
+     required_mbps REAL,
+     channels_playable INTEGER,
+     channels_probed INTEGER,
+     frozen INTEGER DEFAULT 0,
+     label_mismatches INTEGER DEFAULT 0,
+     via_proxy TEXT,
+     source TEXT NOT NULL DEFAULT 'scan',
+     created_at TIMESTAMP NOT NULL DEFAULT NOW()
+   )`,
+  `CREATE INDEX IF NOT EXISTS quality_probe_runs_result_idx ON quality_probe_runs (result_id, measured_at)`,
+  `CREATE TABLE IF NOT EXISTS playlist_tokens (
+     id SERIAL PRIMARY KEY,
+     result_id INTEGER NOT NULL REFERENCES scan_results(id) ON DELETE CASCADE,
+     token TEXT NOT NULL UNIQUE,
+     limit_count INTEGER NOT NULL DEFAULT 200,
+     revoked INTEGER NOT NULL DEFAULT 0,
+     fetch_count INTEGER NOT NULL DEFAULT 0,
+     last_fetched_at TIMESTAMP,
+     created_at TIMESTAMP NOT NULL DEFAULT NOW()
+   )`,
+  `CREATE TABLE IF NOT EXISTS monitors (
+     id SERIAL PRIMARY KEY,
+     result_id INTEGER NOT NULL REFERENCES scan_results(id) ON DELETE CASCADE,
+     enabled INTEGER NOT NULL DEFAULT 1,
+     interval_minutes INTEGER NOT NULL DEFAULT 360,
+     alert_on TEXT NOT NULL DEFAULT 'degrading,poor,unusable',
+     channels INTEGER NOT NULL DEFAULT 3,
+     sample_ms INTEGER NOT NULL DEFAULT 8000,
+     last_run_at TIMESTAMP,
+     last_verdict TEXT,
+     last_score REAL,
+     last_trend TEXT,
+     last_alert_at TIMESTAMP,
+     last_alert_reason TEXT,
+     created_at TIMESTAMP NOT NULL DEFAULT NOW()
+   )`,
+  `CREATE TABLE IF NOT EXISTS proxies (
+     id SERIAL PRIMARY KEY,
+     value TEXT NOT NULL,
+     display TEXT NOT NULL,
+     enabled INTEGER NOT NULL DEFAULT 1,
+     last_ok INTEGER,
+     last_latency_ms INTEGER,
+     last_error TEXT,
+     last_checked_at TIMESTAMP,
+     created_at TIMESTAMP NOT NULL DEFAULT NOW()
+   )`,
 ];
 
 // ============================================================================
@@ -92,12 +194,21 @@ async function runMigrations(): Promise<void> {
   globalForDb.__arenaMigrationRun = true;
 
   try {
-    // 0. Ensure new columns exist (safe to run every boot).
+    // 0. Ensure new columns and tables exist (safe to run every boot).
     for (const stmt of [...JOB_ALTERS, ...RESULT_ALTERS]) {
       try {
         await pool.query(stmt);
       } catch {
         // Table may not exist on first boot.
+      }
+    }
+    for (const stmt of TABLE_DDL) {
+      try {
+        await pool.query(stmt);
+      } catch (err) {
+        console.warn(
+          `[db] Could not create an auxiliary table: ${err instanceof Error ? err.message : String(err)}`
+        );
       }
     }
 

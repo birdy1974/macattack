@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { settings } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { parseScheduleSettings, validateScheduleSettings } from "@/lib/schedule";
+import { parseProxyList } from "@/lib/proxy";
 
 async function saveSetting(key: string, value: string) {
   const [existing] = await db
@@ -42,6 +43,15 @@ export async function GET() {
       scheduleEnabled: schedule.enabled,
       scheduleTimezone: settingsMap.schedule_timezone || "",
       scheduleDays: schedule.days,
+      // Optional add-ons (blank = built-in defaults)
+      uaList: settingsMap.ua_list || "",
+      proxyList: settingsMap.proxy_list || "",
+      // Per-portal remembered user agents (ua_winner:<host>), for the UI panel.
+      userAgentWinners: Object.fromEntries(
+        Object.entries(settingsMap)
+          .filter(([key]) => key.startsWith("ua_winner:"))
+          .map(([key, value]) => [key.replace("ua_winner:", ""), value])
+      ),
     });
   } catch (error) {
     return NextResponse.json(
@@ -62,11 +72,43 @@ export async function POST(request: NextRequest) {
       scheduleEnabled?: boolean;
       scheduleTimezone?: string;
       scheduleDays?: unknown;
+      uaList?: string;
+      proxyList?: string;
     };
 
     // Save only settings included in the request so the independent settings
     // panels can be updated without overwriting each other.
     if ("haUrl" in body) await saveSetting("ha_url", body.haUrl || "");
+    if ("uaList" in body) {
+      // One user agent per line; reject lines with control characters.
+      const cleaned = String(body.uaList || "")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0 && line.length <= 200 && !/[\x00-\x1f]/.test(line))
+        .slice(0, 20)
+        .join("\n");
+      await saveSetting("ua_list", cleaned);
+    }
+    if ("proxyList" in body) {
+      const parsedProxies = parseProxyList(String(body.proxyList || ""));
+      // Store the raw lines so credentials survive a re-save, but never expose
+      // them back to the browser unmasked (see GET).
+      await saveSetting(
+        "proxy_list",
+        String(body.proxyList || "")
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .slice(0, 50)
+          .join("\n")
+      );
+      if (String(body.proxyList || "").trim() && parsedProxies.length === 0) {
+        return NextResponse.json(
+          { error: "No valid proxies found (expected host:port or user:pass@host:port)" },
+          { status: 400 }
+        );
+      }
+    }
     if ("haToken" in body) await saveSetting("ha_token", body.haToken || "");
     if ("haEntityId" in body) await saveSetting("ha_entity_id", body.haEntityId || "");
 

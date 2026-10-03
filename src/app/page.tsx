@@ -72,6 +72,36 @@ interface ScanResult {
   handshakeTimeMs: number | null;
   accountInfoTimeMs: number | null;
   qualityReport: QualityReport | null;
+  // Measured stream quality (populated when a valid MAC passes the filters)
+  qualityVerdict?: string | null;
+  qualityScore?: number | null;
+  qualitySpeedScore?: number | null;
+  qualityQualityScore?: number | null;
+  qualityStabilityScore?: number | null;
+  qualityResolution?: string | null;
+  qualityCodec?: string | null;
+  qualityThroughputMbps?: number | null;
+  qualityRequiredMbps?: number | null;
+  qualityChannelsPlayable?: number | null;
+  qualityChannelsProbed?: number | null;
+  qualityCheckedAt?: string | null;
+  qualityFrozen?: number | null;
+  qualityLabelMismatch?: string | null;
+  qualityRetries?: number | null;
+  qualityThroughputCv?: number | null;
+  qualityCatchUpStatus?: string | null;
+  qualityCatchUpDays?: number | null;
+  qualityThumbnail?: string | null;
+  qualityEwma?: number | null;
+  qualityTrend?: string | null;
+  qualityGenreSummary?: Array<{
+    genreId: string | null;
+    genreTitle: string;
+    channelsProbed: number;
+    channelsPlayable: number;
+    averageOverall: number | null;
+  }> | null;
+  protocol?: string | null;
   timezone: string | null;
   portalOnline: string | null;
   lastActive: string | null;
@@ -89,6 +119,52 @@ interface LogEntry {
   level: string;
   message: string;
   createdAt: string;
+}
+
+interface StreamQualityChannelSummary {
+  name: string;
+  url: string | null;
+  linkError: string | null;
+  score: {
+    overall: number | null;
+    speed: number | null;
+    quality: number | null;
+    stability: number | null;
+    verdict: string;
+    label: string;
+    evidence: string[];
+    penalties: string[];
+  } | null;
+  probe: {
+    status: string;
+    container: string;
+    sustainedMbps: number | null;
+    requiredMbps: number | null;
+    resolution: { label: string } | null;
+    videoCodec: string | null;
+    ts: { continuityErrorsPer1000: number; bitrateMbps: number } | null;
+    hls: { segmentsOk: number; segmentsFailed: number; realtimeDeficitMs: number } | null;
+    warnings: string[];
+  } | null;
+}
+
+interface StreamQualityReportSummary {
+  measuredAt: string;
+  portal: { channelListSource: string; channelsListed: number; linksResolved: number; linksFailed: number };
+  channels: StreamQualityChannelSummary[];
+  aggregate: {
+    channelsProbed: number;
+    channelsPlayable: number;
+    speedScore: number | null;
+    qualityScore: number | null;
+    stabilityScore: number | null;
+    overallScore: number | null;
+    verdict: string;
+    label: string;
+    headroomSummary: string | null;
+  };
+  notes: string[];
+  limitations: string[];
 }
 
 interface HASettings {
@@ -113,6 +189,25 @@ const AVAILABLE_FIELDS = [
   { key: "handshakeTimeMs", label: "Portal Handshake (ms)", default: false },
   { key: "accountInfoTimeMs", label: "Account Info Request (ms)", default: false },
   { key: "qualityReport", label: "Detailed Quality Report (JSON)", default: false },
+  { key: "qualityVerdict", label: "Stream Quality Verdict (measured)", default: true },
+  { key: "qualityScore", label: "Stream Quality Score (0-10)", default: true },
+  { key: "qualitySpeedScore", label: "Stream Speed Score (0-10)", default: false },
+  { key: "qualityStabilityScore", label: "Stream Stability Score (0-10)", default: false },
+  { key: "qualityResolution", label: "Stream Resolution (measured)", default: true },
+  { key: "qualityCodec", label: "Stream Video Codec (measured)", default: false },
+  { key: "qualityThroughputMbps", label: "Stream Throughput (Mbps)", default: true },
+  { key: "qualityRequiredMbps", label: "Stream Required Bitrate (Mbps)", default: false },
+  { key: "qualityChannels", label: "Stream Channels Playable/Probed", default: false },
+  { key: "qualityMeasured", label: "Stream Quality Measured At", default: false },
+  { key: "qualityRetries", label: "Stream Retries (transient)", default: false },
+  { key: "qualityFrozen", label: "Stream Frozen Picture Detected", default: false },
+  { key: "qualityLabelMismatch", label: "Stream Label Mismatch", default: false },
+  { key: "qualityCatchUp", label: "Stream Catch-Up (archive) Check", default: false },
+  { key: "qualityThumbnail", label: "Stream Thumbnail URL", default: false },
+  { key: "qualityEwma", label: "Stream Score EWMA (history)", default: false },
+  { key: "qualityTrend", label: "Stream Score Trend (history)", default: false },
+  { key: "qualityGenres", label: "Stream Quality by Genre (measured)", default: false },
+  { key: "protocol", label: "Account Protocol", default: false },
   { key: "tariffPlan", label: "Tariff Plan", default: true },
   { key: "maxConnections", label: "Max Connections", default: true },
   { key: "activeConnections", label: "Active Connections", default: true },
@@ -155,6 +250,19 @@ export default function MacAttackPage() {
   const [genreMatchLive, setGenreMatchLive] = useState(true);
   const [genreMatchVod, setGenreMatchVod] = useState(true);
   const [genreMatchSeries, setGenreMatchSeries] = useState(true);
+  const [qualityCheckEnabled, setQualityCheckEnabled] = useState(true);
+  const [qualityChannels, setQualityChannels] = useState(3);
+  const [qualitySampleMs, setQualitySampleMs] = useState(8000);
+  // Wave add-ons (all optional; ffmpeg-dependent ones are labelled in the UI)
+  const [uaRotationEnabled, setUaRotationEnabled] = useState(true);
+  const [pictureChecksEnabled, setPictureChecksEnabled] = useState(true);
+  const [thumbnailsEnabled, setThumbnailsEnabled] = useState(true);
+  const [catchUpCheckEnabled, setCatchUpCheckEnabled] = useState(true);
+  // Scan scope: prefix enumeration, bulk MAC list, or multi-portal
+  const [scanMode, setScanMode] = useState<"prefix" | "list">("prefix");
+  const [macList, setMacList] = useState("");
+  const [extraPortals, setExtraPortals] = useState("");
+  const [concurrency, setConcurrency] = useState(1);
   const [expireFilterEnabled, setExpireFilterEnabled] = useState(false);
   const [expireMinDate, setExpireMinDate] = useState<string>("");
   const [expireIncludeUnlimited, setExpireIncludeUnlimited] = useState(true);
@@ -196,6 +304,67 @@ export default function MacAttackPage() {
   const [results, setResults] = useState<ScanResult[]>([]);
   const [expandedResultId, setExpandedResultId] = useState<number | null>(null);
   const [expandedQualityId, setExpandedQualityId] = useState<number | null>(null);
+  const [qualityDetailByResult, setQualityDetailByResult] = useState<Record<number, StreamQualityReportSummary>>({});
+  const [qualityDetailLoadingId, setQualityDetailLoadingId] = useState<number | null>(null);
+  const [qualityActionId, setQualityActionId] = useState<number | null>(null);
+  const [qualityActionError, setQualityActionError] = useState<string | null>(null);
+  type HistoryRun = {
+    id: number;
+    measuredAt: string;
+    overall: number | null;
+    speed: number | null;
+    quality: number | null;
+    stability: number | null;
+    verdict: string | null;
+    throughputMbps: number | null;
+    frozen: boolean;
+    labelMismatches: number;
+    viaProxy: string | null;
+    source: string;
+  };
+  type HistorySummary = {
+    ewma: number | null;
+    trend: string;
+    bestOverall: number | null;
+    worstOverall: number | null;
+    averageThroughputMbps: number | null;
+    lastMeasuredAt: string | null;
+  };
+  type MonitorInfo = {
+    id: number;
+    enabled: number;
+    intervalMinutes: number;
+    alertOn: string;
+    lastRunAt: string | null;
+    lastVerdict: string | null;
+    lastScore: number | null;
+    lastTrend: string | null;
+    lastAlertReason: string | null;
+    due?: boolean;
+  };
+  const [historyByResult, setHistoryByResult] = useState<
+    Record<number, { runs: HistoryRun[]; summary: HistorySummary }>
+  >({});
+  const [historyLoadingId, setHistoryLoadingId] = useState<number | null>(null);
+  const [monitorByResult, setMonitorByResult] = useState<Record<number, MonitorInfo | null>>({});
+  const [monitorBusyId, setMonitorBusyId] = useState<number | null>(null);
+  const [monitorRunResult, setMonitorRunResult] = useState<string | null>(null);
+  const [playlistTokenByResult, setPlaylistTokenByResult] = useState<Record<number, string>>({});
+  const [copiedToken, setCopiedToken] = useState<string | null>(null);
+  const [systemInfo, setSystemInfo] = useState<{
+    ffmpeg: { available: boolean; version: string | null; reason: string | null };
+    thumbnails: { dir: string; fileCount: number | null; maxAgeDays: number };
+  } | null>(null);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [uaList, setUaList] = useState("");
+  const [proxyList, setProxyList] = useState("");
+  const [advancedSaving, setAdvancedSaving] = useState(false);
+  const [advancedResult, setAdvancedResult] = useState<{ success?: string; error?: string } | null>(null);
+  const [proxyChecks, setProxyChecks] = useState<Array<{ ok: boolean; latencyMs: number | null; display?: string }>>([]);
+  const [proxyChecking, setProxyChecking] = useState(false);
+  const [xtreamUrl, setXtreamUrl] = useState("");
+  const [xtreamResult, setXtreamResult] = useState<string | null>(null);
+  const [xtreamBusy, setXtreamBusy] = useState(false);
   const [rawDataByResult, setRawDataByResult] = useState<Record<number, unknown>>({});
   const [rawDataLoadingId, setRawDataLoadingId] = useState<number | null>(null);
   const [rawDataError, setRawDataError] = useState<string | null>(null);
@@ -410,6 +579,10 @@ export default function MacAttackPage() {
       setError("Please enter a portal URL");
       return;
     }
+    if (scanMode === "list" && !macList.trim()) {
+      setError("Bulk MAC list mode needs at least one MAC address (or switch back to prefix scanning)");
+      return;
+    }
 
     setError(null);
     setIsLoading(true);
@@ -442,6 +615,22 @@ export default function MacAttackPage() {
           expireFilterEnabled,
           expireFilterMinDate: expireFilterEnabled ? expireMinDate || null : null,
           expireFilterIncludeUnlimited: expireIncludeUnlimited,
+          // Stream quality / speed / stability check for every found MAC
+          qualityCheckEnabled,
+          qualityChannels,
+          qualitySampleMs,
+          uaRotationEnabled,
+          pictureChecksEnabled,
+          thumbnailsEnabled,
+          catchUpCheckEnabled,
+          // Scope: prefix enumeration, bulk MAC list, multi-portal, concurrency
+          scanMode,
+          macList: scanMode === "list" ? macList : "",
+          portalUrls: extraPortals
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter(Boolean),
+          concurrency,
         }),
       });
 
@@ -706,6 +895,62 @@ export default function MacAttackPage() {
     if (field === "qualityReport") {
       return report ? JSON.stringify(report) : "—";
     }
+    if (field === "qualityVerdict") {
+      return result.qualityVerdict ? `${result.qualityVerdict.replace(/^./, (c) => c.toUpperCase())}${result.qualityScore != null ? ` (${result.qualityScore}/10)` : ""}` : "not measured";
+    }
+    if (field === "qualityChannels") {
+      return result.qualityChannelsProbed != null
+        ? `${result.qualityChannelsPlayable ?? 0}/${result.qualityChannelsProbed} playable`
+        : "—";
+    }
+    if (field === "qualityMeasured") {
+      return result.qualityCheckedAt ? new Date(result.qualityCheckedAt).toLocaleString() : "—";
+    }
+    if (field === "qualityThroughputMbps") {
+      return result.qualityThroughputMbps != null ? `${result.qualityThroughputMbps.toFixed(2)} Mbps` : "—";
+    }
+    if (field === "qualityRequiredMbps") {
+      return result.qualityRequiredMbps != null ? `${result.qualityRequiredMbps.toFixed(2)} Mbps` : "—";
+    }
+    if (field === "qualityRetries") {
+      return result.qualityRetries != null ? String(result.qualityRetries) : "—";
+    }
+    if (field === "qualityFrozen") {
+      return result.qualityFrozen === 1 ? "yes" : result.qualityFrozen === 0 ? "no" : "—";
+    }
+    if (field === "qualityLabelMismatch") {
+      return result.qualityLabelMismatch || "—";
+    }
+    if (field === "qualityCatchUp") {
+      if (!result.qualityCatchUpStatus) return "—";
+      return result.qualityCatchUpDays && result.qualityCatchUpDays >= 1
+        ? `${result.qualityCatchUpStatus} (${result.qualityCatchUpDays.toFixed(1)} day(s))`
+        : result.qualityCatchUpStatus;
+    }
+    if (field === "qualityThumbnail") {
+      return result.qualityThumbnail
+        ? `/api/scan/thumbnail?name=${encodeURIComponent(result.qualityThumbnail)}`
+        : "—";
+    }
+    if (field === "qualityEwma") {
+      return result.qualityEwma != null ? String(result.qualityEwma) : "—";
+    }
+    if (field === "qualityTrend") {
+      return result.qualityTrend || "—";
+    }
+    if (field === "qualityGenres") {
+      const groups = result.qualityGenreSummary || [];
+      if (groups.length === 0) return "—";
+      return groups
+        .map(
+          (group) =>
+            `${group.genreTitle}: ${group.averageOverall ?? "—"}/10 (${group.channelsPlayable}/${group.channelsProbed} playable)`
+        )
+        .join(" · ");
+    }
+    if (field === "protocol") {
+      return result.protocol || "stalker";
+    }
 
     const value = result[field as keyof ScanResult];
     if (value === null || value === undefined || value === "") return "—";
@@ -730,6 +975,386 @@ export default function MacAttackPage() {
     if (v < 300) return "text-cyan-400";
     if (v < 700) return "text-yellow-400";
     return "text-red-400";
+  };
+
+  /** Load the stored per-channel stream-quality report for one result. */
+  const loadQualityDetail = async (resultId: number) => {
+    setQualityDetailLoadingId(resultId);
+    setQualityActionError(null);
+    try {
+      const res = await fetch(`/api/scan/quality?resultId=${resultId}`);
+      const data = (await res.json()) as { report?: StreamQualityReportSummary | null; error?: string };
+      if (!res.ok) {
+        setQualityActionError(data.error || "Could not load the stream-quality report");
+        return;
+      }
+      if (data.report) {
+        setQualityDetailByResult((current) => ({ ...current, [resultId]: data.report as StreamQualityReportSummary }));
+      } else {
+        setQualityActionError("No stream-quality report was stored for this result");
+      }
+    } catch {
+      setQualityActionError("Could not load the stream-quality report");
+    } finally {
+      setQualityDetailLoadingId(null);
+    }
+  };
+
+  /** Re-measure the streams for a stored result (streams change over time). */
+  const recheckQuality = async (resultId: number) => {
+    setQualityActionId(resultId);
+    setQualityActionError(null);
+    try {
+      const res = await fetch("/api/scan/quality", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resultId }),
+      });
+      const data = (await res.json()) as {
+        error?: string;
+        qualityVerdict?: string;
+        qualityScore?: number | null;
+        qualitySpeedScore?: number | null;
+        qualityQualityScore?: number | null;
+        qualityStabilityScore?: number | null;
+        qualityResolution?: string | null;
+        qualityCodec?: string | null;
+        qualityThroughputMbps?: number | null;
+        qualityRequiredMbps?: number | null;
+        qualityChannelsPlayable?: number | null;
+        qualityChannelsProbed?: number | null;
+        qualityCheckedAt?: string | null;
+        qualityReport?: StreamQualityReportSummary | null;
+      };
+      if (!res.ok) {
+        setQualityActionError(data.error || "Stream quality check failed");
+        return;
+      }
+      setResults((current) =>
+        current.map((result) =>
+          result.id === resultId
+            ? {
+                ...result,
+                qualityVerdict: data.qualityVerdict ?? result.qualityVerdict,
+                qualityScore: data.qualityScore ?? result.qualityScore,
+                qualitySpeedScore: data.qualitySpeedScore ?? result.qualitySpeedScore,
+                qualityQualityScore: data.qualityQualityScore ?? result.qualityQualityScore,
+                qualityStabilityScore: data.qualityStabilityScore ?? result.qualityStabilityScore,
+                qualityResolution: data.qualityResolution ?? result.qualityResolution,
+                qualityCodec: data.qualityCodec ?? result.qualityCodec,
+                qualityThroughputMbps: data.qualityThroughputMbps ?? result.qualityThroughputMbps,
+                qualityRequiredMbps: data.qualityRequiredMbps ?? result.qualityRequiredMbps,
+                qualityChannelsPlayable: data.qualityChannelsPlayable ?? result.qualityChannelsPlayable,
+                qualityChannelsProbed: data.qualityChannelsProbed ?? result.qualityChannelsProbed,
+                qualityCheckedAt: data.qualityCheckedAt ?? result.qualityCheckedAt,
+              }
+            : result
+        )
+      );
+      if (data.qualityReport) {
+        setQualityDetailByResult((current) => ({ ...current, [resultId]: data.qualityReport as StreamQualityReportSummary }));
+      }
+    } catch {
+      setQualityActionError("Stream quality check failed");
+    } finally {
+      setQualityActionId(null);
+    }
+  };
+
+  // ========================================================================
+  // WAVE HELPERS: history, monitoring, stable playlist URLs, add-ons
+  // ========================================================================
+
+  /** Load probe history (EWMA/trend sparkline) for one result. */
+  const loadProbeHistory = async (resultId: number) => {
+    setHistoryLoadingId(resultId);
+    try {
+      const res = await fetch(`/api/scan/history?resultId=${resultId}&days=90`);
+      const data = (await res.json()) as {
+        runs?: HistoryRun[];
+        summary?: HistorySummary;
+        error?: string;
+      };
+      if (res.ok && data.runs && data.summary) {
+        setHistoryByResult((current) => ({ ...current, [resultId]: { runs: data.runs!, summary: data.summary! } }));
+      }
+    } catch {
+      // Silent: history is an enhancement, not a blocker.
+    } finally {
+      setHistoryLoadingId(null);
+    }
+  };
+
+  /** Load monitoring state for one result. */
+  const loadMonitor = async (resultId: number) => {
+    try {
+      const res = await fetch(`/api/scan/monitors?resultId=${resultId}`);
+      const data = (await res.json()) as { monitors?: MonitorInfo[] };
+      setMonitorByResult((current) => ({ ...current, [resultId]: data.monitors?.[0] ?? null }));
+    } catch {
+      // ignore
+    }
+  };
+
+  /** Enable/disable monitoring for one result. */
+  const toggleMonitor = async (resultId: number, enabled: boolean) => {
+    setMonitorBusyId(resultId);
+    setMonitorRunResult(null);
+    try {
+      const res = await fetch("/api/scan/monitors", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resultId, enabled }),
+      });
+      const data = (await res.json()) as { monitor?: MonitorInfo; error?: string };
+      if (res.ok && data.monitor) {
+        setMonitorByResult((current) => ({ ...current, [resultId]: data.monitor! }));
+      } else {
+        setMonitorRunResult(data.error || "Could not update monitoring");
+      }
+    } catch {
+      setMonitorRunResult("Could not update monitoring");
+    } finally {
+      setMonitorBusyId(null);
+    }
+  };
+
+  /** Run all due monitor checks now (same endpoint an external cron would hit). */
+  const runDueMonitors = async () => {
+    setMonitorRunResult("Running due checks…");
+    try {
+      const res = await fetch("/api/scan/monitors?limit=3", { method: "PUT" });
+      const data = (await res.json()) as {
+        ran?: number;
+        skipped?: number;
+        outcomes?: Array<{ macAddress: string; verdict: string | null; trend: string; alert: boolean; reason: string | null; error: string | null }>;
+        error?: string;
+      };
+      if (!res.ok) {
+        setMonitorRunResult(data.error || "Monitor run failed");
+        return;
+      }
+      if (!data.ran) {
+        setMonitorRunResult(`No monitors were due (${data.skipped ?? 0} waiting for their interval).`);
+        return;
+      }
+      const alerts = (data.outcomes || []).filter((outcome) => outcome.alert);
+      setMonitorRunResult(
+        `Ran ${data.ran} check(s).` +
+          (alerts.length > 0
+            ? ` ⚠ ${alerts.length} alert(s): ` +
+              alerts.map((alert) => `${alert.macAddress} — ${alert.reason}`).join("; ")
+            : " No new alerts.")
+      );
+      // Refresh the affected rows in the table.
+      await pollStatus();
+    } catch {
+      setMonitorRunResult("Monitor run failed");
+    }
+  };
+
+  /** Create a stable, revocable subscription URL for a result's M3U. */
+  const createPlaylistToken = async (resultId: number) => {
+    try {
+      const res = await fetch("/api/scan/playlist-token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resultId, limitCount: 200 }),
+      });
+      const data = (await res.json()) as { url?: string; error?: string };
+      if (res.ok && data.url) {
+        setPlaylistTokenByResult((current) => ({ ...current, [resultId]: data.url! }));
+        try {
+          await navigator.clipboard.writeText(data.url);
+          setCopiedToken(data.url);
+          setTimeout(() => setCopiedToken(null), 2500);
+        } catch {
+          // Clipboard may be unavailable (http origin) — the URL is shown anyway.
+        }
+      } else {
+        setQualityActionError(data.error || "Could not create the subscription URL");
+      }
+    } catch {
+      setQualityActionError("Could not create the subscription URL");
+    }
+  };
+
+  /** Save the add-on settings (UA list, proxy pool) and load capabilities. */
+  const loadAdvanced = useCallback(async () => {
+    try {
+      const [settingsRes, systemRes] = await Promise.all([fetch("/api/settings"), fetch("/api/system")]);
+      if (settingsRes.ok) {
+        const data = (await settingsRes.json()) as { uaList?: string; proxyList?: string };
+        setUaList(data.uaList || "");
+        setProxyList(data.proxyList || "");
+      }
+      if (systemRes.ok) {
+        const data = (await systemRes.json()) as {
+          ffmpeg: { available: boolean; version: string | null; reason: string | null };
+          thumbnails: { dir: string; fileCount: number | null; maxAgeDays: number };
+        };
+        setSystemInfo(data);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const saveAdvanced = async () => {
+    setAdvancedSaving(true);
+    setAdvancedResult(null);
+    try {
+      const res = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ uaList, proxyList }),
+      });
+      const data = (await res.json()) as { success?: boolean; error?: string };
+      setAdvancedResult(
+        res.ok && data.success
+          ? { success: "Saved. Proxy/UA settings apply to the next scan and quality check." }
+          : { error: data.error || "Could not save the advanced settings" }
+      );
+    } catch {
+      setAdvancedResult({ error: "Could not save the advanced settings" });
+    } finally {
+      setAdvancedSaving(false);
+    }
+  };
+
+  const validateProxyPool = async () => {
+    setProxyChecking(true);
+    setAdvancedResult(null);
+    try {
+      // Save the pool first so validation always checks what the scanner will use.
+      await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ proxyList }),
+      });
+      const res = await fetch("/api/scan/proxies", { method: "PUT" });
+      const data = (await res.json()) as {
+        checked?: number;
+        working?: number;
+        results?: Array<{ ok: boolean; latencyMs: number | null; display?: string }>;
+        error?: string;
+      };
+      if (!res.ok) {
+        setAdvancedResult({ error: data.error || "Proxy validation failed" });
+        return;
+      }
+      setProxyChecks(data.results || []);
+      setAdvancedResult({ success: `Checked ${data.checked ?? 0} proxy(ies): ${data.working ?? 0} working.` });
+    } catch {
+      setAdvancedResult({ error: "Proxy validation failed" });
+    } finally {
+      setProxyChecking(false);
+    }
+  };
+
+  /** Login-check + sample an Xtream Codes account. */
+  const checkXtream = async (measure: boolean) => {
+    if (!xtreamUrl.trim()) {
+      setXtreamResult("Paste an Xtream URL containing username and password");
+      return;
+    }
+    setXtreamBusy(true);
+    setXtreamResult(null);
+    try {
+      if (!measure) {
+        const res = await fetch(`/api/scan/xtream?url=${encodeURIComponent(xtreamUrl.trim())}`);
+        const data = (await res.json()) as {
+          auth?: boolean;
+          account?: { status: string | null; expiryDate: string | null; maxConnections: string | null; activeConnections: string | null } | null;
+          error?: string;
+        };
+        setXtreamResult(
+          res.ok && data.auth
+            ? `Login OK — status ${data.account?.status ?? "?"}, expires ${data.account?.expiryDate ?? "?"}, connections ${data.account?.activeConnections ?? "?"}/${data.account?.maxConnections ?? "?"}`
+            : `Login failed: ${data.error || "no account data"}`
+        );
+        return;
+      }
+      const res = await fetch("/api/scan/xtream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: xtreamUrl.trim(), channels: 3, sampleMs: 8000 }),
+      });
+      const data = (await res.json()) as {
+        account?: { liveStreams: number; categories: number; status: string | null };
+        report?: { aggregate: { overallScore: number | null; verdict: string; channelsPlayable: number; channelsProbed: number; label: string } };
+        error?: string;
+      };
+      if (!res.ok || !data.report) {
+        setXtreamResult(`Xtream check failed: ${data.error || "unknown error"}`);
+        return;
+      }
+      setXtreamResult(
+        `Xtream OK — ${data.account?.liveStreams ?? 0} live stream(s) in ${data.account?.categories ?? 0} categories. ` +
+          `Sampled ${data.report.aggregate.channelsPlayable}/${data.report.aggregate.channelsProbed} playable, score ${
+            data.report.aggregate.overallScore ?? "—"
+          }/10 (${data.report.aggregate.verdict}).`
+      );
+    } catch {
+      setXtreamResult("Xtream check failed");
+    } finally {
+      setXtreamBusy(false);
+    }
+  };
+
+  /** Tiny sparkline (SVG) for a run history. */
+  const renderSparkline = (runs: HistoryRun[]) => {
+    const points = runs
+      .slice()
+      .reverse()
+      .map((run) => run.overall)
+      .filter((value): value is number => typeof value === "number");
+    if (points.length < 2) return <span className="text-xs text-gray-600">not enough history yet</span>;
+    const width = 120;
+    const height = 28;
+    const step = width / Math.max(points.length - 1, 1);
+    const path = points
+      .map((value, index) => `${index === 0 ? "M" : "L"}${(index * step).toFixed(1)},${(height - (value / 10) * height).toFixed(1)}`)
+      .join(" ");
+    return (
+      <svg width={width} height={height} className="overflow-visible">
+        <path d={path} fill="none" stroke="currentColor" strokeWidth="1.5" className={scoreColor(points[points.length - 1])} />
+        {points.map((value, index) => (
+          <circle
+            key={index}
+            cx={(index * step).toFixed(1)}
+            cy={(height - (value / 10) * height).toFixed(1)}
+            r="1.6"
+            className={`fill-current ${scoreColor(value)}`}
+          />
+        ))}
+      </svg>
+    );
+  };
+
+  /** Colour a stream-quality verdict for the results table. */
+  const verdictColor = (verdict: string | null | undefined): string => {
+    switch ((verdict || "").toLowerCase()) {
+      case "excellent":
+        return "text-green-300";
+      case "good":
+        return "text-emerald-300";
+      case "fair":
+        return "text-yellow-300";
+      case "poor":
+        return "text-orange-300";
+      case "unusable":
+        return "text-red-300";
+      default:
+        return "text-gray-400";
+    }
+  };
+
+  const scoreColor = (score: number | null | undefined): string => {
+    if (score === null || score === undefined || !Number.isFinite(score)) return "text-gray-400";
+    if (score >= 7) return "text-green-300";
+    if (score >= 5) return "text-yellow-300";
+    return "text-red-300";
   };
 
   const getPortalCheckAssessment = (currentJob: ScanJob) => {
@@ -879,6 +1504,16 @@ export default function MacAttackPage() {
               ⏰ Schedule
             </button>
             <button
+              onClick={() => {
+                setShowAdvanced(true);
+                void loadAdvanced();
+              }}
+              className="px-3 py-1.5 text-sm bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg transition-colors"
+              title="Proxies, user agents, capability detection, Xtream and monitoring"
+            >
+              🧰 Advanced
+            </button>
+            <button
               onClick={() => setShowHASettings(true)}
               className="px-3 py-1.5 text-sm bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg transition-colors"
               title="Home Assistant Settings"
@@ -924,6 +1559,160 @@ export default function MacAttackPage() {
             <span className="text-xs text-yellow-500">
               It will resume when the next allowed window opens.
             </span>
+          </div>
+        </div>
+      )}
+
+      {/* Advanced panel: proxies, user agents, capabilities, Xtream, monitors */}
+      {showAdvanced && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl w-full max-w-3xl max-h-[90vh] overflow-y-auto p-6 space-y-5">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold text-gray-200">🧰 Advanced</h2>
+              <button onClick={() => setShowAdvanced(false)} className="text-gray-400 hover:text-gray-200">
+                ✕
+              </button>
+            </div>
+
+            {/* Capabilities */}
+            <div className="rounded-lg border border-gray-800 bg-gray-950/40 p-4">
+              <p className="text-sm font-semibold text-gray-300 mb-2">Host capabilities</p>
+              {systemInfo ? (
+                <div className="space-y-1 text-xs text-gray-400">
+                  <p>
+                    <span className="text-gray-500">ffmpeg:</span>{" "}
+                    {systemInfo.ffmpeg.available ? (
+                      <span className="text-green-300">available ({systemInfo.ffmpeg.version || "version unknown"})</span>
+                    ) : (
+                      <span className="text-yellow-300">not installed — picture checks/thumbnails stay off</span>
+                    )}
+                  </p>
+                  <p className="text-gray-500">
+                    Optional and never bundled: install ffmpeg in the container/host and set <code>FFMPEG_PATH</code>{" "}
+                    if it is not on PATH. Everything else works without it.
+                  </p>
+                  <p>
+                    <span className="text-gray-500">Thumbnails:</span>{" "}
+                    {systemInfo.thumbnails.fileCount ?? 0} file(s) in <code>{systemInfo.thumbnails.dir}</code> (kept{" "}
+                    {systemInfo.thumbnails.maxAgeDays} days)
+                  </p>
+                </div>
+              ) : (
+                <p className="text-xs text-gray-500">Detecting…</p>
+              )}
+            </div>
+
+            {/* User agents */}
+            <div className="rounded-lg border border-gray-800 bg-gray-950/40 p-4">
+              <p className="text-sm font-semibold text-gray-300 mb-1">User-agent candidates</p>
+              <p className="text-xs text-gray-500 mb-2">
+                Tried in order when the default MAG user agent is refused; the first working one is remembered per
+                portal host. One per line, max 20. Leave empty for the built-in list (MAG200/MAG254/MAG250/VLC/Chrome).
+              </p>
+              <textarea
+                value={uaList}
+                onChange={(e) => setUaList(e.target.value)}
+                rows={3}
+                placeholder={"Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3"}
+                className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs font-mono text-gray-200 placeholder-gray-600 focus:outline-none focus:border-cyan-500"
+              />
+            </div>
+
+            {/* Proxy pool */}
+            <div className="rounded-lg border border-gray-800 bg-gray-950/40 p-4 space-y-2">
+              <p className="text-sm font-semibold text-gray-300">Proxy pool (optional)</p>
+              <p className="text-xs text-gray-500">
+                One proxy per line: <code>host:port</code> or <code>user:pass@host:port</code> (max 50). The first
+                enabled proxy is used for stream probes/quality checks, which gives you a second vantage point when a
+                stream looks geo-blocked. Portal scans keep going direct so the MAC checks stay fast.
+              </p>
+              <textarea
+                value={proxyList}
+                onChange={(e) => setProxyList(e.target.value)}
+                rows={3}
+                placeholder={"127.0.0.1:8888\nuser:pass@proxy.example.com:8080"}
+                className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs font-mono text-gray-200 placeholder-gray-600 focus:outline-none focus:border-cyan-500"
+              />
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => void saveAdvanced()}
+                  disabled={advancedSaving}
+                  className="px-3 py-1.5 text-xs bg-cyan-700 hover:bg-cyan-600 disabled:opacity-50 rounded text-white"
+                >
+                  {advancedSaving ? "Saving…" : "Save settings"}
+                </button>
+                <button
+                  onClick={() => void validateProxyPool()}
+                  disabled={proxyChecking || !proxyList.trim()}
+                  className="px-3 py-1.5 text-xs bg-gray-800 hover:bg-gray-700 disabled:opacity-50 border border-gray-700 rounded text-gray-200"
+                >
+                  {proxyChecking ? "Validating…" : "Validate proxies"}
+                </button>
+              </div>
+              {proxyChecks.length > 0 && (
+                <ul className="text-xs space-y-0.5">
+                  {proxyChecks.map((check, index) => (
+                    <li key={index} className={check.ok ? "text-green-300" : "text-red-300"}>
+                      {check.ok ? "✓" : "✕"} {check.display || `proxy ${index + 1}`}{" "}
+                      {check.latencyMs != null ? `· ${check.latencyMs} ms` : ""}
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {advancedResult?.success && <p className="text-xs text-green-300">{advancedResult.success}</p>}
+              {advancedResult?.error && <p className="text-xs text-red-300">{advancedResult.error}</p>}
+            </div>
+
+            {/* Monitoring */}
+            <div className="rounded-lg border border-gray-800 bg-gray-950/40 p-4 space-y-2">
+              <p className="text-sm font-semibold text-gray-300">Monitoring &amp; alerts</p>
+              <p className="text-xs text-gray-500">
+                Enable “Monitor” on any found MAC to re-check it on an interval. Checks run when you press the button
+                below (or when a cron job hits <code>PUT /api/scan/monitors</code>) — nothing runs in the background,
+                and no data leaves your host.
+              </p>
+              <button
+                onClick={() => void runDueMonitors()}
+                className="px-3 py-1.5 text-xs bg-amber-700 hover:bg-amber-600 rounded text-white"
+              >
+                Run due checks now
+              </button>
+              {monitorRunResult && <p className="text-xs text-amber-200">{monitorRunResult}</p>}
+            </div>
+
+            {/* Xtream */}
+            <div className="rounded-lg border border-gray-800 bg-gray-950/40 p-4 space-y-2">
+              <p className="text-sm font-semibold text-gray-300">Xtream Codes account check</p>
+              <p className="text-xs text-gray-500">
+                Paste an Xtream URL that contains the credentials, e.g.{" "}
+                <code>http://host:8080/get.php?username=USER&amp;password=PASS&amp;type=m3u_plus</code>. Login is
+                checked first; the deep check samples live streams with the same measurement engine as Stalker results.
+              </p>
+              <input
+                type="text"
+                value={xtreamUrl}
+                onChange={(e) => setXtreamUrl(e.target.value)}
+                placeholder="http://host:8080/player_api.php?username=…&password=…"
+                className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs font-mono text-gray-200 placeholder-gray-600 focus:outline-none focus:border-cyan-500"
+              />
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => void checkXtream(false)}
+                  disabled={xtreamBusy}
+                  className="px-3 py-1.5 text-xs bg-gray-800 hover:bg-gray-700 disabled:opacity-50 border border-gray-700 rounded text-gray-200"
+                >
+                  {xtreamBusy ? "Working…" : "Check login"}
+                </button>
+                <button
+                  onClick={() => void checkXtream(true)}
+                  disabled={xtreamBusy}
+                  className="px-3 py-1.5 text-xs bg-cyan-700 hover:bg-cyan-600 disabled:opacity-50 rounded text-white"
+                >
+                  {xtreamBusy ? "Working…" : "Check + sample streams"}
+                </button>
+              </div>
+              {xtreamResult && <p className="text-xs text-cyan-200">{xtreamResult}</p>}
+            </div>
           </div>
         </div>
       )}
@@ -1278,21 +2067,106 @@ export default function MacAttackPage() {
                   </p>
                 </div>
 
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-1.5">
-                    MAC Prefix
-                  </label>
-                  <input
-                    type="text"
-                    value={macPrefix}
-                    onChange={(e) => setMacPrefix(e.target.value)}
-                    placeholder="00:1A:79"
-                    disabled={isRunning}
-                    className="w-full px-3 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500/50 disabled:opacity-50 transition-colors"
-                  />
-                  <p className="text-xs text-gray-500 mt-1">
-                    Default: 00:1A:79 (MAG device prefix)
-                  </p>
+                {/* Scan scope: enumerate a prefix, or check a pasted MAC list */}
+                <div className="rounded-lg border border-gray-800 bg-gray-900/60 p-3 space-y-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-medium text-gray-300">Scan scope</span>
+                    <div className="flex rounded-lg overflow-hidden border border-gray-700">
+                      <button
+                        type="button"
+                        onClick={() => setScanMode("prefix")}
+                        disabled={isRunning}
+                        className={`px-3 py-1.5 text-xs ${scanMode === "prefix" ? "bg-cyan-600 text-white" : "bg-gray-800 text-gray-300 hover:bg-gray-700"} disabled:opacity-50`}
+                      >
+                        Enumerate prefix
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setScanMode("list")}
+                        disabled={isRunning}
+                        className={`px-3 py-1.5 text-xs ${scanMode === "list" ? "bg-cyan-600 text-white" : "bg-gray-800 text-gray-300 hover:bg-gray-700"} disabled:opacity-50`}
+                      >
+                        Bulk MAC list
+                      </button>
+                    </div>
+                  </div>
+
+                  {scanMode === "prefix" ? (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300 mb-1.5">
+                        MAC Prefix
+                      </label>
+                      <input
+                        type="text"
+                        value={macPrefix}
+                        onChange={(e) => setMacPrefix(e.target.value)}
+                        placeholder="00:1A:79"
+                        disabled={isRunning}
+                        className="w-full px-3 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500/50 disabled:opacity-50 transition-colors"
+                      />
+                      <p className="text-xs text-gray-500 mt-1">
+                        Default: 00:1A:79 (MAG device prefix)
+                      </p>
+                    </div>
+                  ) : (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300 mb-1.5">
+                        MAC list (one per line, max 5,000)
+                      </label>
+                      <textarea
+                        value={macList}
+                        onChange={(e) => setMacList(e.target.value)}
+                        placeholder={"00:1A:79:12:34:56\n00:1A:79:AA:BB:CC  # shop box\n00:11:22:33:44:55,00:11:22:33:44:66"}
+                        rows={5}
+                        disabled={isRunning}
+                        className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs font-mono text-gray-200 placeholder-gray-500 focus:outline-none focus:border-cyan-500 disabled:opacity-50"
+                      />
+                      <p className="text-xs text-gray-500 mt-1">
+                        Accepts commas, spaces, dashes and <em>portal|mac</em> pairs. Duplicates are removed;
+                        unusable entries are reported after the job is queued.
+                      </p>
+                    </div>
+                  )}
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-1.5">
+                      Additional portals (optional, one per line)
+                    </label>
+                    <textarea
+                      value={extraPortals}
+                      onChange={(e) => setExtraPortals(e.target.value)}
+                      placeholder={"http://backup-portal.example.com/c/\nhttp://another.example.net:8080/c/"}
+                      rows={2}
+                      disabled={isRunning}
+                      className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-xs font-mono text-gray-200 placeholder-gray-500 focus:outline-none focus:border-cyan-500 disabled:opacity-50"
+                    />
+                    <p className="text-xs text-gray-500 mt-1">
+                      Multi-portal run: portals are rotated per block, so a dead server cannot stall the scan and a
+                      valid MAC is retried against the next portal (second-chance re-check).
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-1.5">
+                      Parallel MAC checks
+                    </label>
+                    <select
+                      value={concurrency}
+                      onChange={(e) => setConcurrency(Number(e.target.value))}
+                      disabled={isRunning}
+                      className="w-full px-3 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 focus:outline-none focus:border-cyan-500 disabled:opacity-50"
+                    >
+                      <option value={1}>1 — sequential (gentlest, default)</option>
+                      <option value={2}>2 workers</option>
+                      <option value={4}>4 workers</option>
+                      <option value={6}>6 workers</option>
+                      <option value={8}>8 workers (capped; rate-limited per portal)</option>
+                    </select>
+                    <p className="text-xs text-gray-500 mt-1">
+                      Parallelism is capped at 8 and rate-limited per portal host to avoid getting the scanner
+                      blocked. Higher values also apply to quality checks (max 4 channel probes at once).
+                    </p>
+                  </div>
                 </div>
 
                 <div>
@@ -1521,6 +2395,137 @@ export default function MacAttackPage() {
                   </div>
                 )}
               </div>
+            </div>
+
+            {/* Stream quality check */}
+            <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
+              <label className="flex items-start gap-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={qualityCheckEnabled}
+                  onChange={(e) => setQualityCheckEnabled(e.target.checked)}
+                  disabled={isRunning}
+                  className="mt-1 w-4 h-4 rounded border-gray-600 text-cyan-500 focus:ring-cyan-500 bg-gray-700"
+                />
+                <span>
+                  <span className="text-sm font-semibold text-gray-200">
+                    🎚️ Stream quality check for every found MAC
+                  </span>
+                  <span className="block text-xs text-gray-500 mt-1">
+                    When a MAC passes the filters, MacAttack lists the portal&apos;s channels, resolves real
+                    stream URLs with <em>create_link</em> and measures throughput vs. required bitrate,
+                    resolution/codec and transport-stream stability. Adds roughly 10–30 seconds per found MAC.
+                  </span>
+                </span>
+              </label>
+
+              {qualityCheckEnabled && (
+                <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <label className="block">
+                    <span className="text-xs text-gray-400">Channels to probe (1–8)</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={8}
+                      value={qualityChannels}
+                      onChange={(e) => setQualityChannels(Math.max(1, Math.min(8, Number(e.target.value) || 1)))}
+                      disabled={isRunning}
+                      className="mt-1 w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 focus:outline-none focus:border-cyan-500 disabled:opacity-50"
+                    />
+                    <span className="block text-xs text-gray-500 mt-1">
+                      Spread across genres so one broken category cannot dominate the verdict.
+                    </span>
+                  </label>
+                  <label className="block">
+                    <span className="text-xs text-gray-400">Sample per channel (3–30 seconds)</span>
+                    <input
+                      type="number"
+                      min={3}
+                      max={30}
+                      value={Math.round(qualitySampleMs / 1000)}
+                      onChange={(e) => setQualitySampleMs(Math.max(3, Math.min(30, Number(e.target.value) || 8)) * 1000)}
+                      disabled={isRunning}
+                      className="mt-1 w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 focus:outline-none focus:border-cyan-500 disabled:opacity-50"
+                    />
+                    <span className="block text-xs text-gray-500 mt-1">
+                      Longer windows catch stalls and bitrate dips; shorter windows keep scans fast.
+                    </span>
+                  </label>
+                </div>
+              )}
+
+              {qualityCheckEnabled && (
+                <div className="mt-4 rounded-lg border border-gray-800 bg-gray-900/60 p-3">
+                  <p className="text-xs uppercase tracking-wide text-gray-500 mb-2">
+                    Optional add-ons
+                  </p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <label className="flex items-start gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={uaRotationEnabled}
+                        onChange={(e) => setUaRotationEnabled(e.target.checked)}
+                        disabled={isRunning}
+                        className="mt-0.5 w-4 h-4 rounded border-gray-600 text-cyan-500 focus:ring-cyan-500 bg-gray-700"
+                      />
+                      <span className="text-xs text-gray-300">
+                        User-agent rotation
+                        <span className="block text-gray-500">
+                          Try MAG/VLC/browser user agents when a portal refuses the default one, then remember the
+                          winner for that host.
+                        </span>
+                      </span>
+                    </label>
+                    <label className="flex items-start gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={catchUpCheckEnabled}
+                        onChange={(e) => setCatchUpCheckEnabled(e.target.checked)}
+                        disabled={isRunning}
+                        className="mt-0.5 w-4 h-4 rounded border-gray-600 text-cyan-500 focus:ring-cyan-500 bg-gray-700"
+                      />
+                      <span className="text-xs text-gray-300">
+                        Catch-up (archive) verification
+                        <span className="block text-gray-500">
+                          When the portal advertises an archive, request a past programme and verify it actually
+                          resolves and plays.
+                        </span>
+                      </span>
+                    </label>
+                    <label className="flex items-start gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={pictureChecksEnabled}
+                        onChange={(e) => setPictureChecksEnabled(e.target.checked)}
+                        disabled={isRunning}
+                        className="mt-0.5 w-4 h-4 rounded border-gray-600 text-cyan-500 focus:ring-cyan-500 bg-gray-700"
+                      />
+                      <span className="text-xs text-gray-300">
+                        Picture checks (freeze / black / fps)
+                        <span className="block text-gray-500">
+                          Needs ffmpeg on the host (optional, never bundled). Without it the streams are still
+                          measured for speed/stability.
+                        </span>
+                      </span>
+                    </label>
+                    <label className="flex items-start gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={thumbnailsEnabled}
+                        onChange={(e) => setThumbnailsEnabled(e.target.checked)}
+                        disabled={isRunning}
+                        className="mt-0.5 w-4 h-4 rounded border-gray-600 text-cyan-500 focus:ring-cyan-500 bg-gray-700"
+                      />
+                      <span className="text-xs text-gray-300">
+                        Stream thumbnails
+                        <span className="block text-gray-500">
+                          Capture one JPEG per probed channel (needs ffmpeg) so you can see what you found.
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Output Fields Selection */}
@@ -1944,7 +2949,23 @@ export default function MacAttackPage() {
                                     ? "Portal check issue"
                                     : "Portal check unavailable"}
                               </p>
-                              <p className="text-xs text-amber-300 mt-0.5">Playback not tested</p>
+                              {result.qualityVerdict && result.qualityVerdict !== "unknown" ? (
+                                <>
+                                  <p className={`text-xs mt-0.5 font-medium ${verdictColor(result.qualityVerdict)}`}>
+                                    Streams: {result.qualityVerdict}
+                                    {result.qualityScore != null ? ` · ${result.qualityScore}/10` : ""}
+                                  </p>
+                                  <p className="text-xs text-gray-400 mt-0.5">
+                                    {result.qualityResolution ?? "resolution n/a"}
+                                    {result.qualityThroughputMbps != null ? ` · ${result.qualityThroughputMbps.toFixed(2)} Mbps` : ""}
+                                    {result.qualityChannelsProbed != null
+                                      ? ` · ${result.qualityChannelsPlayable ?? 0}/${result.qualityChannelsProbed} playable`
+                                      : ""}
+                                  </p>
+                                </>
+                              ) : (
+                                <p className="text-xs text-amber-300 mt-0.5">Streams not measured</p>
+                              )}
                               <button
                                 type="button"
                                 onClick={() => setExpandedQualityId((current) => current === result.id ? null : result.id)}
@@ -2084,6 +3105,387 @@ export default function MacAttackPage() {
                                         <p className="text-sm text-amber-200 mt-1">{result.qualityReport.confidence.label}</p>
                                         <p className="text-xs text-gray-400 mt-1">{result.qualityReport.confidence.explanation}</p>
                                       </div>
+                                    </div>
+
+                                    {/* ── Measured stream quality (real media path) ── */}
+                                    <div className="rounded-lg border border-cyan-900/60 bg-cyan-950/10 p-3 space-y-2">
+                                      <div className="flex flex-wrap items-center justify-between gap-2">
+                                        <div>
+                                          <p className="text-xs font-semibold text-cyan-200">
+                                            Measured stream quality (real media path)
+                                          </p>
+                                          <p className="text-xs text-gray-400 mt-0.5">
+                                            Probe of the channels this MAC can open: throughput vs. required bitrate,
+                                            resolution/codec, and transport-stream stability.
+                                          </p>
+                                        </div>
+                                        <div className="flex flex-wrap gap-2">
+                                          <button
+                                            type="button"
+                                            onClick={() => void recheckQuality(result.id)}
+                                            disabled={qualityActionId === result.id}
+                                            className="px-2 py-1 text-xs text-cyan-200 hover:text-cyan-100 border border-cyan-800 rounded disabled:opacity-50"
+                                          >
+                                            {qualityActionId === result.id ? "Measuring…" : "Re-check streams"}
+                                          </button>
+                                          <a
+                                            href={`/api/scan/playlist?resultId=${result.id}&limit=200`}
+                                            className="px-2 py-1 text-xs text-green-200 hover:text-green-100 border border-green-900 rounded"
+                                          >
+                                            Download M3U
+                                          </a>
+                                          <button
+                                            type="button"
+                                            onClick={() => void loadQualityDetail(result.id)}
+                                            disabled={qualityDetailLoadingId === result.id}
+                                            className="px-2 py-1 text-xs text-gray-300 hover:text-gray-100 border border-gray-700 rounded disabled:opacity-50"
+                                          >
+                                            {qualityDetailLoadingId === result.id ? "Loading…" : "Per-channel detail"}
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => void loadProbeHistory(result.id)}
+                                            disabled={historyLoadingId === result.id}
+                                            className="px-2 py-1 text-xs text-purple-200 hover:text-purple-100 border border-purple-900 rounded disabled:opacity-50"
+                                          >
+                                            {historyLoadingId === result.id ? "Loading…" : "Trend history"}
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => void createPlaylistToken(result.id)}
+                                            className="px-2 py-1 text-xs text-green-200 hover:text-green-100 border border-green-900 rounded"
+                                            title="Creates a stable, revocable M3U subscription URL you can paste into a player"
+                                          >
+                                            Subscription URL
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              const current = monitorByResult[result.id];
+                                              if (current === undefined) {
+                                                void loadMonitor(result.id).then(() =>
+                                                  void toggleMonitor(result.id, true)
+                                                );
+                                              } else {
+                                                void toggleMonitor(result.id, !current || current.enabled !== 1);
+                                              }
+                                            }}
+                                            disabled={monitorBusyId === result.id}
+                                            className={`px-2 py-1 text-xs border rounded disabled:opacity-50 ${
+                                              monitorByResult[result.id]?.enabled === 1
+                                                ? "text-amber-200 border-amber-800"
+                                                : "text-gray-300 border-gray-700 hover:text-gray-100"
+                                            }`}
+                                          >
+                                            {monitorBusyId === result.id
+                                              ? "Saving…"
+                                              : monitorByResult[result.id]?.enabled === 1
+                                                ? "Monitoring on"
+                                                : "Monitor"}
+                                          </button>
+                                        </div>
+                                      </div>
+
+                                      {qualityActionError && <p className="text-xs text-red-300">{qualityActionError}</p>}
+
+                                      {result.qualityVerdict ? (
+                                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                                          <div className="bg-gray-900 rounded-lg p-2">
+                                            <p className="text-xs uppercase tracking-wide text-gray-500">Verdict</p>
+                                            <p className={`text-sm font-medium ${verdictColor(result.qualityVerdict)}`}>
+                                              {result.qualityVerdict}
+                                            </p>
+                                            <p className="text-xs text-gray-500 mt-0.5">
+                                              overall {result.qualityScore ?? "—"}/10 · {result.qualityResolution ?? "resolution n/a"}
+                                            </p>
+                                          </div>
+                                          <div className="bg-gray-900 rounded-lg p-2">
+                                            <p className="text-xs uppercase tracking-wide text-gray-500">Speed</p>
+                                            <p className={`text-sm font-mono ${scoreColor(result.qualitySpeedScore)}`}>
+                                              {result.qualitySpeedScore ?? "—"}/10
+                                            </p>
+                                            <p className="text-xs text-gray-500 mt-0.5">
+                                              {result.qualityThroughputMbps != null ? `${result.qualityThroughputMbps.toFixed(2)} Mbps delivered` : "no throughput figure"}
+                                              {result.qualityRequiredMbps != null ? ` of ${result.qualityRequiredMbps.toFixed(2)} required` : ""}
+                                            </p>
+                                          </div>
+                                          <div className="bg-gray-900 rounded-lg p-2">
+                                            <p className="text-xs uppercase tracking-wide text-gray-500">Picture quality</p>
+                                            <p className={`text-sm font-mono ${scoreColor(result.qualityQualityScore)}`}>
+                                              {result.qualityQualityScore ?? "—"}/10
+                                            </p>
+                                            <p className="text-xs text-gray-500 mt-0.5">{result.qualityCodec ?? "codec unknown"}</p>
+                                          </div>
+                                          <div className="bg-gray-900 rounded-lg p-2">
+                                            <p className="text-xs uppercase tracking-wide text-gray-500">Stability</p>
+                                            <p className={`text-sm font-mono ${scoreColor(result.qualityStabilityScore)}`}>
+                                              {result.qualityStabilityScore ?? "—"}/10
+                                            </p>
+                                            <p className="text-xs text-gray-500 mt-0.5">
+                                              {result.qualityChannelsProbed != null
+                                                ? `${result.qualityChannelsPlayable ?? 0}/${result.qualityChannelsProbed} channels playable`
+                                                : "channels not probed"}
+                                              {result.qualityCheckedAt ? ` · ${new Date(result.qualityCheckedAt).toLocaleString()}` : ""}
+                                            </p>
+                                          </div>
+                                        </div>
+                                      ) : (
+                                        <p className="text-xs text-gray-500">
+                                          No stream measurement recorded for this MAC yet — use “Re-check streams” to measure it now.
+                                        </p>
+                                      )}
+
+                                      {/* Evidence badges: frozen picture, mislabels, retries, catch-up, history */}
+                                      {result.qualityVerdict && (
+                                        <div className="flex flex-wrap items-center gap-2 text-xs">
+                                          {result.qualityFrozen === 1 && (
+                                            <span className="px-2 py-0.5 rounded border border-red-900 bg-red-950/40 text-red-200">
+                                              ❄ frozen picture detected
+                                            </span>
+                                          )}
+                                          {result.qualityLabelMismatch && (
+                                            <span className="px-2 py-0.5 rounded border border-yellow-900 bg-yellow-950/30 text-yellow-200">
+                                              ⚠ {result.qualityLabelMismatch}
+                                            </span>
+                                          )}
+                                          {!!result.qualityRetries && result.qualityRetries > 0 && (
+                                            <span className="px-2 py-0.5 rounded border border-gray-700 text-gray-300">
+                                              ↻ {result.qualityRetries} transient retr{result.qualityRetries === 1 ? "y" : "ies"}
+                                            </span>
+                                          )}
+                                          {result.qualityThroughputCv != null && (
+                                            <span className="px-2 py-0.5 rounded border border-gray-700 text-gray-300">
+                                              throughput CV {result.qualityThroughputCv.toFixed(2)}
+                                            </span>
+                                          )}
+                                          {result.qualityCatchUpStatus && result.qualityCatchUpStatus !== "not_checked" && (
+                                            <span
+                                              className={`px-2 py-0.5 rounded border ${
+                                                result.qualityCatchUpStatus === "verified"
+                                                  ? "border-green-900 text-green-200"
+                                                  : result.qualityCatchUpStatus === "advertised_but_failed"
+                                                    ? "border-orange-900 text-orange-200"
+                                                    : "border-gray-700 text-gray-400"
+                                              }`}
+                                            >
+                                              ⏪ catch-up {result.qualityCatchUpStatus.replace(/_/g, " ")}
+                                              {result.qualityCatchUpDays ? ` (~${result.qualityCatchUpDays.toFixed(1)} d)` : ""}
+                                            </span>
+                                          )}
+                                          {result.qualityEwma != null && (
+                                            <span className="px-2 py-0.5 rounded border border-purple-900 text-purple-200">
+                                              EWMA {result.qualityEwma.toFixed(1)}/10
+                                              {result.qualityTrend && result.qualityTrend !== "insufficient_data"
+                                                ? ` · ${result.qualityTrend}`
+                                                : ""}
+                                            </span>
+                                          )}
+                                          {result.qualityTrend === "degrading" && (
+                                            <span className="px-2 py-0.5 rounded border border-orange-900 text-orange-200">
+                                              ↘ degrading vs its own history
+                                            </span>
+                                          )}
+                                        </div>
+                                      )}
+
+                                      {/* Genre aggregation (Wave 3) */}
+                                      {result.qualityGenreSummary && result.qualityGenreSummary.length > 0 && (
+                                        <div className="rounded border border-gray-800 bg-gray-950/40 p-2">
+                                          <p className="text-xs text-gray-400 mb-1">Quality by genre (measured)</p>
+                                          <div className="flex flex-wrap gap-2">
+                                            {result.qualityGenreSummary.map((group) => (
+                                              <span
+                                                key={group.genreId ?? group.genreTitle}
+                                                className="px-2 py-0.5 rounded border border-gray-700 text-xs text-gray-300"
+                                              >
+                                                {group.genreTitle}:{" "}
+                                                <span className={scoreColor(group.averageOverall)}>
+                                                  {group.averageOverall ?? "—"}/10
+                                                </span>{" "}
+                                                <span className="text-gray-500">
+                                                  ({group.channelsPlayable}/{group.channelsProbed} playable)
+                                                </span>
+                                              </span>
+                                            ))}
+                                          </div>
+                                          <p className="text-xs text-gray-600 mt-1">
+                                            One sample per genre — use it to spot a broken category, not as a full
+                                            genre audit.
+                                          </p>
+                                        </div>
+                                      )}
+
+                                      {/* Thumbnail from the newest measurement */}
+                                      {result.qualityThumbnail && (
+                                        <div className="flex items-center gap-3">
+                                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                                          <img
+                                            src={`/api/scan/thumbnail?name=${encodeURIComponent(result.qualityThumbnail)}`}
+                                            alt="Captured stream frame"
+                                            className="h-20 rounded border border-gray-700"
+                                          />
+                                          <p className="text-xs text-gray-500">
+                                            Frame captured through ffmpeg at the moment of measurement. Stored on this
+                                            host (never uploaded) and pruned after two weeks.
+                                          </p>
+                                        </div>
+                                      )}
+
+                                      {/* Stable subscription URL */}
+                                      {playlistTokenByResult[result.id] && (
+                                        <div className="rounded border border-green-900/60 bg-green-950/10 p-2">
+                                          <p className="text-xs text-green-200">
+                                            Stable subscription URL {copiedToken === playlistTokenByResult[result.id] ? "(copied)" : ""}
+                                          </p>
+                                          <code className="block text-xs text-gray-300 break-all mt-1">
+                                            {playlistTokenByResult[result.id]}
+                                          </code>
+                                          <div className="flex gap-2 mt-2">
+                                            <button
+                                              type="button"
+                                              onClick={() => {
+                                                void navigator.clipboard.writeText(playlistTokenByResult[result.id]);
+                                                setCopiedToken(playlistTokenByResult[result.id]);
+                                              }}
+                                              className="px-2 py-0.5 text-xs border border-green-900 text-green-200 rounded"
+                                            >
+                                              Copy
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={async () => {
+                                                const url = playlistTokenByResult[result.id];
+                                                const token = url.split("token=")[1] || "";
+                                                await fetch(`/api/scan/playlist-token?token=${encodeURIComponent(token)}`, {
+                                                  method: "DELETE",
+                                                });
+                                                setPlaylistTokenByResult((current) => {
+                                                  const next = { ...current };
+                                                  delete next[result.id];
+                                                  return next;
+                                                });
+                                              }}
+                                              className="px-2 py-0.5 text-xs border border-red-900 text-red-300 rounded"
+                                            >
+                                              Revoke
+                                            </button>
+                                          </div>
+                                        </div>
+                                      )}
+
+                                      {/* Monitoring state for this result */}
+                                      {monitorByResult[result.id]?.enabled === 1 &&
+                                        (() => {
+                                          const activeMonitor = monitorByResult[result.id] as MonitorInfo;
+                                          return (
+                                            <p className="text-xs text-amber-200/80">
+                                              Monitored every {activeMonitor.intervalMinutes} min ·
+                                              {activeMonitor.lastRunAt
+                                                ? ` last check ${new Date(activeMonitor.lastRunAt).toLocaleString()}`
+                                                : " not checked yet"}
+                                              {activeMonitor.lastAlertReason ? ` · ⚠ ${activeMonitor.lastAlertReason}` : ""}
+                                            </p>
+                                          );
+                                        })()}
+
+                                      {/* Trend history */}
+                                      {historyByResult[result.id] && (
+                                        <div className="rounded border border-purple-900/60 bg-purple-950/10 p-2 space-y-1">
+                                          <div className="flex flex-wrap items-center justify-between gap-2">
+                                            <p className="text-xs text-purple-200">
+                                              Probe history: {historyByResult[result.id].runs.length} run(s) · EWMA{" "}
+                                              {historyByResult[result.id].summary.ewma ?? "—"}/10 · trend{" "}
+                                              {historyByResult[result.id].summary.trend.replace(/_/g, " ")} · worst{" "}
+                                              {historyByResult[result.id].summary.worstOverall ?? "—"} / best{" "}
+                                              {historyByResult[result.id].summary.bestOverall ?? "—"}
+                                            </p>
+                                            {renderSparkline(historyByResult[result.id].runs)}
+                                          </div>
+                                          <div className="max-h-40 overflow-y-auto">
+                                            <table className="w-full text-xs">
+                                              <thead>
+                                                <tr className="text-gray-500">
+                                                  <th className="text-left py-1 pr-3">When</th>
+                                                  <th className="text-left py-1 pr-3">Overall</th>
+                                                  <th className="text-left py-1 pr-3">Verdict</th>
+                                                  <th className="text-left py-1 pr-3">Notes</th>
+                                                </tr>
+                                              </thead>
+                                              <tbody>
+                                                {historyByResult[result.id].runs.slice(0, 20).map((run) => (
+                                                  <tr key={run.id} className="border-t border-gray-800">
+                                                    <td className="py-1 pr-3 text-gray-400">
+                                                      {new Date(run.measuredAt).toLocaleString()}
+                                                    </td>
+                                                    <td className={`py-1 pr-3 font-mono ${scoreColor(run.overall)}`}>
+                                                      {run.overall ?? "—"}
+                                                    </td>
+                                                    <td className={`py-1 pr-3 ${verdictColor(run.verdict)}`}>{run.verdict ?? "—"}</td>
+                                                    <td className="py-1 pr-3 text-gray-500">
+                                                      {[run.source, run.frozen ? "frozen" : null, run.labelMismatches ? `${run.labelMismatches} mislabeled` : null, run.viaProxy ? `via ${run.viaProxy}` : null]
+                                                        .filter(Boolean)
+                                                        .join(" · ") || "—"}
+                                                    </td>
+                                                  </tr>
+                                                ))}
+                                              </tbody>
+                                            </table>
+                                          </div>
+                                        </div>
+                                      )}
+
+                                      {qualityDetailByResult[result.id] && (
+                                        <div className="space-y-2">
+                                          <p className="text-xs text-gray-400">
+                                            {qualityDetailByResult[result.id].aggregate.label}
+                                            {qualityDetailByResult[result.id].aggregate.headroomSummary
+                                              ? ` · ${qualityDetailByResult[result.id].aggregate.headroomSummary}`
+                                              : ""}
+                                          </p>
+                                          <div className="overflow-x-auto">
+                                            <table className="w-full text-xs">
+                                              <thead>
+                                                <tr className="text-gray-500">
+                                                  <th className="text-left py-1 pr-3">Channel</th>
+                                                  <th className="text-left py-1 pr-3">Verdict</th>
+                                                  <th className="text-left py-1 pr-3">Overall</th>
+                                                  <th className="text-left py-1 pr-3">Speed</th>
+                                                  <th className="text-left py-1 pr-3">Quality</th>
+                                                  <th className="text-left py-1 pr-3">Stability</th>
+                                                  <th className="text-left py-1">Evidence</th>
+                                                </tr>
+                                              </thead>
+                                              <tbody className="divide-y divide-gray-800/60">
+                                                {qualityDetailByResult[result.id].channels.map((channel, index) => (
+                                                  <tr key={`${channel.name}-${index}`}>
+                                                    <td className="py-1 pr-3 text-gray-300 max-w-48 truncate" title={channel.name}>
+                                                      {channel.name}
+                                                    </td>
+                                                    <td className={`py-1 pr-3 ${verdictColor(channel.score?.verdict)}`}>
+                                                      {channel.score?.verdict ?? channel.linkError ?? "not measured"}
+                                                    </td>
+                                                    <td className="py-1 pr-3 font-mono">{channel.score?.overall ?? "—"}</td>
+                                                    <td className="py-1 pr-3 font-mono">{channel.score?.speed ?? "—"}</td>
+                                                    <td className="py-1 pr-3 font-mono">{channel.score?.quality ?? "—"}</td>
+                                                    <td className="py-1 pr-3 font-mono">{channel.score?.stability ?? "—"}</td>
+                                                    <td className="py-1 text-gray-500 max-w-96 whitespace-pre-wrap break-words">
+                                                      {channel.score?.evidence?.slice(0, 2).join(" · ") ?? "—"}
+                                                      {channel.score?.penalties && channel.score.penalties.length > 0
+                                                        ? `\n! ${channel.score.penalties.join(" · ")}`
+                                                        : ""}
+                                                    </td>
+                                                  </tr>
+                                                ))}
+                                              </tbody>
+                                            </table>
+                                          </div>
+                                          <ul className="list-disc pl-5 space-y-0.5 text-xs text-gray-500">
+                                            {qualityDetailByResult[result.id].limitations.map((limitation) => (
+                                              <li key={limitation}>{limitation}</li>
+                                            ))}
+                                          </ul>
+                                        </div>
+                                      )}
                                     </div>
 
                                     <div className="rounded-lg border border-gray-800 bg-gray-900 p-3">
