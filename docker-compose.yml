@@ -61,6 +61,7 @@ services:
   app:
     image: ghcr.io/birdy1974/macattack:latest
     container_name: mac-attack
+    user: "${PUID:-1026}:${PGID:-100}"
     restart: unless-stopped
     ports:
       - "3099:3000"
