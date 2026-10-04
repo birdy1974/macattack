@@ -1636,15 +1636,14 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             }
           }
 
-          // Decide which category lists we actually need.  We ALWAYS need
-          // ITV genres and VOD categories when genre filter is OFF because
-          // they're written into the saved result (playlistGenres / vodCats).
-          // When filter is ON we additionally need series categories if
-          // matchSeries is true; we skip a list when it's not needed for
-          // either filter or output.
-          const needLive = !genreFilter.enabled || genreFilter.matchLive;
-          const needVod = !genreFilter.enabled || genreFilter.matchVod;
-          const needSeries = genreFilter.enabled && genreFilter.matchSeries;
+          // Decide which category lists we need. All three lists are always
+          // fetched: their titles (playlistGenres / vodCategories) and their
+          // counts (itvGenreCount / vodCategoryCount / seriesCategoryCount)
+          // are written into every saved result, and the genre filter needs
+          // whichever lists it matches against.
+          const needLive = true;
+          const needVod = true;
+          const needSeries = true;
 
           let itvGenres: Array<{ id: string; title: string }> | null = null;
           let vodCategories: Array<{ id: string; title: string }> | null = null;
@@ -1755,6 +1754,12 @@ export async function startScan(jobId: number, skipVerification: boolean = false
           const timezone = extractedFields.timezone ?? "";
           const playlistGenres = itvGenres ? itvGenres.map((g) => g.title).join(", ") : "";
           const vodCats = vodCategories ? vodCategories.map((g) => g.title).join(", ") : "";
+          // Totals reported per MAC in the exported result files. A list that
+          // the portal answered with zero entries counts as 0; a list that
+          // could not be retrieved at all stays null (shown as "—").
+          const itvGenreCount = itvGenres ? itvGenres.length : null;
+          const vodCategoryCount = vodCategories ? vodCategories.length : null;
+          const seriesCategoryCount = seriesCategories ? seriesCategories.length : null;
           const tariff =
             (combined.tariff_plan as { name?: string })?.name ||
             String(combined.tariff_plan || "");
@@ -1808,6 +1813,9 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             password,
             playlistGenres,
             vodCategories: vodCats,
+            itvGenreCount,
+            vodCategoryCount,
+            seriesCategoryCount,
             rawData: {
               // Keep the decoded profile/account payloads for existing readers.
               profile: profileInfo,

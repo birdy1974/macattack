@@ -107,6 +107,10 @@ const RESULT_ALTERS = [
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_trend TEXT",
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_genre_summary JSONB",
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS protocol TEXT NOT NULL DEFAULT 'stalker'",
+  // Per-MAC category totals written into every saved result / export.
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS itv_genre_count INTEGER",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS vod_category_count INTEGER",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS series_category_count INTEGER",
 ];
 
 // Tables added after the initial release (probe history, playlist tokens,
