@@ -42,12 +42,14 @@ Standing constraints were respected throughout:
 | Monitoring, alerts and QoE-style tracking | `monitors` table, `/api/scan/monitors` (create/update/run due), UI "Monitor"/"Run due checks now" | API paths; run loop shares the quality pipeline proven by `test:quality` |
 | Catch-up (archive) verification | `stalkerResolveArchiveLink()` + `checkMacStreamQuality({ checkCatchUp })`, labelled `verified` / `advertised_but_failed` / `not_advertised` / `not_checked` | `test:quality` section 6 against the fixture's archive-capable channel, including the "switch it off" case |
 | Thumbnails gallery in the results table | Per-result thumbnail + `/api/scan/thumbnail` (path-traversal-safe) | `test:waves` (store safety: traversal rejected, round-trip) |
+| Thumbnail outcome reporting: every capture logs its file name + directory, or the ffmpeg/storage reason; an unusable data directory is reported with the fallback path instead of an empty folder | `src/lib/thumbnail-report.ts` (shared by `mac-quality.ts` and `xtream-quality.ts`), `thumbnailStoreInfo()` in `src/lib/thumbnail-store.ts`, Host capabilities panel | `test:waves` "Thumbnail reporting" section (saved/failed/disabled/no-attempt/fallback), verified end-to-end with a real ffmpeg against the fixtures |
 
 ## Wave 3 — differentiation & coverage
 
 | Item | Where | Verified by |
 |---|---|---|
-| Xtream Codes support (login, catalogue, live stream sampling through the shared probe) | `src/lib/xtream-streams.ts`, `src/lib/xtream-quality.ts`, `/api/scan/xtream` | `npm run test:xtream` — 24 checks against the mock Xtream API in the fixture server |
+| Xtream Codes support (login, catalogue, live stream sampling through the shared probe) | `src/lib/xtream-streams.ts`, `src/lib/xtream-quality.ts`, `/api/scan/xtream` | `npm run test:xtream` — 27 checks against the mock Xtream API in the fixture server |
+| Abort-listener hygiene on the shared per-scan signal (no `MaxListenersExceededWarning`, no listener retained by a settled request) | `src/lib/abort.ts` (`onAbort` / `abortSubscriberCount`), used by `stalker-streams.ts`, `stream-probe.ts`, `xtream-streams.ts`, `ffmpeg-tools.ts` | `test:waves` (fan-out + disposer assertions), `test:probe` section 12, `test:quality` and `test:xtream` final sections assert 0 leftover subscribers after 15/36/24 operations |
 | RTSP / RTMP liveness (TCP + protocol handshake) and honest UDP labelling | `probeSocketLiveness()` / `detectStreamProtocol()` in `src/lib/stream-probe.ts` | `test:waves` (dead host, UDP `unverifiable`, unknown scheme) |
 | Genre aggregation (quality per genre) | `buildGenreGroups()` in `mac-quality.ts`, `quality_genre_summary` column, UI + CSV export | `test:quality` section 6 (groups and averages) |
 
@@ -57,10 +59,10 @@ Standing constraints were respected throughout:
 
 ```bash
 npm run fixtures                  # mock Stalker portal + Xtream API + CONNECT proxy (:4599)
-npm run test:probe                # 48 checks  (probe engine, retries, proxy egress)
-npm run test:quality              # 29 checks  (Stalker → quality pipeline, catch-up, genres)
-npm run test:xtream               # 24 checks  (Xtream API → measurement engine)
-npm run test:waves                # 105 checks (pure logic + mocked VAAPI fallback, no real ffmpeg/GPU)
+npm run test:probe                # 53 checks  (probe engine, retries, proxy egress, abort hygiene)
+npm run test:quality              # 32 checks  (Stalker → quality pipeline, catch-up, genres, abort hygiene)
+npm run test:xtream               # 27 checks  (Xtream API → measurement engine, abort hygiene)
+npm run test:waves                # 139 checks (pure logic + mocked VAAPI fallback + abort hygiene, no real ffmpeg/GPU)
 ```
 
 `test:waves` needs no server (only loopback sockets); the other three expect the

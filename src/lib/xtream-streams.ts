@@ -18,6 +18,7 @@
 
 import http from "node:http";
 import https from "node:https";
+import { onAbort } from "@/lib/abort";
 
 export interface XtreamCredentials {
   /** Scheme + host + port, no trailing slash (e.g. http://host:8080). */
@@ -141,10 +142,13 @@ async function xtreamRequest(
     const finish = (value: { ok: boolean; statusCode: number | null; payload: unknown; error: string | null }) => {
       if (settled) return;
       settled = true;
+      // Detach from the shared signal so requests cannot pile up listeners.
+      detachAbort?.();
       resolve(value);
     };
 
     let request: http.ClientRequest;
+    let detachAbort: (() => void) | null = null;
     try {
       request = transport.get(
         url,
@@ -198,7 +202,7 @@ async function xtreamRequest(
         error: /Timeout/i.test(error.message) ? `Timeout after ${timeoutMs}ms` : error.message,
       })
     );
-    options.signal?.addEventListener("abort", () => request.destroy(new Error("Aborted")), { once: true });
+    detachAbort = onAbort(options.signal, () => request.destroy(new Error("Aborted")));
   });
 }
 

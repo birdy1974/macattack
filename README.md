@@ -291,6 +291,14 @@ reported number is the number of entries the portal answered with (`0` when the 
 but returned nothing, empty when the list could not be retrieved). They appear in the results
 table, in CSV/TXT exports and in the JSON export, and can be toggled like any other field.
 
+**Column order is remembered.** Drag a field by its ⠿ handle (or focus the handle and press
+`Alt` + `↑`/`↓`) and the new order is saved automatically to the `settings` table
+(`output_field_order`). It is restored on the next page load and reused for future scans, so the
+results table, the download buttons and the server-side CSV/TXT/JSON exports all keep the order
+you chose. A stored order is cleaned when it is applied: duplicate keys are dropped, fields that
+no longer exist are ignored and fields added by a later release are appended. Saving an empty
+order returns the list to the default order.
+
 ### 4. Start Scan
 Click **🚀 Start Scan** and watch the console log.
 
@@ -504,12 +512,34 @@ docker exec mac-attack printenv FFMPEG_PATH   # should print nothing in Docker
 docker compose logs app | grep -i ffmpeg
 ```
 
-### Thumbnails stay at 0 files
-The panel reports `not writable` when the app user (uid 1001) cannot write to
-the mounted directory. A Docker-managed volume (the default
-`mac-attack-data:/app/data` in `docker-compose.yml`) starts writable; a host
-bind mount must be writable by uid 1001, e.g.
+### Thumbnails are missing / the data directory stays empty
+Every quality check now logs what happened to each capture, so start there:
+
+- `📸 Thumbnails saved: N → /app/data/thumbnails` — the files are there (inside
+  the container/volume, not necessarily in a host folder).
+- `⚠ <dir> is not writable by the app user (uid 1001) — thumbnails are written
+  to /tmp/macattack-thumbnails instead …` — the configured data directory cannot
+  be written, so MacAttack kept working by using the fallback directory. Those
+  files are served by the app but disappear when the container is recreated.
+  Fix the mount or its ownership, then press **↻ Re-check** in the Host
+  capabilities panel.
+- `⚠ No thumbnail for <channel>: <reason>` — ffmpeg could not grab a frame.
+  Common reasons on real portals: `no frame decoded within 20s (…)` when the
+  stream is offline/DRM-protected or the portal refuses another simultaneous
+  connection, or an ffmpeg stderr line such as `Server returned 403 Forbidden`.
+  Lower **Channels to probe** / check the portal's connection limit if a MAC
+  allows only one at a time.
+
+Where the files live: `<MACATTACK_DATA_DIR>/thumbnails` inside the container
+(`/app/data/thumbnails` with the bundled compose file). With the default
+Docker-managed volume `mac-attack-data:/app/data` that directory is **not** a
+host folder — list it with
+`docker exec mac-attack ls -la /app/data/thumbnails`. A host bind mount must be
+writable by uid 1001, e.g.
 `chown -R 1001:1001 /volume1/docker/mac-attack/data` on the NAS.
+
+The Host capabilities panel reports the directory, the file count, whether it is
+writable, and whether writes are falling back to `/tmp`.
 
 ---
 
@@ -554,10 +584,10 @@ bind mount must be writable by uid 1001, e.g.
 │   └── wave-implementation.md  # what shipped, how it is tested, limits
 ├── scripts/               # offline fixtures, integration and unit suites
 │   ├── probe-fixtures.mjs     # mock Stalker portal + Xtream API + CONNECT proxy
-│   ├── probe-tests.ts         # probe engine (48 checks)
-│   ├── mac-quality-tests.ts   # Stalker quality pipeline (29 checks)
-│   ├── xtream-tests.ts        # Xtream API path (24 checks)
-│   └── wave-tests.ts          # pure logic + mocked VAAPI picture/thumbnail fallback (116 checks)
+│   ├── probe-tests.ts         # probe engine (53 checks)
+│   ├── mac-quality-tests.ts   # Stalker quality pipeline (32 checks)
+│   ├── xtream-tests.ts        # Xtream API path (27 checks)
+│   └── wave-tests.ts          # pure logic + mocked VAAPI picture/thumbnail fallback + abort hygiene (139 checks)
 └── initial/               # Reference copy of the original local-build version
 ```
 

@@ -10,6 +10,8 @@
  * aggregate) without touching the internet.
  */
 
+import { getEventListeners } from "node:events";
+import { abortSubscriberCount } from "../src/lib/abort";
 import { checkXtreamAccountQuality, selectXtreamStreams } from "../src/lib/xtream-quality";
 import {
   parseXtreamUrl,
@@ -111,6 +113,32 @@ async function main() {
   // ── 5. Failure path: bad credentials do not crash the checker ────────────
   const failing = await checkXtreamAccountQuality({ credentials: badPassword, channelsToProbe: 1, sampleMs: 3000 });
   check("bad credentials return an error, not a report", failing.report === null && !!failing.error);
+
+  // ── 6. Abort listeners on the shared scan signal ─────────────────────────
+  // Xtream jobs share one signal across login/categories/streams, so settled
+  // requests must detach their abort listener again.
+  {
+    const controller = new AbortController();
+    const shared = { timeoutMs: 5000, signal: controller.signal };
+    for (let i = 0; i < 12; i += 1) {
+      await xtreamAccount(demo, shared);
+      await xtreamCategories(demo, "live", shared);
+    }
+    const lingering = abortSubscriberCount(controller.signal);
+    check("24 Xtream requests leave no subscriber behind", lingering === 0, String(lingering));
+    check(
+      "24 Xtream requests keep a single native listener",
+      getEventListeners(controller.signal, "abort").length === 1,
+      String(getEventListeners(controller.signal, "abort").length)
+    );
+
+    let notified = 0;
+    controller.signal.addEventListener("abort", () => {
+      notified += 1;
+    });
+    controller.abort();
+    check("the Xtream signal still aborts after all requests", notified === 1, String(notified));
+  }
 
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);

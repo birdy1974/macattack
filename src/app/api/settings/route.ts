@@ -4,6 +4,12 @@ import { settings } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { parseScheduleSettings, validateScheduleSettings } from "@/lib/schedule";
 import { parseProxyList } from "@/lib/proxy";
+import {
+  OUTPUT_FIELD_ORDER_SETTING_KEY,
+  parseOutputFieldOrderSetting,
+  sanitizeOutputFieldOrder,
+  serializeOutputFieldOrder,
+} from "@/lib/field-order";
 
 async function saveSetting(key: string, value: string) {
   const [existing] = await db
@@ -43,6 +49,10 @@ export async function GET() {
       scheduleEnabled: schedule.enabled,
       scheduleTimezone: settingsMap.schedule_timezone || "",
       scheduleDays: schedule.days,
+      // Remembered Output Fields order (empty = never customised).
+      outputFieldOrder: parseOutputFieldOrderSetting(
+        settingsMap[OUTPUT_FIELD_ORDER_SETTING_KEY]
+      ),
       // Optional add-ons (blank = built-in defaults)
       uaList: settingsMap.ua_list || "",
       proxyList: settingsMap.proxy_list || "",
@@ -74,6 +84,8 @@ export async function POST(request: NextRequest) {
       scheduleDays?: unknown;
       uaList?: string;
       proxyList?: string;
+      /** Full Output Fields order (all keys, selected or not). */
+      outputFieldOrder?: unknown;
     };
 
     // Save only settings included in the request so the independent settings
@@ -111,6 +123,15 @@ export async function POST(request: NextRequest) {
     }
     if ("haToken" in body) await saveSetting("ha_token", body.haToken || "");
     if ("haEntityId" in body) await saveSetting("ha_entity_id", body.haEntityId || "");
+
+    // Output Fields order: stored so it survives reloads and seeds the column
+    // order (results table and CSV/TXT export) of the next scan.
+    if ("outputFieldOrder" in body) {
+      await saveSetting(
+        OUTPUT_FIELD_ORDER_SETTING_KEY,
+        serializeOutputFieldOrder(sanitizeOutputFieldOrder(body.outputFieldOrder))
+      );
+    }
 
     if (
       "scheduleEnabled" in body ||

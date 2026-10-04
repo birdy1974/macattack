@@ -13,9 +13,17 @@
  */
 
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { getEventListeners } from "node:events";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { moveItem } from "../src/lib/field-order";
+import { abortSubscriberCount, onAbort } from "../src/lib/abort";
+import {
+  mergeOutputFieldOrder,
+  moveItem,
+  parseOutputFieldOrderSetting,
+  sanitizeOutputFieldOrder,
+  serializeOutputFieldOrder,
+} from "../src/lib/field-order";
 import { parseMacList, normalizeMac } from "../src/lib/mac-list";
 import { parseProxy, parseProxyList, redactProxy } from "../src/lib/proxy";
 import { detectLabelMismatch, parseLabelClaim } from "../src/lib/label-mismatch";
@@ -35,6 +43,7 @@ import {
   resetFfmpegDetection,
 } from "../src/lib/ffmpeg-tools";
 import { deleteThumbnail, readThumbnail, saveThumbnail, thumbnailStoreInfo } from "../src/lib/thumbnail-store";
+import { summariseThumbnails, thumbnailLogLines, type ThumbnailOutcome } from "../src/lib/thumbnail-report";
 import { parseXtreamUrl, xtreamStreamUrl } from "../src/lib/xtream-streams";
 import { detectStreamProtocol, probeStream, scoreStreamProbe, type StreamProbeResult } from "../src/lib/stream-probe";
 import {
@@ -80,6 +89,104 @@ section("Output field ordering");
     "does not change field order when the drag source or target is missing",
     moveItem(initialOrder, "unknown", "expireDate").join(",") === initialOrder.join(",")
   );
+
+  // The order is stored in the settings table, so it must round-trip and merge
+  // cleanly with the field list of the running release.
+  const allKeys = ["macAddress", "portalUrl", "expireDate", "quality", "serverLocation"];
+  check(
+    "keeps the stored order and appends fields the save predates",
+    mergeOutputFieldOrder(allKeys, ["quality", "macAddress"]).join(",") ===
+      "quality,macAddress,portalUrl,expireDate,serverLocation"
+  );
+  check(
+    "drops unknown keys from a stored order",
+    mergeOutputFieldOrder(allKeys, ["gone", "macAddress", "gone"]).join(",") ===
+      "macAddress,portalUrl,expireDate,quality,serverLocation"
+  );
+  check(
+    "stored order round-trips through the settings value",
+    parseOutputFieldOrderSetting(
+      serializeOutputFieldOrder(["quality", "macAddress", "expireDate"])
+    ).join(",") === "quality,macAddress,expireDate"
+  );
+  check(
+    "reads a hand-edited whitespace/comma separated order",
+    parseOutputFieldOrderSetting(" quality , macAddress\nexpireDate ").join(",") ===
+      "quality,macAddress,expireDate"
+  );
+  check(
+    "rejects malformed stored orders instead of throwing",
+    parseOutputFieldOrderSetting("[not json").length === 0 &&
+      parseOutputFieldOrderSetting("").length === 0 &&
+      parseOutputFieldOrderSetting(null).length === 0
+  );
+  check(
+    "sanitises duplicated, blank and oversized keys",
+    sanitizeOutputFieldOrder([" quality ", "quality", "", 42, "x".repeat(65), "macAddress"]).join(",") ===
+      "quality,macAddress"
+  );
+  check("an empty save clears the stored order", parseOutputFieldOrderSetting(serializeOutputFieldOrder([])).length === 0);
+}
+
+// ============================================================================
+// Abort listeners (one per request must be detached when the request settles)
+// ============================================================================
+section("AbortSignal listener hygiene");
+{
+  const native = (signal: AbortSignal) => getEventListeners(signal, "abort").length;
+
+  const controller = new AbortController();
+  check("no signal is a no-op that never throws", onAbort(undefined, () => {})() === undefined);
+
+  const detach = onAbort(controller.signal, () => {});
+  check("registering a listener is observable", abortSubscriberCount(controller.signal) === 1);
+  check("one native abort listener backs all subscribers", native(controller.signal) === 1, String(native(controller.signal)));
+  detach();
+  check("the disposer removes the listener", abortSubscriberCount(controller.signal) === 0);
+
+  let fired = 0;
+  onAbort(controller.signal, () => {
+    fired += 1;
+  });
+  controller.abort();
+  check("an abort still reaches the listener", fired === 1, String(fired));
+  check("an aborted signal keeps no native listener", native(controller.signal) === 0, String(native(controller.signal)));
+
+  const preAborted = new AbortController();
+  preAborted.abort();
+  let immediate = 0;
+  const noop = onAbort(preAborted.signal, () => {
+    immediate += 1;
+  });
+  check("an already-aborted signal fires immediately", immediate === 1, String(immediate));
+  check("the immediate path returns a safe no-op disposer", noop() === undefined);
+
+  // Regression for the MaxListenersExceededWarning: 40 concurrent operations
+  // (parallel MAC checks × channel probes) on the scan signal still add only
+  // one native listener, and a settled operation leaves no subscriber behind.
+  const shared = new AbortController();
+  let notified = 0;
+  const disposers: Array<() => void> = [];
+  for (let i = 0; i < 40; i += 1) {
+    disposers.push(
+      onAbort(shared.signal, () => {
+        notified += 1;
+      })
+    );
+  }
+  check("40 concurrent operations keep one native listener", native(shared.signal) === 1, String(native(shared.signal)));
+  shared.abort();
+  check("every concurrent operation is notified", notified === 40, String(notified));
+  check("the native listener is gone after abort", native(shared.signal) === 0, String(native(shared.signal)));
+
+  const settled = new AbortController();
+  for (let i = 0; i < 50; i += 1) {
+    const dispose = onAbort(settled.signal, () => {}) as () => void;
+    disposers.push(dispose);
+    dispose();
+  }
+  check("50 settled requests leave no subscriber behind", abortSubscriberCount(settled.signal) === 0);
+  check("a signal without live operations has no leak", abortSubscriberCount(controller.signal) === 0);
 }
 
 // ============================================================================
@@ -340,6 +447,22 @@ exit 0
         "thumbnail software retry drops the VAAPI arguments",
         thumbnailCalls.length === 2 && thumbnailCalls[0].includes("-hwaccel vaapi") && !thumbnailCalls[1].includes("-hwaccel vaapi")
       );
+
+      // A scan reuses one AbortSignal for all ffmpeg runs; each finished run
+      // must detach its listener (MaxListenersExceededWarning regression).
+      const scanSignal = new AbortController();
+      for (let run = 0; run < 12; run += 1) {
+        await captureThumbnail("https://mock.example/live.ts", { timeoutMs: 2000, signal: scanSignal.signal });
+      }
+      const ffmpegNative = getEventListeners(scanSignal.signal, "abort").length;
+      check("12 ffmpeg runs leave no subscriber behind", abortSubscriberCount(scanSignal.signal) === 0, String(abortSubscriberCount(scanSignal.signal)));
+      check("12 ffmpeg runs keep a single native listener", ffmpegNative === 1, String(ffmpegNative));
+      let ffmpegAbortNotified = 0;
+      onAbort(scanSignal.signal, () => {
+        ffmpegAbortNotified += 1;
+      });
+      scanSignal.abort();
+      check("the ffmpeg signal still aborts afterwards", ffmpegAbortNotified === 1, String(ffmpegAbortNotified));
     } catch (error) {
       check("runs the fake FFmpeg hardware-fallback probe", false, error instanceof Error ? error.message : String(error));
     } finally {
@@ -564,7 +687,57 @@ section("Thumbnail store");
   check("rejects unknown files", (await readThumbnail("definitely-not-here.jpg")) === null);
   const storeInfo = await thumbnailStoreInfo();
   check("store info reports writability", typeof storeInfo.writable === "boolean");
+  check("store info names the fallback directory", storeInfo.fallbackDir.includes("macattack-thumbnails"), storeInfo.fallbackDir);
   if (saved) await deleteThumbnail(saved);
+}
+
+// ============================================================================
+// Thumbnail outcomes: the scan log must say where files went (or why not)
+// ============================================================================
+section("Thumbnail reporting");
+{
+  const saved: ThumbnailOutcome[] = [
+    { channel: "(NL) NPO 1", name: "001A79D92B61-0-123.jpg", ok: true, detail: "001A79D92B61-0-123.jpg in /app/data/thumbnails" },
+    { channel: "(NL) NPO 2", name: "001A79D92B61-1-124.jpg", ok: true, detail: "001A79D92B61-1-124.jpg in /app/data/thumbnails" },
+    { channel: "(NL) NPO 3", name: null, ok: false, detail: "no frame decoded within 20s (stream offline, DRM-protected or refusing another connection)" },
+  ];
+  const summary = await summariseThumbnails(true, true, saved);
+  check("summary keeps every outcome", summary.outcomes.length === 3);
+  check("summary points at the directory used", typeof summary.dir === "string" && summary.dir.length > 0, summary.dir ?? "");
+
+  const lines = thumbnailLogLines(summary);
+  const joined = lines.map((line) => `${line.level}: ${line.message}`).join("\n");
+  check("logs the saved thumbnail count", /Thumbnails saved: 2/.test(joined), joined);
+  check("logs which directory the files went to", joined.includes(summary.dir ?? "%%"), joined);
+  check("logs the failure reason per channel", /No thumbnail for \(NL\) NPO 3: no frame decoded/.test(joined), joined);
+
+  const disabled = thumbnailLogLines(await summariseThumbnails(false, false, []));
+  check("says when thumbnails are switched off", disabled.some((line) => /switched off/i.test(line.message)));
+
+  const noneAttempted = thumbnailLogLines(await summariseThumbnails(true, true, []));
+  check("explains when nothing was attempted", noneAttempted.some((line) => /no channel returned a playable link/i.test(line.message)));
+
+  // An unusable data directory must be reported instead of silently writing to
+  // the fallback (the "empty data directory" report this test comes from).
+  const originalDataDir = process.env.MACATTACK_DATA_DIR;
+  // A path under a *file* cannot be created (ENOTDIR) — deterministic stand-in
+  // for a bind mount the app user cannot write.
+  const blocker = join(tmpdir(), `macattack-thumbnail-blocker-${Date.now()}`);
+  writeFileSync(blocker, "not a directory");
+  try {
+    process.env.MACATTACK_DATA_DIR = blocker;
+    const fallbackSummary = await summariseThumbnails(true, true, [
+      { channel: "channel", name: "x.jpg", ok: true, detail: "x.jpg in fallback" },
+    ]);
+    check("names the fallback directory when the data dir is unusable", fallbackSummary.storeWarning !== null, String(fallbackSummary.storeWarning));
+    check("summary dir follows the fallback", (fallbackSummary.dir ?? "").includes("macattack-thumbnails"), fallbackSummary.dir ?? "");
+    const warningLines = thumbnailLogLines(fallbackSummary);
+    check("the fallback is a warning in the log", warningLines.some((line) => line.level === "warning" && /not writable/.test(line.message)), JSON.stringify(warningLines));
+  } finally {
+    if (originalDataDir === undefined) delete process.env.MACATTACK_DATA_DIR;
+    else process.env.MACATTACK_DATA_DIR = originalDataDir;
+    rmSync(blocker, { force: true });
+  }
 }
 
 // ============================================================================

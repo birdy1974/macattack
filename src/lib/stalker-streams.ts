@@ -27,6 +27,7 @@ import https from "node:https";
 import { STB_USER_AGENT } from "@/lib/stream-probe";
 import { buildUserAgentCandidates } from "@/lib/user-agents";
 import { type ProxyConfig, openProxyTunnel, tlsOverTunnel } from "@/lib/proxy";
+import { onAbort } from "@/lib/abort";
 
 export interface StalkerClientOptions {
   /** e.g. http://host:port/server/load.php (or .../portal.php) */
@@ -150,10 +151,14 @@ async function stalkerRequest(
     const finish = (response: StalkerResponse) => {
       if (settled) return;
       settled = true;
+      // Detach from the (long-lived, per-scan) signal: one listener per request
+      // would otherwise pile up for the whole scan.
+      detachAbort?.();
       resolve(response);
     };
 
     let request: http.ClientRequest;
+    let detachAbort: (() => void) | null = null;
     try {
       request = transport.get(
         url,
@@ -223,7 +228,7 @@ async function stalkerRequest(
         error: error.message === "Timeout" ? `Timeout after ${timeoutMs}ms` : error.message,
       })
     );
-    options.signal?.addEventListener("abort", () => request.destroy(new Error("Aborted")), { once: true });
+    detachAbort = onAbort(options.signal, () => request.destroy(new Error("Aborted")));
   });
 }
 

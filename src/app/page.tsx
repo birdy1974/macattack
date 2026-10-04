@@ -15,7 +15,7 @@ import {
   type ScheduleSettings,
 } from "@/lib/schedule";
 import { BRAND_IMAGE_URL } from "@/lib/branding";
-import { moveItem } from "@/lib/field-order";
+import { mergeOutputFieldOrder, moveItem } from "@/lib/field-order";
 import { buildQualityReport, type QualityReport } from "@/lib/quality-report";
 
 // ============================================================================
@@ -279,14 +279,8 @@ function normalizeSelectedFields(fields: string[]): string[] {
   return normalized.length > 0 ? normalized : ["macAddress"];
 }
 
-function normalizeFieldOrder(fields: string[]): string[] {
-  const selectedOrder = normalizeSelectedFields(fields);
-  const selected = new Set(selectedOrder);
-  return [
-    ...selectedOrder,
-    ...AVAILABLE_FIELDS.map((field) => field.key).filter((key) => !selected.has(key)),
-  ];
-}
+/** How the Output Fields order last interacted with the stored preference. */
+type FieldOrderSaveState = "idle" | "saving" | "saved" | "error";
 
 // ============================================================================
 // MAIN COMPONENT
@@ -305,6 +299,8 @@ export default function MacAttackPage() {
   const [fieldOrder, setFieldOrder] = useState<string[]>(() =>
     AVAILABLE_FIELDS.map((field) => field.key)
   );
+  const [fieldOrderSaveState, setFieldOrderSaveState] =
+    useState<FieldOrderSaveState>("idle");
   const [draggedField, setDraggedField] = useState<string | null>(null);
   const [dragOverField, setDragOverField] = useState<string | null>(null);
   const [skipVerification, setSkipVerification] = useState(false);
@@ -433,7 +429,7 @@ export default function MacAttackPage() {
       hardwareDevice: string | null;
       checkedAt?: string;
     };
-    thumbnails: { dir: string; fileCount: number | null; maxAgeDays: number; writable?: boolean };
+    thumbnails: { dir: string; fallbackDir?: string; fileCount: number | null; maxAgeDays: number; writable?: boolean; usingFallback?: boolean; lastError?: string | null };
   } | null>(null);
   const [systemRefreshing, setSystemRefreshing] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -487,6 +483,14 @@ export default function MacAttackPage() {
   // ========================================================================
   const logContainerRef = useRef<HTMLDivElement>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Output Fields order (see /api/settings): the last order read from the
+  // server, the selected fields of a restored active job (null when none), and
+  // whether the user already reordered this session — their drag always wins.
+  const storedFieldOrderRef = useRef<string[]>([]);
+  const activeJobFieldOrderRef = useRef<string[] | null>(null);
+  const fieldOrderDecidedRef = useRef(false);
+  // Saves are serialised so a slow request can never overwrite a newer order.
+  const fieldOrderSaveChainRef = useRef<Promise<void>>(Promise.resolve());
   // Mirror of `logAutoRefresh` so the polling callback can read the current
   // value without being re-created (and the interval restarted) on toggle.
   const logAutoRefreshRef = useRef(true);
@@ -494,6 +498,38 @@ export default function MacAttackPage() {
   // ========================================================================
   // FUNCTIONS: Data loading
   // ========================================================================
+
+  /**
+   * Apply the field order the user last stored for the Output Fields list.
+   *
+   * The selected fields of a restored job (when there is one) keep the order
+   * that job was started with; the remaining fields follow the stored
+   * preference; fields the stored order predates fall back to the default
+   * position. Without a job, the stored order alone is applied and the current
+   * field selection is kept.
+   */
+  const applyFieldOrder = useCallback((jobFields: string[] | null) => {
+    const preferred = [
+      ...(jobFields ? normalizeSelectedFields(jobFields) : []),
+      ...storedFieldOrderRef.current,
+    ];
+    if (preferred.length === 0) return;
+
+    const nextOrder = mergeOutputFieldOrder(
+      AVAILABLE_FIELDS.map((field) => field.key),
+      preferred
+    );
+    setFieldOrder(nextOrder);
+
+    if (jobFields) {
+      const selected = new Set(normalizeSelectedFields(jobFields));
+      setSelectedFields(nextOrder.filter((fieldKey) => selected.has(fieldKey)));
+    } else {
+      setSelectedFields((previous) =>
+        nextOrder.filter((fieldKey) => previous.includes(fieldKey))
+      );
+    }
+  }, []);
 
   const loadHASettings = useCallback(async () => {
     try {
@@ -503,6 +539,7 @@ export default function MacAttackPage() {
           scheduleEnabled: boolean;
           scheduleTimezone: string;
           scheduleDays: ScheduleSettings["days"];
+          outputFieldOrder?: string[];
         };
         setHaSettings({
           haUrl: data.haUrl,
@@ -515,11 +552,18 @@ export default function MacAttackPage() {
           days: data.scheduleDays,
         });
         setHaEntityId((current) => current || data.haEntityId);
+
+        // Apply the remembered Output Fields order. Skipped once the user has
+        // reordered in this session — the stored order must not undo a drag.
+        storedFieldOrderRef.current = data.outputFieldOrder ?? [];
+        if (!fieldOrderDecidedRef.current) {
+          applyFieldOrder(activeJobFieldOrderRef.current);
+        }
       }
     } catch {
       // ignore
     }
-  }, []);
+  }, [applyFieldOrder]);
 
   // ========================================================================
   // EFFECTS: Initial load
@@ -540,9 +584,10 @@ export default function MacAttackPage() {
             setMacPrefix(data.job.macPrefix);
             setTimeoutMs(data.job.timeoutMs);
             if (data.job.selectedFields) {
-              const restoredFields = normalizeSelectedFields(data.job.selectedFields);
-              setSelectedFields(restoredFields);
-              setFieldOrder(normalizeFieldOrder(restoredFields));
+              // The running job's fields keep the order that scan was started
+              // with; the stored preference fills in the fields it does not use.
+              activeJobFieldOrderRef.current = normalizeSelectedFields(data.job.selectedFields);
+              applyFieldOrder(activeJobFieldOrderRef.current);
             }
             if (data.job.haEntityId) {
               setHaEntityId(data.job.haEntityId);
@@ -586,7 +631,7 @@ export default function MacAttackPage() {
     checkActiveScan();
     const settingsTimer = setTimeout(() => { void loadHASettings(); }, 0);
     return () => clearTimeout(settingsTimer);
-  }, [loadHASettings]);
+  }, [loadHASettings, applyFieldOrder]);
 
   // Poll for scan status updates.
   // Pass `forceLogs` to pull the console once even while auto-refresh is off
@@ -834,11 +879,42 @@ export default function MacAttackPage() {
     });
   };
 
+  /**
+   * Store the Output Fields order server-side so it survives a reload and
+   * applies to the next scan's results table and CSV/TXT export.
+   */
+  const persistFieldOrder = useCallback((order: readonly string[]) => {
+    fieldOrderDecidedRef.current = true;
+    setFieldOrderSaveState("saving");
+    const body = JSON.stringify({ outputFieldOrder: [...order] });
+
+    // Chain the requests: if an earlier save is still in flight, the newer
+    // order must land last (otherwise a slow response could resurrect it).
+    fieldOrderSaveChainRef.current = fieldOrderSaveChainRef.current
+      .catch(() => {
+        // An earlier failure must not block the next save.
+      })
+      .then(async () => {
+        try {
+          const res = await fetch("/api/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+          });
+          setFieldOrderSaveState(res.ok ? "saved" : "error");
+        } catch {
+          setFieldOrderSaveState("error");
+        }
+      });
+  }, []);
+
   const reorderOutputField = (draggedKey: string, targetKey: string) => {
     const nextOrder = moveItem(fieldOrder, draggedKey, targetKey);
+    if (nextOrder.join("\u0000") === fieldOrder.join("\u0000")) return;
     setFieldOrder(nextOrder);
     const selected = new Set(selectedFields);
     setSelectedFields(nextOrder.filter((fieldKey) => selected.has(fieldKey)));
+    persistFieldOrder(nextOrder);
   };
 
   const selectAllFields = () => {
@@ -1344,7 +1420,7 @@ export default function MacAttackPage() {
             hardwareDevice: string | null;
             checkedAt?: string;
           };
-          thumbnails: { dir: string; fileCount: number | null; maxAgeDays: number; writable?: boolean };
+          thumbnails: { dir: string; fallbackDir?: string; fileCount: number | null; maxAgeDays: number; writable?: boolean; usingFallback?: boolean; lastError?: string | null };
         };
         setSystemInfo(data);
       }
@@ -1371,7 +1447,7 @@ export default function MacAttackPage() {
             hardwareDevice: string | null;
             checkedAt?: string;
           };
-          thumbnails: { dir: string; fileCount: number | null; maxAgeDays: number; writable?: boolean };
+          thumbnails: { dir: string; fallbackDir?: string; fileCount: number | null; maxAgeDays: number; writable?: boolean; usingFallback?: boolean; lastError?: string | null };
         };
         setSystemInfo(data);
       }
@@ -1866,6 +1942,14 @@ export default function MacAttackPage() {
                       </span>
                     )}
                   </p>
+                  {systemInfo.thumbnails.usingFallback && (
+                    <p className="text-xs text-yellow-300">
+                      Writes fall back to <code>{systemInfo.thumbnails.fallbackDir ?? "/tmp/macattack-thumbnails"}</code>{" "}
+                      (cleared when the container is recreated). Fix the mount permissions to keep thumbnails in the data
+                      directory
+                      {systemInfo.thumbnails.lastError ? ` — ${systemInfo.thumbnails.lastError}` : ""}.
+                    </p>
+                  )}
                 </div>
               ) : (
                 <p className="text-xs text-gray-500">Detecting…</p>
@@ -2895,7 +2979,20 @@ export default function MacAttackPage() {
                 {selectedFields.length} of {AVAILABLE_FIELDS.length} fields selected
               </p>
               <p className="text-xs text-gray-500 mt-1">
-                Drag the ⠿ handle to change the results-table and CSV/TXT column order.
+                Drag the ⠿ handle to change the results-table and CSV/TXT column order. The
+                order is saved automatically — it survives reloads and applies to the next scan.
+                {fieldOrderSaveState === "saving" && (
+                  <span className="text-gray-400"> Saving…</span>
+                )}
+                {fieldOrderSaveState === "saved" && (
+                  <span className="text-green-400"> Order saved ✓</span>
+                )}
+                {fieldOrderSaveState === "error" && (
+                  <span className="text-amber-300">
+                    {" "}
+                    Could not save the order — it is kept for this session only.
+                  </span>
+                )}
               </p>
             </div>
 
