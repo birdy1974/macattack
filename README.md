@@ -291,6 +291,14 @@ reported number is the number of entries the portal answered with (`0` when the 
 but returned nothing, empty when the list could not be retrieved). They appear in the results
 table, in CSV/TXT exports and in the JSON export, and can be toggled like any other field.
 
+**Column order is remembered.** Drag a field by its ⠿ handle (or focus the handle and press
+`Alt` + `↑`/`↓`) and the new order is saved automatically to the `settings` table
+(`output_field_order`). It is restored on the next page load and reused for future scans, so the
+results table, the download buttons and the server-side CSV/TXT/JSON exports all keep the order
+you chose. A stored order is cleaned when it is applied: duplicate keys are dropped, fields that
+no longer exist are ignored and fields added by a later release are appended. Saving an empty
+order returns the list to the default order.
+
 ### 4. Start Scan
 Click **🚀 Start Scan** and watch the console log.
 
@@ -557,7 +565,7 @@ bind mount must be writable by uid 1001, e.g.
 │   ├── probe-tests.ts         # probe engine (48 checks)
 │   ├── mac-quality-tests.ts   # Stalker quality pipeline (29 checks)
 │   ├── xtream-tests.ts        # Xtream API path (24 checks)
-│   └── wave-tests.ts          # pure logic + mocked VAAPI picture/thumbnail fallback (116 checks)
+│   └── wave-tests.ts          # pure logic + mocked VAAPI picture/thumbnail fallback (123 checks)
 └── initial/               # Reference copy of the original local-build version
 ```
 

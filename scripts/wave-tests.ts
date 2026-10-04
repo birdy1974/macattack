@@ -15,7 +15,13 @@
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { moveItem } from "../src/lib/field-order";
+import {
+  mergeOutputFieldOrder,
+  moveItem,
+  parseOutputFieldOrderSetting,
+  sanitizeOutputFieldOrder,
+  serializeOutputFieldOrder,
+} from "../src/lib/field-order";
 import { parseMacList, normalizeMac } from "../src/lib/mac-list";
 import { parseProxy, parseProxyList, redactProxy } from "../src/lib/proxy";
 import { detectLabelMismatch, parseLabelClaim } from "../src/lib/label-mismatch";
@@ -80,6 +86,43 @@ section("Output field ordering");
     "does not change field order when the drag source or target is missing",
     moveItem(initialOrder, "unknown", "expireDate").join(",") === initialOrder.join(",")
   );
+
+  // The order is stored in the settings table, so it must round-trip and merge
+  // cleanly with the field list of the running release.
+  const allKeys = ["macAddress", "portalUrl", "expireDate", "quality", "serverLocation"];
+  check(
+    "keeps the stored order and appends fields the save predates",
+    mergeOutputFieldOrder(allKeys, ["quality", "macAddress"]).join(",") ===
+      "quality,macAddress,portalUrl,expireDate,serverLocation"
+  );
+  check(
+    "drops unknown keys from a stored order",
+    mergeOutputFieldOrder(allKeys, ["gone", "macAddress", "gone"]).join(",") ===
+      "macAddress,portalUrl,expireDate,quality,serverLocation"
+  );
+  check(
+    "stored order round-trips through the settings value",
+    parseOutputFieldOrderSetting(
+      serializeOutputFieldOrder(["quality", "macAddress", "expireDate"])
+    ).join(",") === "quality,macAddress,expireDate"
+  );
+  check(
+    "reads a hand-edited whitespace/comma separated order",
+    parseOutputFieldOrderSetting(" quality , macAddress\nexpireDate ").join(",") ===
+      "quality,macAddress,expireDate"
+  );
+  check(
+    "rejects malformed stored orders instead of throwing",
+    parseOutputFieldOrderSetting("[not json").length === 0 &&
+      parseOutputFieldOrderSetting("").length === 0 &&
+      parseOutputFieldOrderSetting(null).length === 0
+  );
+  check(
+    "sanitises duplicated, blank and oversized keys",
+    sanitizeOutputFieldOrder([" quality ", "quality", "", 42, "x".repeat(65), "macAddress"]).join(",") ===
+      "quality,macAddress"
+  );
+  check("an empty save clears the stored order", parseOutputFieldOrderSetting(serializeOutputFieldOrder([])).length === 0);
 }
 
 // ============================================================================
