@@ -1593,9 +1593,9 @@ export default function MacAttackPage() {
             src={BRAND_IMAGE_URL}
             alt=""
             aria-hidden="true"
-            width={128}
-            height={128}
-            className="w-32 h-32 mx-auto mb-6 rounded-2xl object-cover animate-pulse shadow-lg shadow-cyan-950/40"
+            width={384}
+            height={384}
+            className="w-96 h-96 max-w-[85vw] max-h-[85vw] mx-auto mb-6 rounded-2xl object-cover animate-pulse shadow-lg shadow-cyan-950/40"
             unoptimized
           />
           <p className="text-gray-400">Connecting to MacAttack...</p>
