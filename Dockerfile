@@ -101,10 +101,17 @@ RUN mkdir -p public \
 FROM node:20-alpine AS runner
 WORKDIR /app
 
+ARG TARGETARCH
 ENV NODE_ENV=production \
     PORT=3000 \
     HOSTNAME=0.0.0.0 \
     NEXT_TELEMETRY_DISABLED=1
+
+# FFmpeg is available on both image architectures: software decode is the
+# universal fallback. DS918+ (amd64) also gets Intel's VAAPI user-space driver;
+# when /dev/dri is mapped, the app tries hardware decode and falls back per run.
+RUN apk add --no-cache ffmpeg \
+ && if [ "$TARGETARCH" = "amd64" ]; then apk add --no-cache intel-media-driver; fi
 
 # Non-root user
 RUN addgroup --system --gid 1001 nodejs \

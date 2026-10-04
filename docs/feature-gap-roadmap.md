@@ -1,22 +1,21 @@
 # Feature-gap roadmap — what we can still implement, why, and what it buys us
 
 **Companion to:** [`iptv-tool-landscape.md`](iptv-tool-landscape.md) (the ecosystem deep dive)
-**Date:** 2026-10-03 · **Status:** ✅ **all three waves implemented** — see
-[`wave-implementation.md`](wave-implementation.md) for the shipped item list, the tests that
-cover each one, and the honest limits that remain. Only the “Not recommended” section was
-left unimplemented, by design. The tables below are kept unchanged as the decision record
-(what the gap was, why it mattered, what it bought us).
+**Date:** 2026-10-04 · **Status:** ✅ **all three waves implemented** — see
+[`wave-implementation.md`](wave-implementation.md) for the shipped item list, tests and
+remaining limits. These tables preserve the original decision record; the FFmpeg row has
+been updated with its 2026-10-04 Docker packaging and optional VAAPI implementation.
 
 ## How to read the tables
 
 | Column | Meaning |
 |---|---|
-| **Gap** | The feature we do not have today (numbering follows the landscape doc). |
+| **Gap** | The original feature gap (numbering follows the landscape doc); shipped status is called out where applicable. |
 | **Seen in** | Where the idea comes from, so the original can be consulted. |
 | **Added value** | What the user of MacAttack gets once it exists. |
 | **Recommendation** | Concrete implementation path for this codebase (Next.js + Drizzle, Docker amd64+arm64, no build on the NAS/Pi). |
 | **Effort** | XS ≤ ½ day · S ≈ 1 day · M ≈ 2–4 days · L ≈ 1–2 weeks. |
-| **Deps** | New requirements: `ffmpeg` (optional sidecar) · `DB` (columns/table) · `UI` · `ext` (external service). |
+| **Deps** | `ffmpeg` is now bundled in the Docker image; other requirements include `DB` (columns/table), `UI` and `ext` (external service). |
 
 Impact is judged **for this product**: finding accounts that are genuinely watchable, on a NAS/Pi,
 still honest about what was and was not measured.
@@ -46,7 +45,7 @@ These need no new services and no image growth.
 
 | # | Gap | Seen in | Added value | Recommendation | Effort | Deps |
 |---|---|---|---|---|---|---|
-| 1 + 9 | **Optional ffmpeg pack: freeze/black-frame detection, thumbnails, fps, VBR bitrate, blockiness** | IPTVChecker (`freezedetect`, `frozen_video`, screenshots), rendiff-probe (`blackdetect`/`blockdetect`/`blurdetect`), NewsGuyTor (VBR profiling + low-fps) | The biggest honesty upgrade left: today a stream showing a **still image with audio passes every delivery check we have**. Also gives the UI visual proof (thumbnail per probed channel) and fps/VBR numbers | Detect `ffmpeg`/`ffprobe` at runtime (`which`, `PATH`, env override). If present: one 10 s capture per probed channel with `freezedetect` + `blackdetect` + `signalstats`, plus one frame JPEG for the thumbnail. If absent: the scan behaves exactly as today and the report says “picture checks unavailable”. Do **not** bundle it — Synology users can install SynoCommunity ffmpeg, the Pi can `apt install ffmpeg` | M | ffmpeg, DB, UI |
+| 1 + 9 | **FFmpeg picture pack: freeze/black-frame detection, thumbnails, fps and bitrate (shipped 2026-10-04)** | IPTVChecker (`freezedetect`, `frozen_video`, screenshots), rendiff-probe (`blackdetect`/`blockdetect`/`blurdetect`), NewsGuyTor (VBR profiling + low-fps) | Detects still pictures, black intervals and implausible channel labels; adds visual proof and FPS/bitrate data | Bundle Alpine `ffmpeg` in both Docker architectures. On amd64, include Intel's VAAPI user-space driver and attempt hardware decode only when the supported accelerator and accessible DRI device are detected; retry failed hardware decodes in software. Keep local source runs runtime-detected and optional. | Shipped | ffmpeg, DB, UI |
 | 2 | **Probe history + rolling health score (EWMA)** | IPTV Nexus (rolling 0–100 + uptime history), IPTVChecker (scan-history compare) | One unlucky sample stops condemning a stream, and you can see **degradation over time** (evening congestion, provider attrition) instead of a single snapshot. It is also the substrate for monitoring/alerts | New append-only `quality_probe_runs` table (resultId, timestamp, scores, throughput, verdict, channel count). Compute EWMA (α≈0.3) and show “now vs. 7-day trend” in the panel; keep the current snapshot verdict as-is | M | DB, UI |
 | 4 + 5 | **Proxy egress (second vantage point) and proxy-list checker** | IPTVChecker (per-scan proxy), NewsGuyTor (geoblock confirmation through proxies), Flux-Stream (proxy validator + rotation) | Separates “this portal is broken” from “this route is broken”, and confirms geoblocks instead of guessing from HTTP 403. Also useful when a provider rate-limits your home IP | Settings-held proxy list; `stream-probe.ts` accepts an `agent`/HTTP-CONNECT proxy per probe; a “confirm geoblock” action re-probes a 403 stream through one proxy. Ship a small validator (parallel HEAD through each proxy, ms + success) reusing the existing probe timing code | M | DB, UI, ext |
 | 7 | **Bulk MAC list input + configurable concurrency** | Flux-Stream (1–100 threads), mcbash (MAC list file), KiddaC (paste many lines) | Matches how people actually work: paste a vendor/shared list instead of enumerating a prefix. Plus a *cautious* worker cap to scan faster on the Pi 4 without tripping portal rate limits | New job mode `mode: "list"` (textarea/CSV upload → dedup/normalise → queue). Add `concurrency` (1–8, default 1) applied to the validation step only, with a global per-host rate limiter so we add speed without bans | M | DB, UI |
@@ -65,7 +64,7 @@ diagnosable per route (proxy egress), and alertable (monitoring).
 | # | Gap | Seen in | Added value | Recommendation | Effort | Deps |
 |---|---|---|---|---|---|---|
 | 10 | **Xtream Codes support** (`player_api.php`) | Flux-Stream, IPTVChecker (Xtream as playlist source) | Many “stalker” portals are dual-protocol; adding Xtream roughly widens the addressable portals and lets one scan cover both | New `xtream-streams.ts` mirroring `stalker-streams.ts`: login → `get_live_streams`/`get_vod_streams` → direct stream URLs → reuse the probe unchanged; UI: protocol auto-detect from URL shape | M–L | DB, UI |
-| 14 | **RTSP/RTMP (and optional UDP) ingestion** | multicast-checker (UDP + sample recording), IPTVChecker (ffprobe liveness for rtsp/rtmp) | Some portals hand out RTSP/RTMP links; today those channels are simply “not measurable” | Liveness via the optional ffmpeg pack (`ffprobe -rw_timeout`) for `rtsp://`/`rtmp://`; model it as a *different* result kind (bytes received, codec) rather than pretending HLS metrics apply | M | ffmpeg |
+| 14 | **RTSP/RTMP liveness + honest UDP classification (shipped in Wave 3)** | multicast-checker (UDP + sample recording), IPTVChecker (ffprobe liveness for rtsp/rtmp) | RTSP/RTMP links get transport-level liveness instead of being treated as unsupported; UDP is explicitly unverifiable from the scanner host | Use the shared Node socket probe for RTSP/RTMP TCP handshakes and classify UDP as unverifiable. Do not claim throughput or picture metrics for protocols the HTTP media probe cannot measure. | Shipped | — |
 | — | **External-player handoff / per-user playlist** | Cyogenus player, Check-Online-IPTV (auto-VLC) | Some users want to watch, not just score; the subscription URL (quick win) plus an “Open in VLC” deep link covers most of it without bundling a player | Reuse the subscription-URL endpoint; document VLC/TiviMate usage instead of adding a web player | XS | — |
 | — | **Per-group / per-genre aggregation of results** | IPTVChecker (per-group health report) | “Which genre groups are broken on this account?” is a natural next question once we have per-channel probes | Aggregate `qualityReport.channels` by genre in the UI panel | S | UI |
 
@@ -78,9 +77,9 @@ diagnosable per route (proxy egress), and alertable (monitoring).
 | 7 neon themes, glitch effects, obfuscated text | Flux-Stream | Cosmetic; conflicts with a dense, evidence-first data UI. No functional value. |
 | Unbounded parallelism (10–100 threads) | Flux-Stream, Evilvir MacAttack | Provider bans/rate-limits are the main risk to a scan that takes hours; a capped, rate-limited concurrency (gap 7) is the sane version. |
 | Storing full, unredacted stream URLs | common in the wild | Session tokens become replayable credentials in the DB and in exports. We already redact; keep it that way. |
-| Bundling ffmpeg in the default image | IPTVChecker ships sidecars | Adds ~50–100 MB to an image that must stay small on a Raspberry Pi 4 / DS918+ and be rebuilt on every release. Make it detect-and-use, not bundle (gap 1). |
-| ffprobe-based scoring for every channel by default | IPTVChecker, NewsGuyTor | Seconds per channel and CPU-heavy on a Pi; keep the default probe cheap, run ffmpeg only on the sampled channels for a found MAC. |
-| Claiming rebuffer ratio / freeze detection without a decoder | — | Would contradict the honesty rule that made the current report trustworthy. Do it properly (gap 1) or label it “not measurable”. |
+| Shipping a separate oversized FFmpeg sidecar stack | IPTVChecker ships sidecars | A full static codec/tool bundle would add more weight than needed. This product bundles Alpine's runtime `ffmpeg` package for the requested sampled picture checks; do not add a redundant sidecar or run it against every channel. |
+| ffprobe-based scoring for every channel by default | IPTVChecker, NewsGuyTor | Seconds per channel and CPU-heavy on a Pi; keep the default probe cheap, run FFmpeg only on sampled channels for a found MAC. |
+| Claiming rebuffer ratio without player telemetry | — | Would contradict the honesty rule that made the current report trustworthy; label player-side rebuffering “not measurable” instead. |
 
 ---
 

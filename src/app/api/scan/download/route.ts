@@ -62,34 +62,17 @@ export async function GET(request: NextRequest) {
       .from(scanResults)
       .where(eq(scanResults.jobId, parseInt(jobId)));
 
-    const rawSelectedFields = (job.selectedFields as string[]) || [
-      "macAddress",
-      "portalUrl",
-      "expireDate",
-      "quality",
-      "serverLocation",
-    ];
-    const normalizeSelectedFields = (fields: string[]): string[] => {
-      const withoutQuality = fields.filter((f) => f !== "quality");
-      const expireIdx = withoutQuality.indexOf("expireDate");
-      if (expireIdx !== -1) {
-        return [
-          ...withoutQuality.slice(0, expireIdx + 1),
-          "quality",
-          ...withoutQuality.slice(expireIdx + 1),
-        ];
-      }
-      const locIdx = withoutQuality.indexOf("serverLocation");
-      if (locIdx !== -1) {
-        return [
-          ...withoutQuality.slice(0, locIdx),
-          "quality",
-          ...withoutQuality.slice(locIdx),
-        ];
-      }
-      return [...withoutQuality, "quality"];
-    };
-    const selectedFields = normalizeSelectedFields(rawSelectedFields);
+    const requestedFields = request.nextUrl.searchParams.getAll("field");
+    const rawSelectedFields =
+      requestedFields.length > 0
+        ? requestedFields
+        : (job.selectedFields as string[]) || [
+            "macAddress",
+            "portalUrl",
+            "expireDate",
+            "quality",
+            "serverLocation",
+          ];
     const qualityReportCache = new Map<number, ReturnType<typeof buildQualityReport>>();
     const getQualityReport = (result: (typeof results)[number]) => {
       const cached = qualityReportCache.get(result.id);
@@ -146,6 +129,14 @@ export async function GET(request: NextRequest) {
       playlistGenres: "Playlist/Genres",
       vodCategories: "VOD Categories",
     };
+    const selectedFields = [
+      ...new Set(
+        rawSelectedFields.filter((field) =>
+          Object.prototype.hasOwnProperty.call(fieldMap, field)
+        )
+      ),
+    ];
+    if (selectedFields.length === 0) selectedFields.push("macAddress");
 
     const resolveExpireDate = (result: (typeof results)[0]): string => {
       const rawRecord =

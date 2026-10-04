@@ -1,6 +1,6 @@
 # IPTV stream-checking tools — deep dive, reuse and feature gaps
 
-**Date:** 2026-10-03
+**Date:** 2026-10-04
 **Scope:** what MacAttack can reuse from the wider IPTV/stalker tooling ecosystem, and — explicitly —
 **which nice features those tools have that MacAttack does not.**
 
@@ -49,13 +49,14 @@ The gap the user identified is real: **“the MAC is valid” ≠ “the account
 | Health score | `0.25 × ping + 0.40 × content + 0.35 × quality`, each 0–10; ping from **median** latency (1200 ms ≈ 0, 100 ms ≈ 10); quality = HD ratio 0.5 + codec tier 0.3 + ≥25 fps ratio 0.2 | 🟡 adapted as **stability 0.40 + speed 0.35 + quality 0.25** for a single stream, with the weighting documented in code |
 | Codec tiers | HEVC/AV1 = 1.0, H.264 = 0.8, MPEG/VP9 = 0.6, unknown = 0.4 (lower = worse) | 🟢 mirrored (we use 0.85 for H.264) |
 | Retry/backoff | `RetryBackoff::{None, Linear, Exponential}` with capped delays | 🔴 see gap #6 |
-| Playback sanity flags | `frozen_video` (ffmpeg `freezedetect`/still-image detection), `low_bitrate`, `low_framerate`, `label_mismatches` (e.g. “4K” channel that is 720p) | 🔴 see gaps #1 and #8 |
-| Thumbnails | ffmpeg grabs the first frame (no `-ss` on live) for a screenshot/lightbox | 🔴 gap #9 |
+| Playback sanity flags | `frozen_video` (FFmpeg `freezedetect`/still-image detection), `low_bitrate`, `low_framerate`, `label_mismatches` (e.g. “4K” channel that is 720p) | 🟢 FFmpeg analysis on sampled streams; bundled in Docker, with optional VAAPI decode |
+| Thumbnails | FFmpeg grabs the first frame (no `-ss` on live) for a screenshot/lightbox | 🟢 bundled FFmpeg + thumbnail gallery |
 
 ### 3.2 What we deliberately did **not** copy
 
-* ffprobe-as-a-dependency. IPTVChecker ships sidecar ffmpeg/ffprobe binaries; our image must stay small and
-  identical on amd64 (DS918+) and arm64 (Pi 4). Everything we added uses Node built-ins only.
+* IPTVChecker's separate static ffmpeg/ffprobe sidecars. MacAttack uses Alpine's packaged FFmpeg only for
+  sampled picture checks and thumbnails; the same application image remains multi-arch, while the optional
+  Intel VAAPI driver is added only to amd64. The normal transport probe remains Node-based.
 * Its scoring uses one latency number (ping) for “speed”. Our probe measures **real media throughput vs.
   required bitrate**, which is the stronger signal for “will this play”.
 
@@ -108,19 +109,22 @@ implemented server-side with concurrency caps and token-redacted storage.
 
 ## 6. 🚩 **Nice features we did not have** (priority-ordered)
 
-> **Status update (2026-10-03):** every gap below was implemented in the three waves
-> planned in [`feature-gap-roadmap.md`](feature-gap-roadmap.md) — see
-> [`wave-implementation.md`](wave-implementation.md) for where each one lives and how it
-> is tested. The descriptions are kept as the original gap analysis.
+> **Status update (2026-10-04):** the roadmap items below were implemented or given an
+> explicit measurement limit in the three waves planned in
+> [`feature-gap-roadmap.md`](feature-gap-roadmap.md) — see [`wave-implementation.md`](wave-implementation.md)
+> for implementation and tests. FFmpeg is included in both Docker architectures; optional
+> VAAPI decoding uses the DS918+ render-device overlay and falls back to software. RTSP/RTMP
+> receive liveness checks; UDP remains unverifiable. The descriptions below preserve the
+> original gap analysis.
 
 > These are the answers to “highlight if there are any nice features in these other applications that we do not have”.
 
-### 🔴 Gap 1 — Freeze/blank/hard-artefact detection (picture, not just delivery) — **high value**
+### 🟢 Gap 1 — Freeze/blank/hard-artefact detection (picture, not just delivery) — **implemented**
 *Seen in:* IPTVChecker (`frozen_video`, `freezedetect`), rendiff-probe (`blackdetect`, `blockdetect`, `blurdetect`).
-A stream showing a still image with audio still “passes” every delivery check — a normal bitrate, clean TS
-continuity, no failed segments. MacAttack currently cannot see this.
-**Fix:** an *optional* ffmpeg sidecar mode (`freezedetect`/`blackdetect` over a 10 s sample), auto-detected at
-runtime so the NAS/Pi image still works without it. Keep it a flag, never a hard verdict.
+MacAttack runs `freezedetect` and `blackdetect` over sampled streams. The published image bundles FFmpeg;
+missing binaries in local source runs remain a graceful “not available” case. The optional DS918+ VAAPI
+path is opportunistic and software FFmpeg is retried if hardware decode fails. Keep picture flags as evidence,
+not a hard verdict.
 
 ### 🔴 Gap 2 — Result history / rolling health (one bad sample shouldn’t condemn a stream) — **high value**
 *Seen in:* IPTV Nexus (EWMA 0–100 + uptime history), IPTVChecker (scan history compare).
@@ -157,9 +161,9 @@ would be the wins.
 For Stalker accounts this maps to `tv_archive`/`tv_archive_duration` — asking for a programme from 1 h and
 from N days ago and checking for real bytes. Nobody else in the Stalker space does this well.
 
-### 🔴 Gap 9 — Channel thumbnails / screenshots in the UI — **medium value**
+### 🟢 Gap 9 — Channel thumbnails / screenshots in the UI — **implemented**
 *Seen in:* IPTVChecker (screenshot lightbox), NewsGuyTor (screenshots), m3u-editor (diagnostics).
-One ffmpeg/`-frames:v 1` capture per probed channel would make the UI far more convincing.
+The FFmpeg-backed quality flow captures a JPEG for each sampled channel and displays the thumbnail gallery.
 
 ### 🔴 Gap 10 — Xtream Codes support — **medium value**
 *Seen in:* Flux-Stream (Xtream→M3U), IPTVChecker (Xtream login as a playlist source).
@@ -178,8 +182,8 @@ One job = one portal today.
 Only measurable with an actual player; note our report already names these as untested, so there is no
 dishonest claim to fix — it is a future integration, not a bug.
 
-### 🔴 Gap 14 — UDP/multicast and RTSP/RTMP ingestion — **low**
-*Seen in:* multicast-checker, Wisp. Stalker portals are HTTP/HLS-first; low priority.
+### 🟡 Gap 14 — UDP/multicast and RTSP/RTMP ingestion — **partial**
+*Seen in:* multicast-checker, Wisp. RTSP/RTMP TCP handshake liveness is implemented; UDP is honestly labelled unverifiable because the scanner cannot validate multicast payload delivery.
 
 ### 📋 Decision table
 A prioritized, tabular version of these gaps — with added value, implementation path, effort and a

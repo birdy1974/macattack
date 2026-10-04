@@ -1,27 +1,16 @@
 /**
  * ============================================================================
- * Optional ffmpeg pack — picture checks, thumbnails, fps and VBR measurement
+ * FFmpeg picture pack — freeze/black checks, thumbnails, FPS and bitrate
  * ============================================================================
  *
- * Delivery metrics (our HTTP/HLS/MPEG-TS probe) cannot see everything: a
- * stream showing a **still image with audio** keeps a normal bitrate, clean
- * transport-stream continuity and no failed segments. Catching that needs a
- * decoder, which means ffmpeg — but MacAttack ships as one image for a
- * Synology DS918+ and a Raspberry Pi 4, so ffmpeg is:
+ * The published Docker image includes FFmpeg so picture checks work without
+ * installing anything on the NAS/Pi. Local source runs still detect FFmpeg at
+ * runtime (PATH or FFMPEG_PATH). If a Linux Intel VAAPI device is passed into
+ * the container, decode is attempted in hardware and transparently retried in
+ * software if the device or codec cannot be used.
  *
- *   • NEVER bundled — detected at runtime (PATH, or FFMPEG_PATH /
- *     FFPROBE_PATH env overrides);
- *   • NEVER required — every function returns `available: false` and the
- *     caller simply skips picture checks and says so in the report.
- *
- * When ffmpeg is present we run one short pass per probed channel:
- *   ffmpeg -i URL -t <n> -an -vf freezedetect,blackdetect -f null -
- * which gives frozen/black frame evidence, real fps, decoded frame count and
- * the average video bitrate from the final stats line — plus one JPEG frame
- * for the UI thumbnail gallery.
- *
- * The parsers are pure functions so they can be tested against captured
- * ffmpeg output without ffmpeg installed (see scripts/ffmpeg-tools-tests.ts).
+ * Freeze/black filters and JPEG conversion remain CPU-side. Parsers are pure
+ * functions and can be tested without an FFmpeg binary.
  * ============================================================================
  */
 
@@ -33,6 +22,9 @@ export interface FfmpegAvailability {
   path: string | null;
   version: string | null;
   reason: string | null;
+  /** VAAPI candidate only; each decode can still fall back to software. */
+  hardwareAcceleration: "vaapi" | null;
+  hardwareDevice: string | null;
   checkedAt: string;
 }
 
@@ -42,32 +34,83 @@ function ffmpegCandidate(): string {
   return process.env.FFMPEG_PATH || "ffmpeg";
 }
 
-/** Detect ffmpeg once per process (a missing binary costs one failed spawn). */
+function accessibleVaapiDevice(): Promise<string | null> {
+  if (process.platform !== "linux") return Promise.resolve(null);
+  const configured = process.env.MACATTACK_FFMPEG_DRI_DEVICE?.trim();
+  const candidates = configured?.startsWith("/")
+    ? [configured]
+    : ["/dev/dri/renderD128", "/dev/dri/card0"];
+
+  return new Promise((resolve) => {
+    const checkNext = (index: number) => {
+      const device = candidates[index];
+      if (!device) {
+        resolve(null);
+        return;
+      }
+      // The shell's `test -r/-w` built-in uses the same credentials as FFmpeg
+      // without inspecting or opening the DRI device node in the Next bundle.
+      execFile(
+        "/bin/sh",
+        ["-c", '[ -r "$1" ] && [ -w "$1" ]', "sh", device],
+        { timeout: 1000 },
+        (error) => {
+          if (error) checkNext(index + 1);
+          else resolve(device);
+        }
+      );
+    };
+    checkNext(0);
+  });
+}
+
+export function parseHardwareAccelerators(output: string): string[] {
+  return [...new Set(
+    output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => /^[a-z0-9_]+$/i.test(line))
+  )];
+}
+
+/** Detect FFmpeg and a usable VAAPI candidate once per process. */
 export async function detectFfmpeg(force = false): Promise<FfmpegAvailability> {
   if (availabilityCache.value && !force) return availabilityCache.value;
 
+  const binary = ffmpegCandidate();
   const result = await new Promise<FfmpegAvailability>((resolve) => {
-    execFile(ffmpegCandidate(), ["-hide_banner", "-version"], { timeout: 5000 }, (error, stdout) => {
+    execFile(binary, ["-hide_banner", "-version"], { timeout: 5000 }, (error, stdout) => {
       if (error) {
         resolve({
           available: false,
           path: null,
           version: null,
-          reason:
-            process.env.FFMPEG_PATH
-              ? `FFMPEG_PATH is set but not runnable: ${error.message}`
-              : "ffmpeg is not installed (optional: enables freeze/black detection, thumbnails, fps and bitrate checks)",
+          reason: process.env.FFMPEG_PATH
+            ? `FFMPEG_PATH is set but not runnable: ${error.message}`
+            : "ffmpeg is not on PATH (the Docker image includes it; local runs can install it or set FFMPEG_PATH)",
+          hardwareAcceleration: null,
+          hardwareDevice: null,
           checkedAt: new Date().toISOString(),
         });
         return;
       }
+
       const version = /ffmpeg version (\S+)/.exec(stdout)?.[1] ?? null;
-      resolve({
-        available: true,
-        path: ffmpegCandidate(),
-        version,
-        reason: null,
-        checkedAt: new Date().toISOString(),
+      execFile(binary, ["-hide_banner", "-hwaccels"], { timeout: 5000 }, async (_hwError, hwStdout, hwStderr) => {
+        const accelerators = parseHardwareAccelerators(`${hwStdout}\n${hwStderr}`);
+        const mode = (process.env.MACATTACK_FFMPEG_HWACCEL || "auto").trim().toLowerCase();
+        const wantsVaapi = mode === "auto" || mode === "vaapi";
+        const hardwareDevice =
+          wantsVaapi && accelerators.includes("vaapi") ? await accessibleVaapiDevice() : null;
+        resolve({
+          available: true,
+          path: binary,
+          version,
+          reason: null,
+          hardwareAcceleration: hardwareDevice ? "vaapi" : null,
+          hardwareDevice,
+          checkedAt: new Date().toISOString(),
+        });
       });
     });
   });
@@ -206,14 +249,21 @@ export async function analyzePicture(
     `freezedetect=n=${FREEZE_NOISE}:d=${Math.max(2, FREEZE_MIN_SEC)}`,
     `blackdetect=d=${Math.max(1.5, BLACK_MIN_SEC)}:pic_th=0.97`,
   ].join(",");
+  const availability = options.ffmpegPath ? null : await detectFfmpeg();
+  if (!options.ffmpegPath && !availability?.available) {
+    return emptyPictureAnalysis(url, options, "ffmpeg unavailable");
+  }
 
-  const args = [
+  const ffmpeg = options.ffmpegPath || availability?.path || ffmpegCandidate();
+  const hardwareArgs = vaapiInputArgs(availability);
+  const argsFor = (accelerationArgs: string[]) => [
     "-hide_banner",
     "-nostdin",
     "-loglevel",
     "info",
     "-user_agent",
     userAgent,
+    ...accelerationArgs,
     ...(options.inputArgs ?? []),
     "-i",
     url,
@@ -226,33 +276,25 @@ export async function analyzePicture(
     "null",
     "-",
   ];
+  const softwareArgs = argsFor([]);
+  const execution = await runFfmpegWithSoftwareFallback(
+    ffmpeg,
+    argsFor,
+    hardwareArgs,
+    timeoutMs,
+    options.signal,
+    (result) => {
+      const frames = parseFfmpegStats(result.stderr).frames ?? 0;
+      return !result.error && result.exitCode === 0 && frames > 0;
+    }
+  );
+  const { stderr, error } = execution.result;
 
-  const ffmpeg = options.ffmpegPath || process.env.FFMPEG_PATH || "ffmpeg";
-  const empty: PictureAnalysis = {
-    analyzed: false,
-    durationSec: null,
-    frames: null,
-    fps: null,
-    frozenIntervals: [],
-    frozenDurationSec: 0,
-    frozenDetected: false,
-    blackIntervals: [],
-    blackDurationSec: 0,
-    blackDetected: false,
-    videoBitrateMbps: null,
-    error: null,
-    tool: `ffmpeg ${args.filter((arg) => arg !== url).join(" ")}`,
-  };
-
-  const availability = options.ffmpegPath ? null : await detectFfmpeg();
-  if (availability && !availability.available) {
-    return { ...empty, error: "ffmpeg unavailable" };
-  }
-
-  const { stderr, error } = await runFfmpeg(ffmpeg, args, timeoutMs, options.signal);
   if (error && !/Conversion failed|Invalid data|Server returned/i.test(stderr)) {
     // A stream that never opened is not an analysis result, it is a probe failure.
-    if (/No such file|not found|ENOENT/i.test(error)) return { ...empty, error: "ffmpeg unavailable" };
+    if (/No such file|not found|ENOENT/i.test(error)) {
+      return emptyPictureAnalysis(url, options, "ffmpeg unavailable");
+    }
   }
 
   const stats = parseFfmpegStats(stderr);
@@ -272,6 +314,11 @@ export async function analyzePicture(
       : null;
 
   const analyzed = stats.frames !== null && stats.frames > 0;
+  const executionMode = execution.hardwareUsed
+    ? "VAAPI decode"
+    : execution.softwareFallback
+      ? "software fallback"
+      : "software decode";
   return {
     analyzed,
     durationSec: analyzedDuration,
@@ -286,7 +333,53 @@ export async function analyzePicture(
     blackDetected: analyzed && blackDurationSec >= Math.max(1.5, seconds * 0.5),
     videoBitrateMbps,
     error: analyzed ? null : error || "ffmpeg did not decode any frames",
-    tool: empty.tool,
+    tool: `ffmpeg (${executionMode}) ${softwareArgs.filter((arg) => arg !== url).join(" ")}`,
+  };
+}
+
+function emptyPictureAnalysis(
+  url: string,
+  options: PictureAnalysisOptions,
+  error: string
+): PictureAnalysis {
+  const seconds = Math.max(3, Math.min(options.seconds ?? 10, 60));
+  const filters = [
+    `freezedetect=n=${FREEZE_NOISE}:d=${Math.max(2, FREEZE_MIN_SEC)}`,
+    `blackdetect=d=${Math.max(1.5, BLACK_MIN_SEC)}:pic_th=0.97`,
+  ].join(",");
+  const args = [
+    "-hide_banner",
+    "-nostdin",
+    "-loglevel",
+    "info",
+    "-user_agent",
+    options.userAgent || "MacAttack",
+    ...(options.inputArgs ?? []),
+    "-i",
+    url,
+    "-t",
+    String(seconds),
+    "-an",
+    "-vf",
+    filters,
+    "-f",
+    "null",
+    "-",
+  ];
+  return {
+    analyzed: false,
+    durationSec: null,
+    frames: null,
+    fps: null,
+    frozenIntervals: [],
+    frozenDurationSec: 0,
+    frozenDetected: false,
+    blackIntervals: [],
+    blackDurationSec: 0,
+    blackDetected: false,
+    videoBitrateMbps: null,
+    error,
+    tool: `ffmpeg ${args.filter((arg) => arg !== url).join(" ")}`,
   };
 }
 
@@ -305,13 +398,21 @@ export async function captureThumbnail(
   url: string,
   options: PictureAnalysisOptions & { seekSeconds?: number } = {}
 ): Promise<ThumbnailResult> {
-  const args = [
+  const availability = options.ffmpegPath ? null : await detectFfmpeg();
+  if (!options.ffmpegPath && !availability?.available) {
+    return { ok: false, jpeg: null, error: "ffmpeg unavailable" };
+  }
+
+  const ffmpeg = options.ffmpegPath || availability?.path || ffmpegCandidate();
+  const hardwareArgs = vaapiInputArgs(availability);
+  const argsFor = (accelerationArgs: string[]) => [
     "-hide_banner",
     "-nostdin",
     "-loglevel",
     "error",
     "-user_agent",
     options.userAgent || "MacAttack",
+    ...accelerationArgs,
     ...(options.inputArgs ?? []),
     "-i",
     url,
@@ -324,22 +425,24 @@ export async function captureThumbnail(
     "image2",
     "-",
   ];
-
-  const availability = await detectFfmpeg();
-  if (!availability.available) return { ok: false, jpeg: null, error: "ffmpeg unavailable" };
-
-  const { stdout, error } = await runFfmpegResult(
-    process.env.FFMPEG_PATH || "ffmpeg",
-    args,
+  const execution = await runFfmpegWithSoftwareFallback(
+    ffmpeg,
+    argsFor,
+    hardwareArgs,
     options.timeoutMs ?? 20000,
-    options.signal
+    options.signal,
+    (result) => !result.error && result.exitCode === 0 && isJpeg(result.stdout)
   );
+  const { stdout, error } = execution.result;
 
   if (stdout.length === 0) return { ok: false, jpeg: null, error: error || "No frame captured" };
   // Guard against a text error page being "captured".
-  const isJpeg = stdout[0] === 0xff && stdout[1] === 0xd8;
-  if (!isJpeg) return { ok: false, jpeg: null, error: "ffmpeg output was not a JPEG frame" };
+  if (!isJpeg(stdout)) return { ok: false, jpeg: null, error: "ffmpeg output was not a JPEG frame" };
   return { ok: true, jpeg: stdout, error: null };
+}
+
+function isJpeg(buffer: Buffer): boolean {
+  return buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xd8;
 }
 
 // ============================================================================
@@ -351,6 +454,51 @@ interface RunResult {
   stderr: string;
   error: string | null;
   exitCode: number | null;
+}
+
+interface FfmpegExecution {
+  result: RunResult;
+  hardwareUsed: boolean;
+  softwareFallback: boolean;
+}
+
+function vaapiInputArgs(availability: FfmpegAvailability | null): string[] {
+  if (availability?.hardwareAcceleration !== "vaapi" || !availability.hardwareDevice) return [];
+  return ["-hwaccel", "vaapi", "-hwaccel_device", availability.hardwareDevice];
+}
+
+function isStreamInputFailure(result: RunResult): boolean {
+  return /HTTP error \d{3}|server returned|connection refused|network is unreachable|name or service not known|temporary failure in name resolution|invalid data found when processing input/i.test(
+    `${result.stderr}\n${result.error || ""}`
+  );
+}
+
+async function runFfmpegWithSoftwareFallback(
+  binary: string,
+  argsFor: (accelerationArgs: string[]) => string[],
+  hardwareArgs: string[],
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+  isSuccess: (result: RunResult) => boolean
+): Promise<FfmpegExecution> {
+  const first = await runFfmpegResult(
+    binary,
+    argsFor(hardwareArgs),
+    timeoutMs,
+    signal
+  );
+  const hardwareSucceeded = hardwareArgs.length > 0 && isSuccess(first);
+  if (
+    hardwareArgs.length === 0 ||
+    hardwareSucceeded ||
+    signal?.aborted ||
+    isStreamInputFailure(first)
+  ) {
+    return { result: first, hardwareUsed: hardwareSucceeded, softwareFallback: false };
+  }
+
+  const fallback = await runFfmpegResult(binary, argsFor([]), timeoutMs, signal);
+  return { result: fallback, hardwareUsed: false, softwareFallback: true };
 }
 
 function runFfmpegResult(
@@ -404,14 +552,4 @@ function runFfmpegResult(
     child.on("error", (error: Error) => finish(error.message, null));
     child.on("close", (code) => finish(null, code));
   });
-}
-
-async function runFfmpeg(
-  binary: string,
-  args: string[],
-  timeoutMs: number,
-  signal?: AbortSignal
-): Promise<{ stderr: string; error: string | null; exitCode: number | null }> {
-  const result = await runFfmpegResult(binary, args, timeoutMs, signal);
-  return { stderr: result.stderr, error: result.error, exitCode: result.exitCode };
 }

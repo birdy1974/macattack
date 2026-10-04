@@ -8,6 +8,7 @@ import {
   type ScheduleSettings,
 } from "@/lib/schedule";
 import { BRAND_IMAGE_URL } from "@/lib/branding";
+import { moveItem } from "@/lib/field-order";
 import { buildQualityReport, type QualityReport } from "@/lib/quality-report";
 
 // ============================================================================
@@ -225,24 +226,18 @@ const AVAILABLE_FIELDS = [
 ];
 
 function normalizeSelectedFields(fields: string[]): string[] {
-  const withoutQuality = fields.filter((f) => f !== "quality");
-  const expireIdx = withoutQuality.indexOf("expireDate");
-  if (expireIdx !== -1) {
-    return [
-      ...withoutQuality.slice(0, expireIdx + 1),
-      "quality",
-      ...withoutQuality.slice(expireIdx + 1),
-    ];
-  }
-  const locIdx = withoutQuality.indexOf("serverLocation");
-  if (locIdx !== -1) {
-    return [
-      ...withoutQuality.slice(0, locIdx),
-      "quality",
-      ...withoutQuality.slice(locIdx),
-    ];
-  }
-  return [...withoutQuality, "quality"];
+  const available = new Set(AVAILABLE_FIELDS.map((field) => field.key));
+  const normalized = [...new Set(fields.filter((field) => available.has(field)))];
+  return normalized.length > 0 ? normalized : ["macAddress"];
+}
+
+function normalizeFieldOrder(fields: string[]): string[] {
+  const selectedOrder = normalizeSelectedFields(fields);
+  const selected = new Set(selectedOrder);
+  return [
+    ...selectedOrder,
+    ...AVAILABLE_FIELDS.map((field) => field.key).filter((key) => !selected.has(key)),
+  ];
 }
 
 // ============================================================================
@@ -259,6 +254,11 @@ export default function MacAttackPage() {
   const [selectedFields, setSelectedFields] = useState<string[]>(
     AVAILABLE_FIELDS.filter((f) => f.default).map((f) => f.key)
   );
+  const [fieldOrder, setFieldOrder] = useState<string[]>(() =>
+    AVAILABLE_FIELDS.map((field) => field.key)
+  );
+  const [draggedField, setDraggedField] = useState<string | null>(null);
+  const [dragOverField, setDragOverField] = useState<string | null>(null);
   const [skipVerification, setSkipVerification] = useState(false);
   const [blockSize, setBlockSize] = useState(8000);
 
@@ -374,7 +374,13 @@ export default function MacAttackPage() {
   const [playlistTokenByResult, setPlaylistTokenByResult] = useState<Record<number, string>>({});
   const [copiedToken, setCopiedToken] = useState<string | null>(null);
   const [systemInfo, setSystemInfo] = useState<{
-    ffmpeg: { available: boolean; version: string | null; reason: string | null };
+    ffmpeg: {
+      available: boolean;
+      version: string | null;
+      reason: string | null;
+      hardwareAcceleration: "vaapi" | null;
+      hardwareDevice: string | null;
+    };
     thumbnails: { dir: string; fileCount: number | null; maxAgeDays: number };
   } | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -466,7 +472,9 @@ export default function MacAttackPage() {
             setMacPrefix(data.job.macPrefix);
             setTimeoutMs(data.job.timeoutMs);
             if (data.job.selectedFields) {
-              setSelectedFields(normalizeSelectedFields(data.job.selectedFields));
+              const restoredFields = normalizeSelectedFields(data.job.selectedFields);
+              setSelectedFields(restoredFields);
+              setFieldOrder(normalizeFieldOrder(restoredFields));
             }
             if (data.job.haEntityId) {
               setHaEntityId(data.job.haEntityId);
@@ -724,10 +732,9 @@ export default function MacAttackPage() {
 
   const handleDownload = (format: "csv" | "txt" | "json") => {
     if (!activeJobId) return;
-    window.open(
-      `/api/scan/download?jobId=${activeJobId}&format=${format}`,
-      "_blank"
-    );
+    const query = new URLSearchParams({ jobId: String(activeJobId), format });
+    selectedFields.forEach((field) => query.append("field", field));
+    window.open(`/api/scan/download?${query.toString()}`, "_blank");
   };
 
   // ========================================================================
@@ -735,16 +742,26 @@ export default function MacAttackPage() {
   // ========================================================================
 
   const toggleField = (key: string) => {
-    setSelectedFields((prev) => {
-      const next = prev.includes(key)
-        ? prev.filter((f) => f !== key)
-        : [...prev, key];
-      return AVAILABLE_FIELDS.map((f) => f.key).filter((k) => next.includes(k));
+    setSelectedFields((previous) => {
+      const nextSelected = new Set(previous);
+      if (nextSelected.has(key)) {
+        nextSelected.delete(key);
+      } else {
+        nextSelected.add(key);
+      }
+      return fieldOrder.filter((fieldKey) => nextSelected.has(fieldKey));
     });
   };
 
+  const reorderOutputField = (draggedKey: string, targetKey: string) => {
+    const nextOrder = moveItem(fieldOrder, draggedKey, targetKey);
+    setFieldOrder(nextOrder);
+    const selected = new Set(selectedFields);
+    setSelectedFields(nextOrder.filter((fieldKey) => selected.has(fieldKey)));
+  };
+
   const selectAllFields = () => {
-    setSelectedFields(AVAILABLE_FIELDS.map((f) => f.key));
+    setSelectedFields([...fieldOrder]);
   };
 
   const deselectAllFields = () => {
@@ -1235,7 +1252,13 @@ export default function MacAttackPage() {
       }
       if (systemRes.ok) {
         const data = (await systemRes.json()) as {
-          ffmpeg: { available: boolean; version: string | null; reason: string | null };
+          ffmpeg: {
+            available: boolean;
+            version: string | null;
+            reason: string | null;
+            hardwareAcceleration: "vaapi" | null;
+            hardwareDevice: string | null;
+          };
           thumbnails: { dir: string; fileCount: number | null; maxAgeDays: number };
         };
         setSystemInfo(data);
@@ -1481,9 +1504,9 @@ export default function MacAttackPage() {
             src={BRAND_IMAGE_URL}
             alt=""
             aria-hidden="true"
-            width={64}
-            height={64}
-            className="w-16 h-16 mx-auto mb-4 rounded-xl object-cover animate-pulse"
+            width={128}
+            height={128}
+            className="w-32 h-32 mx-auto mb-6 rounded-2xl object-cover animate-pulse shadow-lg shadow-cyan-950/40"
             unoptimized
           />
           <p className="text-gray-400">Connecting to MacAttack...</p>
@@ -1506,7 +1529,7 @@ export default function MacAttackPage() {
     <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column" }}>
       {/* Header */}
       <header className="border-b border-gray-800 bg-gray-900/80 backdrop-blur-sm sticky top-0 z-50">
-        <div style={{ maxWidth: "80rem", margin: "0 auto", padding: "0.75rem 1rem", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ maxWidth: "80rem", margin: "0 auto", padding: "0.75rem 1rem", display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: "0.75rem" }}>
           <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
             <Image
               src={BRAND_IMAGE_URL}
@@ -1526,7 +1549,7 @@ export default function MacAttackPage() {
               </p>
             </div>
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: "0.5rem", flexWrap: "wrap", flex: "1 1 auto" }}>
             {isRunning && (
               <div className="flex items-center gap-2 px-3 py-1.5 bg-cyan-900/30 border border-cyan-700/50 rounded-full scanning-glow">
                 <div className="w-2 h-2 bg-cyan-400 rounded-full animate-pulse" />
@@ -1541,6 +1564,39 @@ export default function MacAttackPage() {
                 <span className="text-xs text-yellow-300 font-medium">Schedule pause</span>
               </div>
             )}
+            <div role="group" aria-label="Scan actions" className="flex items-center gap-1 rounded-lg border border-gray-700/80 bg-gray-950/60 p-1">
+              <button
+                onClick={isStopped ? handleStart : handleStop}
+                disabled={isLoading || (isStopped && !portalUrl.trim())}
+                aria-label={isStopped ? "Start scan" : "Stop scan"}
+                title={isStopped ? "Start scan" : "Stop scan"}
+                className={`whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-semibold text-white transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                  isStopped ? "bg-cyan-700 hover:bg-cyan-600" : "bg-red-700 hover:bg-red-600"
+                }`}
+              >
+                {isLoading ? (isStopped ? "⏳ Starting" : "⏳ Stopping") : isStopped ? "🚀 Start" : "⏹ Stop"}
+              </button>
+              {activeJobId && results.length > 0 && (
+                <>
+                  <button
+                    onClick={() => handleDownload("csv")}
+                    aria-label="Download CSV"
+                    title="Download CSV"
+                    className="whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-medium text-gray-200 transition-colors hover:bg-gray-800"
+                  >
+                    📥 CSV
+                  </button>
+                  <button
+                    onClick={() => handleDownload("txt")}
+                    aria-label="Download TXT"
+                    title="Download TXT"
+                    className="whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-medium text-gray-200 transition-colors hover:bg-gray-800"
+                  >
+                    📥 TXT
+                  </button>
+                </>
+              )}
+            </div>
             <button
               onClick={() => setShowScheduleSettings(true)}
               className="px-3 py-1.5 text-sm bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg transition-colors"
@@ -1629,12 +1685,25 @@ export default function MacAttackPage() {
                     {systemInfo.ffmpeg.available ? (
                       <span className="text-green-300">available ({systemInfo.ffmpeg.version || "version unknown"})</span>
                     ) : (
-                      <span className="text-yellow-300">not installed — picture checks/thumbnails stay off</span>
+                      <span className="text-yellow-300">not found — picture checks/thumbnails are unavailable</span>
+                    )}
+                  </p>
+                  <p>
+                    <span className="text-gray-500">Video decode:</span>{" "}
+                    {!systemInfo.ffmpeg.available ? (
+                      <span className="text-gray-400">unavailable until FFmpeg is installed</span>
+                    ) : systemInfo.ffmpeg.hardwareAcceleration === "vaapi" ? (
+                      <span className="text-green-300">
+                        VAAPI candidate on <code>{systemInfo.ffmpeg.hardwareDevice}</code> (tested per decode; software fallback enabled)
+                      </span>
+                    ) : (
+                      <span className="text-gray-400">software decode (VAAPI support/device not detected or acceleration disabled)</span>
                     )}
                   </p>
                   <p className="text-gray-500">
-                    Optional and never bundled: install ffmpeg in the container/host and set <code>FFMPEG_PATH</code>{" "}
-                    if it is not on PATH. Everything else works without it.
+                    The Docker image includes FFmpeg. When enabled, VAAPI is attempted only if supported and an Intel DRI
+                    device is accessible; failed hardware decoding retries in software. For local runs, install ffmpeg or set{" "}
+                    <code>FFMPEG_PATH</code>.
                   </p>
                   <p>
                     <span className="text-gray-500">Thumbnails:</span>{" "}
@@ -2548,8 +2617,8 @@ export default function MacAttackPage() {
                       <span className="text-xs text-gray-300">
                         Picture checks (freeze / black / fps)
                         <span className="block text-gray-500">
-                          Needs ffmpeg on the host (optional, never bundled). Without it the streams are still
-                          measured for speed/stability.
+                          Uses the FFmpeg bundled in the Docker image. Local source runs without FFmpeg still
+                          measure streams for speed/stability, but skip picture checks.
                         </span>
                       </span>
                     </label>
@@ -2564,7 +2633,7 @@ export default function MacAttackPage() {
                       <span className="text-xs text-gray-300">
                         Stream thumbnails
                         <span className="block text-gray-500">
-                          Capture one JPEG per probed channel (needs ffmpeg) so you can see what you found.
+                          Capture one JPEG per probed channel with FFmpeg so you can see what you found.
                         </span>
                       </span>
                     </label>
@@ -2597,24 +2666,80 @@ export default function MacAttackPage() {
                 </div>
               </div>
               <div className="space-y-1 max-h-64 overflow-y-auto">
-                {AVAILABLE_FIELDS.map((field) => (
-                  <label
-                    key={field.key}
-                    className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-gray-800 cursor-pointer transition-colors"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={selectedFields.includes(field.key)}
-                      onChange={() => toggleField(field.key)}
-                      disabled={isRunning || (field.key === "macAddress" && selectedFields.length === 1)}
-                      className="w-4 h-4 rounded border-gray-600 text-cyan-500 focus:ring-cyan-500 bg-gray-700 disabled:opacity-50"
-                    />
-                    <span className="text-sm text-gray-300">{field.label}</span>
-                  </label>
-                ))}
+                {fieldOrder.map((fieldKey) => {
+                  const field = AVAILABLE_FIELDS.find((availableField) => availableField.key === fieldKey);
+                  if (!field) return null;
+
+                  return (
+                    <div
+                      key={field.key}
+                      onDragOver={(event) => {
+                        if (isRunning) return;
+                        event.preventDefault();
+                        event.dataTransfer.dropEffect = "move";
+                        setDragOverField(field.key);
+                      }}
+                      onDrop={(event) => {
+                        if (isRunning) return;
+                        event.preventDefault();
+                        const sourceKey = event.dataTransfer.getData("text/plain") || draggedField;
+                        if (sourceKey) reorderOutputField(sourceKey, field.key);
+                        setDraggedField(null);
+                        setDragOverField(null);
+                      }}
+                      className={`flex items-center gap-3 px-3 py-2 rounded-lg border transition-colors ${
+                        dragOverField === field.key
+                          ? "border-cyan-500 bg-cyan-950/40"
+                          : "border-transparent hover:bg-gray-800"
+                      } ${draggedField === field.key ? "opacity-50" : ""}`}
+                    >
+                      <button
+                        type="button"
+                        draggable={!isRunning}
+                        disabled={isRunning}
+                        onDragStart={(event) => {
+                          event.dataTransfer.effectAllowed = "move";
+                          event.dataTransfer.setData("text/plain", field.key);
+                          setDraggedField(field.key);
+                        }}
+                        onDragEnd={() => {
+                          setDraggedField(null);
+                          setDragOverField(null);
+                        }}
+                        onKeyDown={(event) => {
+                          if (!event.altKey || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) return;
+                          const index = fieldOrder.indexOf(field.key);
+                          const targetIndex = index + (event.key === "ArrowUp" ? -1 : 1);
+                          const targetKey = fieldOrder[targetIndex];
+                          if (!targetKey) return;
+                          event.preventDefault();
+                          reorderOutputField(field.key, targetKey);
+                        }}
+                        aria-label={`Reorder ${field.label}`}
+                        title="Drag to reorder (or use Alt + arrow keys)"
+                        className="shrink-0 cursor-grab text-lg leading-none text-gray-500 hover:text-cyan-300 active:cursor-grabbing disabled:cursor-not-allowed"
+                      >
+                        ⠿
+                      </button>
+                      <label className="flex min-w-0 flex-1 items-center gap-3 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={selectedFields.includes(field.key)}
+                          onChange={() => toggleField(field.key)}
+                          disabled={isRunning || (field.key === "macAddress" && selectedFields.length === 1)}
+                          className="w-4 h-4 rounded border-gray-600 text-cyan-500 focus:ring-cyan-500 bg-gray-700 disabled:opacity-50"
+                        />
+                        <span className="text-sm text-gray-300">{field.label}</span>
+                      </label>
+                    </div>
+                  );
+                })}
               </div>
               <p className="text-xs text-gray-500 mt-2">
                 {selectedFields.length} of {AVAILABLE_FIELDS.length} fields selected
+              </p>
+              <p className="text-xs text-gray-500 mt-1">
+                Drag the ⠿ handle to change the results-table and CSV/TXT column order.
               </p>
             </div>
 
