@@ -1,6 +1,13 @@
 "use client";
 
-import { Fragment, useState, useEffect, useRef, useCallback } from "react";
+import {
+  Fragment,
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  useSyncExternalStore,
+} from "react";
 import Image from "next/image";
 import {
   DEFAULT_WEEK_SCHEDULE,
@@ -225,6 +232,41 @@ const AVAILABLE_FIELDS = [
   { key: "createdAt", label: "Created At", default: true },
 ];
 
+// ============================================================================
+// CONSOLE LOG AUTO-REFRESH PREFERENCE (persisted in localStorage)
+// ============================================================================
+
+const LOG_AUTO_REFRESH_STORAGE_KEY = "macattack.logAutoRefresh";
+const logAutoRefreshListeners = new Set<() => void>();
+
+function subscribeLogAutoRefresh(listener: () => void): () => void {
+  logAutoRefreshListeners.add(listener);
+  // Keep multiple open tabs in sync.
+  window.addEventListener("storage", listener);
+  return () => {
+    logAutoRefreshListeners.delete(listener);
+    window.removeEventListener("storage", listener);
+  };
+}
+
+/** Defaults to enabled when nothing is stored or storage is unavailable. */
+function getLogAutoRefreshSnapshot(): boolean {
+  try {
+    return window.localStorage.getItem(LOG_AUTO_REFRESH_STORAGE_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function setLogAutoRefreshPreference(enabled: boolean): void {
+  try {
+    window.localStorage.setItem(LOG_AUTO_REFRESH_STORAGE_KEY, String(enabled));
+  } catch {
+    // localStorage unavailable — the preference just won't persist.
+  }
+  logAutoRefreshListeners.forEach((listener) => listener());
+}
+
 function normalizeSelectedFields(fields: string[]): string[] {
   const available = new Set(AVAILABLE_FIELDS.map((field) => field.key));
   const normalized = [...new Set(fields.filter((field) => available.has(field)))];
@@ -397,6 +439,7 @@ export default function MacAttackPage() {
   const [rawDataLoadingId, setRawDataLoadingId] = useState<number | null>(null);
   const [rawDataError, setRawDataError] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [logsUpdatedAt, setLogsUpdatedAt] = useState<Date | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isReconnecting, setIsReconnecting] = useState(true);
@@ -418,10 +461,24 @@ export default function MacAttackPage() {
   const [showHistory, setShowHistory] = useState(false);
 
   // ========================================================================
+  // STATE: Console log auto-refresh
+  // ========================================================================
+  // Read from localStorage as an external store so the server render (default:
+  // enabled) hydrates cleanly and the choice sticks across reloads/tabs.
+  const logAutoRefresh = useSyncExternalStore(
+    subscribeLogAutoRefresh,
+    getLogAutoRefreshSnapshot,
+    () => true,
+  );
+
+  // ========================================================================
   // REFS
   // ========================================================================
   const logContainerRef = useRef<HTMLDivElement>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Mirror of `logAutoRefresh` so the polling callback can read the current
+  // value without being re-created (and the interval restarted) on toggle.
+  const logAutoRefreshRef = useRef(true);
 
   // ========================================================================
   // FUNCTIONS: Data loading
@@ -520,8 +577,10 @@ export default function MacAttackPage() {
     return () => clearTimeout(settingsTimer);
   }, [loadHASettings]);
 
-  // Poll for scan status updates
-  const pollStatus = useCallback(async () => {
+  // Poll for scan status updates.
+  // Pass `forceLogs` to pull the console once even while auto-refresh is off
+  // (used by the "Refresh now" button).
+  const pollStatus = useCallback(async (forceLogs = false) => {
     if (!activeJobId) return;
     try {
       const res = await fetch(`/api/scan/status?jobId=${activeJobId}`);
@@ -539,7 +598,10 @@ export default function MacAttackPage() {
         ...result,
         qualityReport: buildQualityReport(data.job, result),
       })));
-      setLogs(data.logs);
+      if (forceLogs || logAutoRefreshRef.current) {
+        setLogs(data.logs);
+        setLogsUpdatedAt(new Date());
+      }
 
       // Stop polling if scan is done
       if (
@@ -581,12 +643,19 @@ export default function MacAttackPage() {
     };
   }, [activeJobId, pollStatus]);
 
-  // Auto-scroll logs to bottom
+  // Keep the ref the polling callback reads in sync with the preference.
   useEffect(() => {
+    logAutoRefreshRef.current = logAutoRefresh;
+  }, [logAutoRefresh]);
+
+  // Auto-scroll logs to bottom. While auto-refresh is paused we leave the
+  // scroll position alone so the log can be read back without being yanked.
+  useEffect(() => {
+    if (!logAutoRefresh) return;
     if (logContainerRef.current) {
       logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
     }
-  }, [logs, logFilters]);
+  }, [logs, logFilters, logAutoRefresh]);
 
   const loadHistory = async () => {
     try {
@@ -618,6 +687,7 @@ export default function MacAttackPage() {
     setIsLoading(true);
     setResults([]);
     setLogs([]);
+    setLogsUpdatedAt(null);
     setJob(null);
 
     try {
@@ -1452,6 +1522,25 @@ export default function MacAttackPage() {
 
   const toggleLogFilter = (level: keyof typeof logFilters) => {
     setLogFilters((prev) => ({ ...prev, [level]: !prev[level] }));
+  };
+
+  /**
+   * Enable/disable automatic console-log refresh while a scan is running.
+   * Results, progress and the job status keep polling regardless — only the
+   * log list is frozen. The choice is remembered across reloads.
+   */
+  const toggleLogAutoRefresh = () => {
+    const next = !logAutoRefresh;
+    logAutoRefreshRef.current = next;
+    setLogAutoRefreshPreference(next);
+    // Re-enabling should show the newest lines right away instead of waiting
+    // for the next poll tick.
+    if (next) void pollStatus(true);
+  };
+
+  /** Pull the console log once, even while auto-refresh is paused. */
+  const refreshLogsNow = () => {
+    void pollStatus(true);
   };
 
   /**
@@ -3710,49 +3799,93 @@ export default function MacAttackPage() {
                 <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">
                   🖥️ Console Log
                 </h2>
-                {/* Log filter buttons */}
-                <div className="flex items-center gap-2">
-                  <span className="text-xs text-gray-500 mr-1">Show:</span>
-                  <button
-                    onClick={() => toggleLogFilter("info")}
-                    className={`px-2 py-1 text-xs rounded transition-colors ${
-                      logFilters.info
-                        ? "bg-blue-900/50 text-blue-300 border border-blue-700/50"
-                        : "bg-gray-800 text-gray-500 border border-gray-700"
-                    }`}
-                  >
-                    ℹ️ Info
-                  </button>
-                  <button
-                    onClick={() => toggleLogFilter("success")}
-                    className={`px-2 py-1 text-xs rounded transition-colors ${
-                      logFilters.success
-                        ? "bg-green-900/50 text-green-300 border border-green-700/50"
-                        : "bg-gray-800 text-gray-500 border border-gray-700"
-                    }`}
-                  >
-                    ✅ Success
-                  </button>
-                  <button
-                    onClick={() => toggleLogFilter("warning")}
-                    className={`px-2 py-1 text-xs rounded transition-colors ${
-                      logFilters.warning
-                        ? "bg-yellow-900/50 text-yellow-300 border border-yellow-700/50"
-                        : "bg-gray-800 text-gray-500 border border-gray-700"
-                    }`}
-                  >
-                    ⚠️ Warning
-                  </button>
-                  <button
-                    onClick={() => toggleLogFilter("error")}
-                    className={`px-2 py-1 text-xs rounded transition-colors ${
-                      logFilters.error
-                        ? "bg-red-900/50 text-red-300 border border-red-700/50"
-                        : "bg-gray-800 text-gray-500 border border-gray-700"
-                    }`}
-                  >
-                    ❌ Error
-                  </button>
+                <div className="flex items-center gap-3 flex-wrap">
+                  {/* Log filter buttons */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-gray-500 mr-1">Show:</span>
+                    <button
+                      onClick={() => toggleLogFilter("info")}
+                      className={`px-2 py-1 text-xs rounded transition-colors ${
+                        logFilters.info
+                          ? "bg-blue-900/50 text-blue-300 border border-blue-700/50"
+                          : "bg-gray-800 text-gray-500 border border-gray-700"
+                      }`}
+                    >
+                      ℹ️ Info
+                    </button>
+                    <button
+                      onClick={() => toggleLogFilter("success")}
+                      className={`px-2 py-1 text-xs rounded transition-colors ${
+                        logFilters.success
+                          ? "bg-green-900/50 text-green-300 border border-green-700/50"
+                          : "bg-gray-800 text-gray-500 border border-gray-700"
+                      }`}
+                    >
+                      ✅ Success
+                    </button>
+                    <button
+                      onClick={() => toggleLogFilter("warning")}
+                      className={`px-2 py-1 text-xs rounded transition-colors ${
+                        logFilters.warning
+                          ? "bg-yellow-900/50 text-yellow-300 border border-yellow-700/50"
+                          : "bg-gray-800 text-gray-500 border border-gray-700"
+                      }`}
+                    >
+                      ⚠️ Warning
+                    </button>
+                    <button
+                      onClick={() => toggleLogFilter("error")}
+                      className={`px-2 py-1 text-xs rounded transition-colors ${
+                        logFilters.error
+                          ? "bg-red-900/50 text-red-300 border border-red-700/50"
+                          : "bg-gray-800 text-gray-500 border border-gray-700"
+                      }`}
+                    >
+                      ❌ Error
+                    </button>
+                  </div>
+
+                  {/* Auto-refresh toggle */}
+                  <div className="flex items-center gap-2 border-l border-gray-800 pl-3">
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={logAutoRefresh}
+                      aria-label="Auto-refresh console logs"
+                      onClick={toggleLogAutoRefresh}
+                      title={
+                        logAutoRefresh
+                          ? "Pause automatic log refresh"
+                          : "Resume automatic log refresh"
+                      }
+                      className="flex items-center gap-2 px-2 py-1 text-xs rounded border border-gray-700 bg-gray-800 hover:bg-gray-700 transition-colors"
+                    >
+                      <span
+                        className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
+                          logAutoRefresh ? "bg-green-600" : "bg-gray-600"
+                        }`}
+                      >
+                        <span
+                          className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${
+                            logAutoRefresh ? "translate-x-3.5" : "translate-x-0.5"
+                          }`}
+                        />
+                      </span>
+                      <span className={logAutoRefresh ? "text-green-300" : "text-gray-400"}>
+                        Auto-refresh {logAutoRefresh ? "on" : "off"}
+                      </span>
+                    </button>
+                    {!logAutoRefresh && (
+                      <button
+                        type="button"
+                        onClick={refreshLogsNow}
+                        title="Fetch the latest log entries once"
+                        className="px-2 py-1 text-xs rounded border border-blue-700/50 bg-blue-900/40 text-blue-300 hover:bg-blue-900/70 transition-colors"
+                      >
+                        🔄 Refresh now
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
               <div
@@ -3780,8 +3913,22 @@ export default function MacAttackPage() {
                   ))
                 )}
               </div>
-              <div className="px-4 py-2 bg-gray-900 border-t border-gray-800 text-xs text-gray-500">
-                Showing {filteredLogs.length} of {logs.length} log entries
+              <div className="px-4 py-2 bg-gray-900 border-t border-gray-800 text-xs text-gray-500 flex items-center justify-between flex-wrap gap-2">
+                <span>
+                  Showing {filteredLogs.length} of {logs.length} log entries
+                </span>
+                {logAutoRefresh ? (
+                  logsUpdatedAt && (
+                    <span className="text-gray-600">
+                      Live · updated {logsUpdatedAt.toLocaleTimeString()}
+                    </span>
+                  )
+                ) : (
+                  <span className="text-yellow-400/90">
+                    ⏸️ Auto-refresh paused
+                    {logsUpdatedAt ? ` · last update ${logsUpdatedAt.toLocaleTimeString()}` : ""}
+                  </span>
+                )}
               </div>
             </div>
 
@@ -3800,6 +3947,13 @@ export default function MacAttackPage() {
                   <strong className="text-gray-400">Log Filters:</strong>{" "}
                   Use the filter buttons above the console to show/hide different log levels.
                   Click a button to toggle that log type.
+                </p>
+                <p>
+                  <strong className="text-gray-400">Auto-refresh:</strong>{" "}
+                  Toggle <em>Auto-refresh</em> above the console to pause or resume live log
+                  updates — handy for reading back through output while a scan runs. While paused
+                  you can pull the newest entries on demand with <em>Refresh now</em>. The setting
+                  is remembered in your browser.
                 </p>
                 <p>
                   <strong className="text-gray-400">Background Scanning:</strong>{" "}

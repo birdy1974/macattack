@@ -303,6 +303,12 @@ Use the filter buttons to show/hide:
 - ⚠️ Warning messages
 - ❌ Error messages
 
+The **Auto-refresh** switch next to the filters pauses/resumes live console updates while a scan
+runs — handy for reading back through earlier output. Progress, results and job status keep
+polling while it is off; only the log list is frozen. Use **🔄 Refresh now** to pull the latest
+entries once, or flip the switch back on to resume (the newest lines appear immediately). The
+preference is stored in your browser and survives reloads.
+
 ### 6. Download Results
 Export to CSV or TXT when valid MACs are found. JSON exports include the complete portal responses and the detailed quality report; treat these files as sensitive because portal responses can contain credentials.
 
