@@ -1575,25 +1575,10 @@ export async function startScan(jobId: number, skipVerification: boolean = false
           // profile/category requests; it is not media startup time.
           const responseTimeMs = handshakeTimeMs + accountInfoTimeMs;
 
-          // ── Early-expire filter (cheap — no extra HTTP needed) ────────
-          // Extract the expiry from account_info (`phone` first, ignoring
-          // zero-date placeholders). When account_info already provides a
-          // concrete expiry date, we can filter immediately before fetching
-          // profile/categories; if account_info has no expiry date yet, we
-          // re-check after fetchProfile below.
-          const earlyExpiry = extractPortalExpiry(null, accountInfo);
-          if (expireFilter.enabled && earlyExpiry) {
-            const expiryCheck = expiryPassesFilter(expireFilter, earlyExpiry);
-            if (!expiryCheck.pass) {
-              filteredOut += 1;
-              await addLog(
-                jobId,
-                "info",
-                `MAC ${mac} valid but filtered out by expire date (${expiryCheck.reason})`
-              );
-              continue;
-            }
-          }
+          // Do not apply the expiry filter to account_info alone. Its fallback
+          // expiry fields may be superseded by profile.phone when the final
+          // result fields are extracted below. The filter must run only on
+          // that final selected expireDate.
 
           // ── Valid MAC found (account-info-wise) ──────────────────────
           found += 1;

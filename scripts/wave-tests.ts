@@ -8,17 +8,30 @@
  * history maths (EWMA/trend/degradation), ffmpeg stderr parsers, thumbnail-store
  * name safety, Xtream URL parsing, and the score caps (freeze/black/mismatch).
  *
- * ffmpeg itself is absent in CI/sandboxes and never bundled, so the picture
- * path is exercised through captured stderr samples.
+ * The suite requires no real ffmpeg binary or GPU: parsers use captured stderr
+ * and Linux VAAPI retry behavior uses a small fake ffmpeg executable.
  */
 
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { moveItem } from "../src/lib/field-order";
 import { parseMacList, normalizeMac } from "../src/lib/mac-list";
 import { parseProxy, parseProxyList, redactProxy } from "../src/lib/proxy";
 import { detectLabelMismatch, parseLabelClaim } from "../src/lib/label-mismatch";
 import { buildUserAgentCandidates, DEFAULT_USER_AGENTS } from "../src/lib/user-agents";
 import { HostRateLimiter, hostOf, pMapLimit } from "../src/lib/parallel";
 import { computeEwma, computeTrend, detectDegradation, summariseHistory, type ProbeRun } from "../src/lib/quality-history";
-import { parseBlackIntervals, parseFreezeIntervals, parseFfmpegStats } from "../src/lib/ffmpeg-tools";
+import {
+  analyzePicture,
+  captureThumbnail,
+  detectFfmpeg,
+  parseBlackIntervals,
+  parseFreezeIntervals,
+  parseFfmpegStats,
+  parseHardwareAccelerators,
+  resetFfmpegDetection,
+} from "../src/lib/ffmpeg-tools";
 import { deleteThumbnail, readThumbnail, saveThumbnail } from "../src/lib/thumbnail-store";
 import { parseXtreamUrl, xtreamStreamUrl } from "../src/lib/xtream-streams";
 import { detectStreamProtocol, probeStream, scoreStreamProbe, type StreamProbeResult } from "../src/lib/stream-probe";
@@ -48,6 +61,23 @@ function check(name: string, condition: boolean, detail?: string) {
 
 function section(title: string) {
   console.log(`\n${title}`);
+}
+
+// ============================================================================
+// Output field ordering
+// ============================================================================
+section("Output field ordering");
+{
+  const initialOrder = ["macAddress", "expireDate", "quality", "serverLocation"];
+  check(
+    "moves a dragged output field to the target position",
+    moveItem(initialOrder, "serverLocation", "expireDate").join(",") ===
+      "macAddress,serverLocation,expireDate,quality"
+  );
+  check(
+    "does not change field order when the drag source or target is missing",
+    moveItem(initialOrder, "unknown", "expireDate").join(",") === initialOrder.join(",")
+  );
 }
 
 // ============================================================================
@@ -216,6 +246,111 @@ section("ffmpeg output parsers");
   check("takes the last duration", stats.durationSec === 16, String(stats.durationSec));
   check("takes the frame count", stats.frames === 480);
   check("parses a partial stream (no freeze lines)", parseFreezeIntervals("frame=1 fps=25").length === 0);
+}
+
+// ============================================================================
+// 7b. VAAPI DETECTION + SOFTWARE RETRY (no real FFmpeg/GPU needed)
+// ============================================================================
+section("FFmpeg VAAPI detection and software retry");
+{
+  const hwaccels = ["Hardware acceleration methods:", "vaapi", "vdpau", ""].join(String.fromCharCode(13, 10));
+  check(
+    "parses FFmpeg hardware accelerators across CRLF output",
+    parseHardwareAccelerators(hwaccels).join(",") === "vaapi,vdpau"
+  );
+
+  if (process.platform === "linux") {
+    const tempDir = mkdtempSync(join(tmpdir(), "macattack-ffmpeg-test-"));
+    const fakeBinary = join(tempDir, "ffmpeg-mock");
+    const fakeDevice = join(tempDir, "renderD128");
+    const callLog = join(tempDir, "calls.log");
+    const originalEnv = {
+      FFMPEG_PATH: process.env.FFMPEG_PATH,
+      MACATTACK_FFMPEG_DRI_DEVICE: process.env.MACATTACK_FFMPEG_DRI_DEVICE,
+      MACATTACK_FFMPEG_HWACCEL: process.env.MACATTACK_FFMPEG_HWACCEL,
+      MACATTACK_TEST_FFMPEG_LOG: process.env.MACATTACK_TEST_FFMPEG_LOG,
+    };
+
+    try {
+      writeFileSync(
+        fakeBinary,
+        String.raw`#!/bin/sh
+printf '%s\n' "$*" >> "$MACATTACK_TEST_FFMPEG_LOG"
+if [ "$2" = "-version" ]; then
+  printf 'ffmpeg version mock-7.1\n'
+  exit 0
+fi
+if [ "$2" = "-hwaccels" ]; then
+  printf 'Hardware acceleration methods:\nvaapi\n'
+  exit 0
+fi
+case " $* " in
+  *" -hwaccel vaapi "*)
+    printf 'VAAPI device initialization failed\n' >&2
+    exit 1
+    ;;
+esac
+case " $* " in
+  *" -f image2 "*)
+    printf '\377\330mock-jpeg'
+    exit 0
+    ;;
+esac
+printf 'frame=   90 fps= 30 q=-0.0 size=N/A time=00:00:03.00 bitrate=N/A\n' >&2
+exit 0
+`
+      );
+      chmodSync(fakeBinary, 0o755);
+      writeFileSync(fakeDevice, "device stub");
+      process.env.FFMPEG_PATH = fakeBinary;
+      process.env.MACATTACK_FFMPEG_DRI_DEVICE = fakeDevice;
+      process.env.MACATTACK_FFMPEG_HWACCEL = "auto";
+      process.env.MACATTACK_TEST_FFMPEG_LOG = callLog;
+      resetFfmpegDetection();
+
+      const availability = await detectFfmpeg();
+      check(
+        "detects VAAPI only when the binary and an accessible device are present",
+        availability.available && availability.hardwareAcceleration === "vaapi" && availability.hardwareDevice === fakeDevice
+      );
+
+      const analysis = await analyzePicture("https://mock.example/live.ts", { seconds: 3, timeoutMs: 2000 });
+      check("retries failed VAAPI decoding in software", analysis.analyzed && analysis.tool.includes("software fallback"));
+      const decodeCalls = readFileSync(callLog, "utf8")
+        .trim()
+        .split(/\r?\n/)
+        .filter((line) => line.includes("https://mock.example/live.ts"));
+      check(
+        "software retry drops the VAAPI arguments",
+        decodeCalls.length === 2 && decodeCalls[0].includes("-hwaccel vaapi") && !decodeCalls[1].includes("-hwaccel vaapi")
+      );
+
+      const thumbnail = await captureThumbnail("https://mock.example/live.ts", { timeoutMs: 2000 });
+      check(
+        "thumbnail capture retries failed VAAPI decoding and returns JPEG",
+        thumbnail.ok && thumbnail.jpeg?.[0] === 0xff && thumbnail.jpeg?.[1] === 0xd8
+      );
+      const thumbnailCalls = readFileSync(callLog, "utf8")
+        .trim()
+        .split(/\r?\n/)
+        .filter((line) => line.includes("https://mock.example/live.ts") && line.includes("-frames:v 1"));
+      check(
+        "thumbnail software retry drops the VAAPI arguments",
+        thumbnailCalls.length === 2 && thumbnailCalls[0].includes("-hwaccel vaapi") && !thumbnailCalls[1].includes("-hwaccel vaapi")
+      );
+    } catch (error) {
+      check("runs the fake FFmpeg hardware-fallback probe", false, error instanceof Error ? error.message : String(error));
+    } finally {
+      resetFfmpegDetection();
+      for (const [key, value] of Object.entries(originalEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  } else {
+    check("skips the Linux-only fake FFmpeg process test", true);
+  }
 }
 
 // ============================================================================
@@ -401,6 +536,27 @@ section("Stalker expire date extraction (from `phone` field)");
       { expire_billing_date: "2021-01-01 00:00:00" },
       { phone: "2027-12-31" }
     ) === "2027-12-31"
+  );
+
+  // Account-only expiry aliases are provisional: the final value may come
+  // from profile.phone, which has higher precedence than those aliases.
+  const accountWithOldExpiryAlias = { expire_billing_date: "2026-01-01" };
+  const profileWithFinalPhoneExpiry = { phone: "2027-08-19" };
+  const cutoffForFinalExpiry = {
+    enabled: true,
+    minDate: "2027-01-01",
+    includeUnlimited: false,
+  };
+  const provisionalAccountExpiry = extractPortalExpiry(null, accountWithOldExpiryAlias);
+  const finalProfileExpiry = extractPortalFields(
+    profileWithFinalPhoneExpiry,
+    accountWithOldExpiryAlias
+  ).expireDate;
+  check(
+    "account-only fallback is before cutoff but final profile.phone expiry is after it",
+    !expiryPassesFilter(cutoffForFinalExpiry, provisionalAccountExpiry).pass &&
+      finalProfileExpiry === "2027-08-19" &&
+      expiryPassesFilter(cutoffForFinalExpiry, finalProfileExpiry).pass
   );
 
   // When `phone` is absent/empty and `end_date` is "0000-00-00", a real

@@ -3,11 +3,9 @@ import { detectFfmpeg } from "@/lib/ffmpeg-tools";
 import { thumbnailStoreInfo } from "@/lib/thumbnail-store";
 
 /**
- * Capability report for the dashboard.
- *
- * Everything optional is detected at runtime, never bundled: the NAS/Pi image
- * must keep working when ffmpeg is absent, so the UI shows what is available
- * and labels the rest "not available on this host" instead of failing.
+ * Capability report for the dashboard. FFmpeg is included in the published
+ * multi-architecture image. VAAPI remains optional and is only reported when
+ * FFmpeg supports it and a Linux DRI device is accessible to this process.
  */
 export async function GET() {
   try {
@@ -19,6 +17,8 @@ export async function GET() {
         reason: ffmpeg.reason,
         path: ffmpeg.path,
         envOverride: "FFMPEG_PATH",
+        hardwareAcceleration: ffmpeg.hardwareAcceleration,
+        hardwareDevice: ffmpeg.hardwareDevice,
       },
       thumbnails: await thumbnailStoreInfo(),
       features: {

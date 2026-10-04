@@ -36,9 +36,10 @@ a **multi-platform image**:
   vs. required bitrate, resolution/codec/DRM, HLS segment pacing (can the link
   keep up with real time?), MPEG-TS continuity errors, and a
   speed / picture / stability score with a verdict.
-* **Optional picture pack (ffmpeg, detected — never bundled)** — freeze and
-  blackdetect, fps/bitrate profiling, and one thumbnail per measured channel.
-  Without ffmpeg everything else still works and the UI says so.
+* **Picture checks with bundled FFmpeg** — freeze/black detection, decoded
+  FPS/bitrate profiling, and thumbnails work out of the box on both architectures.
+  On the DS918+, optional Intel VAAPI decoding is attempted when `/dev/dri` is
+  mapped; unsupported hardware/codecs fall back to software automatically.
 * **Trust over time** — every measurement is stored as a probe run; results show
   an EWMA score, an improving/stable/degrading trend, a sparkline and alerts.
 * **Paste work, not click work** — bulk MAC lists, extra portals for a
@@ -50,27 +51,29 @@ a **multi-platform image**:
   per-portal memory, **monitoring + alerts**, **stable revocable M3U
   subscription URLs**, and **Xtream Codes** accounts alongside Stalker.
 
-Everything optional is runtime-detected or explicitly configured; the NAS/Pi
-image needs no extra packages. See
-[`docs/wave-implementation.md`](docs/wave-implementation.md) for the full item
-list, tests and remaining limits.
+The published NAS/Pi image includes FFmpeg; optional hardware acceleration is
+runtime-detected and never required. See
+[`docs/wave-implementation.md`](docs/wave-implementation.md) for the shipped
+feature list, tests and remaining limits.
 
 ---
 
 ## 🚀 Installation on Synology NAS (no compilation!)
 
-All you need on the NAS is the **docker-compose.yml** file (and optionally
-**update.sh**). No source code, no Node.js, no build tools.
+For a standard install, copy **docker-compose.yml** (and optionally
+**update.sh**). To enable optional Intel VAAPI decoding, also copy
+**docker-compose.vaapi.yml**. No source code, Node.js or build tools are needed.
 
 ### Step 1: Copy the compose file to the NAS
 
 ```bash
 # From your computer (adjust path/IP):
 scp docker-compose.yml update.sh admin@<NAS-IP>:/volume1/docker/mac-attack/
+# Optional, only for VAAPI: also copy docker-compose.vaapi.yml to the same directory
 ```
 
-Or upload the two files with **Synology File Station** to
-`/volume1/docker/mac-attack/`.
+Or upload the base files with **Synology File Station** to
+`/volume1/docker/mac-attack/` (plus `docker-compose.vaapi.yml` if enabling VAAPI).
 
 ### Step 2: Start the stack
 
@@ -91,6 +94,26 @@ local build.
 ```
 http://<YOUR-NAS-IP>:3099
 ```
+
+### Optional: enable Intel VAAPI decoding on the DS918+
+
+The default compose file needs no GPU device and uses software decode. If DSM
+exposes the Intel render node, map it with the optional override so FFmpeg can
+try hardware decoding (the app automatically retries in software on failure):
+
+```bash
+# Check the device and its group on the NAS first:
+ls -l /dev/dri/renderD128
+stat -c '%g' /dev/dri/renderD128
+
+# Copy docker-compose.vaapi.yml to this directory, then use the numeric group ID:
+export RENDER_GID="$(stat -c '%g' /dev/dri/renderD128)"
+docker compose -f docker-compose.yml -f docker-compose.vaapi.yml up -d
+```
+
+This is optional and only applies to the amd64 DS918+ image. If DSM does not
+expose `/dev/dri/renderD128`, keep using the base compose file; software FFmpeg
+continues to provide picture analysis.
 
 > The repository is public, so the image can be pulled anonymously.
 > If the repository (or GHCR package) is ever made private, log in first:
@@ -316,9 +339,10 @@ lives in [`docs/iptv-tool-landscape.md`](docs/iptv-tool-landscape.md).
 ### 8a. Optional add-ons (Advanced panel)
 Open **🧰 Advanced** in the header:
 
-* **Host capabilities** — whether ffmpeg is available (and where), plus the
-  thumbnail cache location and age. Install ffmpeg in the container/host (or set
-  `FFMPEG_PATH`) to enable picture checks; it is never bundled.
+* **Host capabilities** — FFmpeg availability, detected VAAPI device, and the
+  thumbnail cache location/age. The published Docker image bundles FFmpeg;
+  local source runs can install it or set `FFMPEG_PATH`. On the DS918+, use the
+  optional `docker-compose.vaapi.yml` overlay to pass through `/dev/dri`.
 * **User-agent candidates** — the rotation list tried when a portal refuses the
   default MAG user agent. The first working one is remembered per portal host.
 * **Proxy pool** — `host:port` or `user:pass@host:port`, up to 50 entries, used
@@ -365,7 +389,9 @@ npm run test:waves      # pure logic (no server needed)
 
 | Variable | Effect |
 |---|---|
-| `FFMPEG_PATH` | Path to `ffmpeg` when it is not on `PATH` (enables picture checks/thumbnails) |
+| `FFMPEG_PATH` | Path to `ffmpeg` when it is not on `PATH` (enables picture checks/thumbnails; bundled Docker images already include it) |
+| `MACATTACK_FFMPEG_HWACCEL` | `auto` (default) or `vaapi` to attempt VAAPI when supported/device-accessible; set `none` to force software decoding |
+| `MACATTACK_FFMPEG_DRI_DEVICE` | Optional Linux DRI render-device path (default detection tries `/dev/dri/renderD128`, then `/dev/dri/card0`) |
 | `MACATTACK_DATA_DIR` | Base directory for the thumbnail cache — files land in `<dir>/thumbnails` (default `./data`, pruned after 14 days; the bundled compose file mounts a volume at `/app/data` so they survive updates) |
 | `MACATTACK_STB_USER_AGENT` | Overrides the default MAG user agent |
 | `MACATTACK_ALLOW_LOCAL_STREAMS=1` | Test escape hatch: allow loopback stream URLs (used by the fixture suites) |
@@ -466,7 +492,7 @@ Next.js server — give it a few seconds on first boot.
 │       ├── user-agents.ts     # UA rotation candidates + per-host memory
 │       ├── parallel.ts        # capped concurrency + per-host rate limiter
 │       ├── label-mismatch.ts  # "4K" label vs. measured reality
-│       ├── ffmpeg-tools.ts    # optional ffmpeg: freeze/black/fps/thumbnails
+│       ├── ffmpeg-tools.ts    # FFmpeg analysis, VAAPI attempt + software fallback
 │       ├── thumbnail-store.ts # on-disk thumbnail cache (self-pruning)
 │       ├── quality-history.ts # EWMA / trend / degradation maths
 │       ├── xtream-streams.ts  # Xtream Codes API client
@@ -484,7 +510,7 @@ Next.js server — give it a few seconds on first boot.
 │   ├── probe-tests.ts         # probe engine (48 checks)
 │   ├── mac-quality-tests.ts   # Stalker quality pipeline (29 checks)
 │   ├── xtream-tests.ts        # Xtream API path (24 checks)
-│   └── wave-tests.ts          # pure logic: lists, proxies, history, parsers (74 checks)
+│   └── wave-tests.ts          # pure logic + mocked VAAPI picture/thumbnail fallback (105 checks)
 └── initial/               # Reference copy of the original local-build version
 ```
 

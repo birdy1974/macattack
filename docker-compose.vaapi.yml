@@ -1,0 +1,22 @@
+# Optional Intel VAAPI overlay for a Synology DS918+ (amd64 only).
+#
+# Use only when the host exposes /dev/dri/renderD128. Find its numeric group
+# ID with `stat -c '%g' /dev/dri/renderD128`, export RENDER_GID to that value,
+# then start with both files:
+#   RENDER_GID=<host-device-gid> docker compose \
+#     -f docker-compose.yml -f docker-compose.vaapi.yml up -d
+#
+# If the device/driver/codec is unavailable, MacAttack retries the operation
+# with software FFmpeg. The base compose file needs no GPU device and also
+# serves Raspberry Pi installations.
+services:
+  app:
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    group_add:
+      # Override with the host's renderD128 group ID if it differs from 44.
+      - "${RENDER_GID:-44}"
+    environment:
+      MACATTACK_FFMPEG_HWACCEL: auto
+      MACATTACK_FFMPEG_DRI_DEVICE: /dev/dri/renderD128
+      LIBVA_DRIVER_NAME: iHD
