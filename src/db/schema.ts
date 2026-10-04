@@ -120,6 +120,12 @@ export const scanResults = pgTable("scan_results", {
   password: text("password"),
   playlistGenres: text("playlist_genres"),
   vodCategories: text("vod_categories"),
+  // Number of category/genre entries the portal returned for this MAC
+  // (null when the list could not be retrieved at all, 0 when the portal
+  // answered but returned no entries). Exported as result fields.
+  itvGenreCount: integer("itv_genre_count"),
+  vodCategoryCount: integer("vod_category_count"),
+  seriesCategoryCount: integer("series_category_count"),
   /** "stalker" or "xtream" — how this result was produced. */
   protocol: text("protocol").notNull().default("stalker"),
 

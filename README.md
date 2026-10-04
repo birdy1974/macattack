@@ -279,7 +279,17 @@ http://example.com:8080/stalker_portal/c/
 Enable "Skip portal verification" if auto-detection fails.
 
 ### 3. Configure Output Fields
-Select which data fields to include in results.
+Select which data fields to include in results. Among them are three **per-MAC category totals**
+recorded for every saved result:
+
+- **ITV Genres Retrieved (count)** — live TV genres the portal returned (`get_genres`, `type=itv`).
+- **VOD Categories Retrieved (count)** — movie/VOD categories (`get_categories`, `type=vod`).
+- **Series Categories Retrieved (count)** — series/shows categories (`get_categories`, `type=series`).
+
+All three category lists are fetched for every valid MAC so the counts are always available; the
+reported number is the number of entries the portal answered with (`0` when the portal answered
+but returned nothing, empty when the list could not be retrieved). They appear in the results
+table, in CSV/TXT exports and in the JSON export, and can be toggled like any other field.
 
 ### 4. Start Scan
 Click **🚀 Start Scan** and watch the console log.

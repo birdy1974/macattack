@@ -108,6 +108,9 @@ async function createSchema() {
     "  password TEXT," +
     "  playlist_genres TEXT," +
     "  vod_categories TEXT," +
+    "  itv_genre_count INTEGER," +
+    "  vod_category_count INTEGER," +
+    "  series_category_count INTEGER," +
     "  raw_data JSONB," +
     "  found_at TIMESTAMP DEFAULT NOW() NOT NULL" +
     ");" +
@@ -208,6 +211,9 @@ async function createSchema() {
       "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_trend TEXT",
       "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_genre_summary JSONB",
       "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS protocol TEXT NOT NULL DEFAULT 'stalker'",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS itv_genre_count INTEGER",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS vod_category_count INTEGER",
+      "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS series_category_count INTEGER",
     ];
     var tableDdl = [
       "CREATE TABLE IF NOT EXISTS quality_probe_runs (" +

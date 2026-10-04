@@ -117,6 +117,9 @@ interface ScanResult {
   password: string | null;
   playlistGenres: string | null;
   vodCategories: string | null;
+  itvGenreCount: number | null;
+  vodCategoryCount: number | null;
+  seriesCategoryCount: number | null;
   createdAt: string | null;
   foundAt: string;
 }
@@ -229,6 +232,9 @@ const AVAILABLE_FIELDS = [
   { key: "password", label: "Password", default: true },
   { key: "playlistGenres", label: "Playlist/Genres", default: false },
   { key: "vodCategories", label: "VOD Categories", default: false },
+  { key: "itvGenreCount", label: "ITV Genres Retrieved (count)", default: true },
+  { key: "vodCategoryCount", label: "VOD Categories Retrieved (count)", default: true },
+  { key: "seriesCategoryCount", label: "Series Categories Retrieved (count)", default: true },
   { key: "createdAt", label: "Created At", default: true },
 ];
 

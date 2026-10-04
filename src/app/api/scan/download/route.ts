@@ -128,6 +128,9 @@ export async function GET(request: NextRequest) {
       password: "Password",
       playlistGenres: "Playlist/Genres",
       vodCategories: "VOD Categories",
+      itvGenreCount: "ITV Genres Retrieved (count)",
+      vodCategoryCount: "VOD Categories Retrieved (count)",
+      seriesCategoryCount: "Series Categories Retrieved (count)",
     };
     const selectedFields = [
       ...new Set(
@@ -311,6 +314,18 @@ export async function GET(request: NextRequest) {
           return result.playlistGenres || "";
         case "vodCategories":
           return result.vodCategories || "";
+        case "itvGenreCount":
+          return result.itvGenreCount !== null && result.itvGenreCount !== undefined
+            ? String(result.itvGenreCount)
+            : "";
+        case "vodCategoryCount":
+          return result.vodCategoryCount !== null && result.vodCategoryCount !== undefined
+            ? String(result.vodCategoryCount)
+            : "";
+        case "seriesCategoryCount":
+          return result.seriesCategoryCount !== null && result.seriesCategoryCount !== undefined
+            ? String(result.seriesCategoryCount)
+            : "";
         default:
           return "";
       }
