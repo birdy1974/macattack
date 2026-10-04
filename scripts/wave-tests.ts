@@ -14,7 +14,7 @@
 
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { moveItem } from "../src/lib/field-order";
 import { parseMacList, normalizeMac } from "../src/lib/mac-list";
 import { parseProxy, parseProxyList, redactProxy } from "../src/lib/proxy";
@@ -25,14 +25,16 @@ import { computeEwma, computeTrend, detectDegradation, summariseHistory, type Pr
 import {
   analyzePicture,
   captureThumbnail,
+  describeAllFailures,
   detectFfmpeg,
+  ffmpegCandidates,
   parseBlackIntervals,
   parseFreezeIntervals,
   parseFfmpegStats,
   parseHardwareAccelerators,
   resetFfmpegDetection,
 } from "../src/lib/ffmpeg-tools";
-import { deleteThumbnail, readThumbnail, saveThumbnail } from "../src/lib/thumbnail-store";
+import { deleteThumbnail, readThumbnail, saveThumbnail, thumbnailStoreInfo } from "../src/lib/thumbnail-store";
 import { parseXtreamUrl, xtreamStreamUrl } from "../src/lib/xtream-streams";
 import { detectStreamProtocol, probeStream, scoreStreamProbe, type StreamProbeResult } from "../src/lib/stream-probe";
 import {
@@ -354,6 +356,112 @@ exit 0
 }
 
 // ============================================================================
+// 7c. FFMPEG CANDIDATE FALLBACK (a wrong FFMPEG_PATH must not mask PATH)
+// ============================================================================
+section("FFmpeg candidate fallback");
+{
+  const originalFfmpegPath = process.env.FFMPEG_PATH;
+  try {
+    delete process.env.FFMPEG_PATH;
+    check(
+      "falls back to PATH and absolute locations when FFMPEG_PATH is unset",
+      ffmpegCandidates().join(",") === "ffmpeg,/usr/bin/ffmpeg,/usr/local/bin/ffmpeg"
+    );
+
+    process.env.FFMPEG_PATH = "/custom/ffmpeg";
+    check(
+      "tries an explicit FFMPEG_PATH first",
+      ffmpegCandidates()[0] === "/custom/ffmpeg" && ffmpegCandidates().includes("ffmpeg")
+    );
+
+    process.env.FFMPEG_PATH = "ffmpeg";
+    check(
+      "de-duplicates an override that equals a fallback",
+      ffmpegCandidates().filter((candidate) => candidate === "ffmpeg").length === 1
+    );
+
+    // Pure failure strings: the dashboard shows these, so they must name the
+    // override, every tried path, and the fix for each environment.
+    process.env.FFMPEG_PATH = "/nonexistent/ffmpeg-xyz";
+    const localReason = describeAllFailures(
+      [
+        { binary: "/nonexistent/ffmpeg-xyz", code: "ENOENT", message: "spawn ENOENT" },
+        { binary: "ffmpeg", code: "ENOENT", message: "spawn ENOENT" },
+      ],
+      false
+    );
+    check("failure reason names a wrong FFMPEG_PATH", localReason.includes("/nonexistent/ffmpeg-xyz"));
+    check("failure reason lists every tried path", localReason.includes('"ffmpeg"'));
+    check("local failure reason suggests a fix", /install|re-check/i.test(localReason));
+    const containerReason = describeAllFailures(
+      [
+        { binary: "/nonexistent/ffmpeg-xyz", code: "ENOENT", message: "spawn ENOENT" },
+        { binary: "ffmpeg", code: "ENOENT", message: "spawn ENOENT" },
+      ],
+      true
+    );
+    check("container failure reason points at the older image", /older image|update\.sh/i.test(containerReason));
+  } finally {
+    if (originalFfmpegPath === undefined) delete process.env.FFMPEG_PATH;
+    else process.env.FFMPEG_PATH = originalFfmpegPath;
+  }
+
+  // A stale FFMPEG_PATH plus a working `ffmpeg` on PATH must still detect.
+  if (process.platform !== "win32") {
+    const tempDir = mkdtempSync(join(tmpdir(), "macattack-ffmpeg-fallback-"));
+    const originalEnv = {
+      FFMPEG_PATH: process.env.FFMPEG_PATH,
+      PATH: process.env.PATH,
+      MACATTACK_FFMPEG_HWACCEL: process.env.MACATTACK_FFMPEG_HWACCEL,
+    };
+    try {
+      writeFileSync(
+        join(tempDir, "ffmpeg"),
+        String.raw`#!/bin/sh
+if [ "$2" = "-version" ]; then
+  printf 'ffmpeg version mock-fallback-1.0\n'
+  exit 0
+fi
+if [ "$2" = "-hwaccels" ]; then
+  printf 'Hardware acceleration methods:\nvdpau\n'
+  exit 0
+fi
+exit 1
+`
+      );
+      chmodSync(join(tempDir, "ffmpeg"), 0o755);
+      process.env.PATH = `${tempDir}${delimiter}${process.env.PATH || ""}`;
+      process.env.FFMPEG_PATH = join(tempDir, "definitely-not-here-ffmpeg");
+      process.env.MACATTACK_FFMPEG_HWACCEL = "none";
+      resetFfmpegDetection();
+
+      const availability = await detectFfmpeg();
+      check(
+        "detection falls through a wrong FFMPEG_PATH to PATH",
+        availability.available && availability.path === "ffmpeg",
+        `available=${availability.available} path=${availability.path}`
+      );
+      check("successful detection keeps the version", availability.version === "mock-fallback-1.0");
+      check(
+        "successful detection records every tried path",
+        availability.triedPaths[0] === process.env.FFMPEG_PATH && availability.triedPaths.includes("ffmpeg")
+      );
+    } catch (error) {
+      check("falls back to PATH when FFMPEG_PATH is wrong", false, error instanceof Error ? error.message : String(error));
+    } finally {
+      resetFfmpegDetection();
+      for (const [key, value] of Object.entries(originalEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  } else {
+    check("skips the PATH-fallback probe on Windows", true);
+  }
+}
+
+// ============================================================================
 // 8. SCORE CAPS (Wave 2)
 // ============================================================================
 section("Score caps for hard evidence");
@@ -454,6 +562,8 @@ section("Thumbnail store");
   }
   check("rejects path traversal", (await readThumbnail("../../etc/passwd")) === null);
   check("rejects unknown files", (await readThumbnail("definitely-not-here.jpg")) === null);
+  const storeInfo = await thumbnailStoreInfo();
+  check("store info reports writability", typeof storeInfo.writable === "boolean");
   if (saved) await deleteThumbnail(saved);
 }
 

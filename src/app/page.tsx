@@ -426,11 +426,16 @@ export default function MacAttackPage() {
       available: boolean;
       version: string | null;
       reason: string | null;
+      path: string | null;
+      triedPaths?: string[];
+      envOverrideSet?: boolean;
       hardwareAcceleration: "vaapi" | null;
       hardwareDevice: string | null;
+      checkedAt?: string;
     };
-    thumbnails: { dir: string; fileCount: number | null; maxAgeDays: number };
+    thumbnails: { dir: string; fileCount: number | null; maxAgeDays: number; writable?: boolean };
   } | null>(null);
+  const [systemRefreshing, setSystemRefreshing] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [uaList, setUaList] = useState("");
   const [proxyList, setProxyList] = useState("");
@@ -1332,15 +1337,48 @@ export default function MacAttackPage() {
             available: boolean;
             version: string | null;
             reason: string | null;
+            path: string | null;
+            triedPaths?: string[];
+            envOverrideSet?: boolean;
             hardwareAcceleration: "vaapi" | null;
             hardwareDevice: string | null;
+            checkedAt?: string;
           };
-          thumbnails: { dir: string; fileCount: number | null; maxAgeDays: number };
+          thumbnails: { dir: string; fileCount: number | null; maxAgeDays: number; writable?: boolean };
         };
         setSystemInfo(data);
       }
     } catch {
       // ignore
+    }
+  }, []);
+
+  /** Re-run FFmpeg/thumbnail detection without restarting the container. */
+  const refreshSystemInfo = useCallback(async () => {
+    setSystemRefreshing(true);
+    try {
+      const systemRes = await fetch("/api/system?refresh=1");
+      if (systemRes.ok) {
+        const data = (await systemRes.json()) as {
+          ffmpeg: {
+            available: boolean;
+            version: string | null;
+            reason: string | null;
+            path: string | null;
+            triedPaths?: string[];
+            envOverrideSet?: boolean;
+            hardwareAcceleration: "vaapi" | null;
+            hardwareDevice: string | null;
+            checkedAt?: string;
+          };
+          thumbnails: { dir: string; fileCount: number | null; maxAgeDays: number; writable?: boolean };
+        };
+        setSystemInfo(data);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setSystemRefreshing(false);
     }
   }, []);
 
@@ -1772,17 +1810,35 @@ export default function MacAttackPage() {
 
             {/* Capabilities */}
             <div className="rounded-lg border border-gray-800 bg-gray-950/40 p-4">
-              <p className="text-sm font-semibold text-gray-300 mb-2">Host capabilities</p>
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-sm font-semibold text-gray-300">Host capabilities</p>
+                <button
+                  onClick={() => void refreshSystemInfo()}
+                  disabled={systemRefreshing}
+                  className="px-2 py-1 text-xs bg-gray-800 hover:bg-gray-700 disabled:opacity-50 border border-gray-700 rounded text-gray-200"
+                  title="Re-run FFmpeg detection (also clears the cached result after pulling a new image or fixing FFMPEG_PATH)"
+                >
+                  {systemRefreshing ? "Checking…" : "↻ Re-check"}
+                </button>
+              </div>
               {systemInfo ? (
                 <div className="space-y-1 text-xs text-gray-400">
                   <p>
                     <span className="text-gray-500">ffmpeg:</span>{" "}
                     {systemInfo.ffmpeg.available ? (
-                      <span className="text-green-300">available ({systemInfo.ffmpeg.version || "version unknown"})</span>
+                      <span className="text-green-300">
+                        available ({systemInfo.ffmpeg.version || "version unknown"}
+                        {systemInfo.ffmpeg.path ? ` · ${systemInfo.ffmpeg.path}` : ""})
+                      </span>
                     ) : (
                       <span className="text-yellow-300">not found — picture checks/thumbnails are unavailable</span>
                     )}
                   </p>
+                  {!systemInfo.ffmpeg.available && systemInfo.ffmpeg.reason && (
+                    <p className="rounded border border-yellow-900/70 bg-yellow-950/20 p-2 text-yellow-200/90 break-words">
+                      {systemInfo.ffmpeg.reason}
+                    </p>
+                  )}
                   <p>
                     <span className="text-gray-500">Video decode:</span>{" "}
                     {!systemInfo.ffmpeg.available ? (
@@ -1798,12 +1854,17 @@ export default function MacAttackPage() {
                   <p className="text-gray-500">
                     The Docker image includes FFmpeg. When enabled, VAAPI is attempted only if supported and an Intel DRI
                     device is accessible; failed hardware decoding retries in software. For local runs, install ffmpeg or set{" "}
-                    <code>FFMPEG_PATH</code>.
+                    <code>FFMPEG_PATH</code> (leave it unset inside Docker — the bundled binary is found on PATH).
                   </p>
                   <p>
                     <span className="text-gray-500">Thumbnails:</span>{" "}
                     {systemInfo.thumbnails.fileCount ?? 0} file(s) in <code>{systemInfo.thumbnails.dir}</code> (kept{" "}
                     {systemInfo.thumbnails.maxAgeDays} days)
+                    {systemInfo.thumbnails.writable === false && (
+                      <span className="text-yellow-300">
+                        {" "}— directory is not writable by the app user (uid 1001); check the volume permissions.
+                      </span>
+                    )}
                   </p>
                 </div>
               ) : (

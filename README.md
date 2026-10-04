@@ -355,8 +355,10 @@ lives in [`docs/iptv-tool-landscape.md`](docs/iptv-tool-landscape.md).
 ### 8a. Optional add-ons (Advanced panel)
 Open **🧰 Advanced** in the header:
 
-* **Host capabilities** — FFmpeg availability, detected VAAPI device, and the
-  thumbnail cache location/age. The published Docker image bundles FFmpeg;
+* **Host capabilities** — FFmpeg availability (with the exact failure reason and
+  every path tried when missing), detected VAAPI device, and the thumbnail
+  cache location/age/writability, plus a **↻ Re-check** button that re-runs
+  detection without a restart. The published Docker image bundles FFmpeg;
   local source runs can install it or set `FFMPEG_PATH`. On the DS918+, use the
   optional `docker-compose.vaapi.yml` overlay to pass through `/dev/dri`.
 * **User-agent candidates** — the rotation list tried when a portal refuses the
@@ -405,7 +407,7 @@ npm run test:waves      # pure logic (no server needed)
 
 | Variable | Effect |
 |---|---|
-| `FFMPEG_PATH` | Path to `ffmpeg` when it is not on `PATH` (enables picture checks/thumbnails; bundled Docker images already include it) |
+| `FFMPEG_PATH` | Path to `ffmpeg` when it is not on `PATH` (local source runs only — leave unset in Docker, where the bundled binary is found on PATH; detection still falls back to PATH if the override is wrong) |
 | `MACATTACK_FFMPEG_HWACCEL` | `auto` (default) or `vaapi` to attempt VAAPI when supported/device-accessible; set `none` to force software decoding |
 | `MACATTACK_FFMPEG_DRI_DEVICE` | Optional Linux DRI render-device path (default detection tries `/dev/dri/renderD128`, then `/dev/dri/card0`) |
 | `MACATTACK_DATA_DIR` | Base directory for the thumbnail cache — files land in `<dir>/thumbnails` (default `./data`, pruned after 14 days; the bundled compose file mounts a volume at `/app/data` so they survive updates) |
@@ -480,6 +482,35 @@ docker compose logs -f app
 The container waits for PostgreSQL, applies the schema, then starts the
 Next.js server — give it a few seconds on first boot.
 
+### Host capabilities says "ffmpeg: not found"
+The panel now shows the exact reason plus every path that was tried. The usual
+causes, in order:
+
+1. **Old image.** FFmpeg is bundled in current images — if the container was
+   created before that, pull the latest one and recreate it:
+   `docker compose pull app && docker compose up -d` (or `./update.sh`).
+2. **Wrong `FFMPEG_PATH` override.** Inside Docker the variable must be unset
+   (the app finds `/usr/bin/ffmpeg` on PATH by itself). A custom compose file
+   that sets `FFMPEG_PATH` to a host path breaks detection — remove the line
+   and recreate the container.
+3. **Stale reading.** Detection is cached per process. After fixing 1–2, press
+   **↻ Re-check** in the Host capabilities panel instead of restarting.
+
+Verify from the host at any time:
+
+```bash
+docker exec mac-attack ffmpeg -hide_banner -version | head -n 1
+docker exec mac-attack printenv FFMPEG_PATH   # should print nothing in Docker
+docker compose logs app | grep -i ffmpeg
+```
+
+### Thumbnails stay at 0 files
+The panel reports `not writable` when the app user (uid 1001) cannot write to
+the mounted directory. A Docker-managed volume (the default
+`mac-attack-data:/app/data` in `docker-compose.yml`) starts writable; a host
+bind mount must be writable by uid 1001, e.g.
+`chown -R 1001:1001 /volume1/docker/mac-attack/data` on the NAS.
+
 ---
 
 ## 📁 Repository Layout
@@ -526,7 +557,7 @@ Next.js server — give it a few seconds on first boot.
 │   ├── probe-tests.ts         # probe engine (48 checks)
 │   ├── mac-quality-tests.ts   # Stalker quality pipeline (29 checks)
 │   ├── xtream-tests.ts        # Xtream API path (24 checks)
-│   └── wave-tests.ts          # pure logic + mocked VAAPI picture/thumbnail fallback (105 checks)
+│   └── wave-tests.ts          # pure logic + mocked VAAPI picture/thumbnail fallback (116 checks)
 └── initial/               # Reference copy of the original local-build version
 ```
 

@@ -5,7 +5,9 @@
  *
  * The published Docker image includes FFmpeg so picture checks work without
  * installing anything on the NAS/Pi. Local source runs still detect FFmpeg at
- * runtime (PATH or FFMPEG_PATH). If a Linux Intel VAAPI device is passed into
+ * runtime. Detection tries FFMPEG_PATH first (when set) and then falls back to
+ * `ffmpeg` on PATH plus the usual absolute locations, so a stale override
+ * cannot mask a working binary. If a Linux Intel VAAPI device is passed into
  * the container, decode is attempted in hardware and transparently retried in
  * software if the device or codec cannot be used.
  *
@@ -27,12 +29,36 @@ export interface FfmpegAvailability {
   hardwareAcceleration: "vaapi" | null;
   hardwareDevice: string | null;
   checkedAt: string;
+  /** Every binary location that was tried, in order (first = FFMPEG_PATH when set). */
+  triedPaths: string[];
+}
+
+export interface DetectionAttemptFailure {
+  binary: string;
+  code?: string | number | null;
+  message: string;
 }
 
 const availabilityCache = { value: null as FfmpegAvailability | null };
 
+/**
+ * Ordered FFmpeg locations to try. An explicit FFMPEG_PATH wins when it works,
+ * but a stale/wrong override no longer masks a working FFmpeg on PATH: the
+ * bundled Docker image ships `ffmpeg` on PATH, so detection falls through to
+ * it (plus the usual absolute locations) before giving up.
+ */
+export function ffmpegCandidates(): string[] {
+  const list: string[] = [];
+  const configured = process.env.FFMPEG_PATH?.trim();
+  if (configured) list.push(configured);
+  for (const fallback of ["ffmpeg", "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"]) {
+    if (!list.includes(fallback)) list.push(fallback);
+  }
+  return list;
+}
+
 function ffmpegCandidate(): string {
-  return process.env.FFMPEG_PATH || "ffmpeg";
+  return ffmpegCandidates()[0];
 }
 
 function accessibleVaapiDevice(): Promise<string | null> {
@@ -75,7 +101,7 @@ export function parseHardwareAccelerators(output: string): string[] {
 }
 
 /** True when running inside a container (Docker/Podman/k8s). */
-function runningInContainer(): boolean {
+export function runningInContainer(): boolean {
   return (
     existsSync("/.dockerenv") ||
     existsSync("/run/.containerenv") ||
@@ -83,15 +109,15 @@ function runningInContainer(): boolean {
   );
 }
 
-/** Explain *why* FFmpeg could not be started, with an actionable fix. */
+/** Explain *why* one FFmpeg binary could not be started, with an actionable fix. */
 export function describeDetectionFailure(
   binary: string,
   error: { code?: string | number | null; message: string },
   inContainer: boolean = runningInContainer()
 ): string {
-  const configured = Boolean(process.env.FFMPEG_PATH);
+  const configured = process.env.FFMPEG_PATH?.trim();
   if (error.code === "ENOENT") {
-    if (configured) {
+    if (configured && binary === configured) {
       return `FFMPEG_PATH is set to "${binary}" but no such executable exists.`;
     }
     return inContainer
@@ -104,46 +130,142 @@ export function describeDetectionFailure(
   return `"${binary}" was found but failed to run: ${error.message}`;
 }
 
-/** Detect FFmpeg and a usable VAAPI candidate once per process. */
-export async function detectFfmpeg(force = false): Promise<FfmpegAvailability> {
-  if (availabilityCache.value && !force) return availabilityCache.value;
+/**
+ * Explain why *all* FFmpeg candidates failed. Always names what was tried so a
+ * wrong FFMPEG_PATH override is visible instead of a bare "not found".
+ */
+export function describeAllFailures(
+  failures: DetectionAttemptFailure[],
+  inContainer: boolean = runningInContainer()
+): string {
+  const tried = failures.map((failure) => `"${failure.binary}"`).join(", ") || '"ffmpeg"';
+  const configured = process.env.FFMPEG_PATH?.trim();
+  const overrideFailed = Boolean(configured) && failures[0]?.binary === configured;
+  const permissionFailure = failures.find((failure) => failure.code === "EACCES");
+  const otherFailure = failures.find(
+    (failure) => failure.code !== "ENOENT" && failure.code !== "EACCES"
+  );
 
-  const binary = ffmpegCandidate();
-  const result = await new Promise<FfmpegAvailability>((resolve) => {
-    execFile(binary, ["-hide_banner", "-version"], { timeout: 5000 }, (error, stdout) => {
+  let headline: string;
+  if (overrideFailed && failures.length > 1) {
+    const rest = failures
+      .slice(1)
+      .map((failure) => `"${failure.binary}"`)
+      .join(", ");
+    headline =
+      `FFMPEG_PATH is set to "${configured}" but no executable was found there; ` +
+      `the PATH fallbacks (${rest}) did not respond either (tried ${tried}).`;
+  } else if (overrideFailed) {
+    headline = `FFMPEG_PATH is set to "${configured}" but no executable was found there (tried ${tried}).`;
+  } else {
+    headline = `ffmpeg was not found (tried ${tried}).`;
+  }
+
+  if (permissionFailure) {
+    headline += ` "${permissionFailure.binary}" exists but is not executable by this user (EACCES).`;
+  } else if (otherFailure) {
+    headline += ` Last error: ${otherFailure.message}`;
+  }
+
+  if (inContainer) {
+    headline +=
+      " The current MacAttack image bundles FFmpeg, so this container is almost certainly running an older image: run ./update.sh " +
+      "(or `docker compose pull app && docker compose up -d`) to get the latest image.";
+    if (overrideFailed) {
+      headline +=
+        " Also check the FFMPEG_PATH override — remove it unless that exact path exists inside the container — then press Re-check.";
+    }
+  } else if (overrideFailed) {
+    headline +=
+      " Fix or remove the FFMPEG_PATH override (the Docker image needs none — ffmpeg is on PATH), or install ffmpeg, then press Re-check.";
+  } else {
+    headline +=
+      " Install it (e.g. `apt install ffmpeg` / `brew install ffmpeg`) or set FFMPEG_PATH to the binary, then press Re-check.";
+  }
+  return headline;
+}
+
+function execFileAsync(
+  binary: string,
+  args: string[],
+  timeout: number
+): Promise<
+  | { ok: true; stdout: string; stderr: string }
+  | { ok: false; stdout: string; stderr: string; error: { code?: string | number | null; message: string } }
+> {
+  return new Promise((resolve) => {
+    execFile(binary, args, { timeout }, (error, stdout, stderr) => {
       if (error) {
         resolve({
-          available: false,
-          path: null,
-          version: null,
-          reason: describeDetectionFailure(binary, error),
-          hardwareAcceleration: null,
-          hardwareDevice: null,
-          checkedAt: new Date().toISOString(),
+          ok: false,
+          stdout: String(stdout ?? ""),
+          stderr: String(stderr ?? ""),
+          error: {
+            code: (error as NodeJS.ErrnoException | null)?.code ?? null,
+            message: error.message,
+          },
         });
         return;
       }
-
-      const version = /ffmpeg version (\S+)/.exec(stdout)?.[1] ?? null;
-      execFile(binary, ["-hide_banner", "-hwaccels"], { timeout: 5000 }, async (_hwError, hwStdout, hwStderr) => {
-        const accelerators = parseHardwareAccelerators(`${hwStdout}\n${hwStderr}`);
-        const mode = (process.env.MACATTACK_FFMPEG_HWACCEL || "auto").trim().toLowerCase();
-        const wantsVaapi = mode === "auto" || mode === "vaapi";
-        const hardwareDevice =
-          wantsVaapi && accelerators.includes("vaapi") ? await accessibleVaapiDevice() : null;
-        resolve({
-          available: true,
-          path: binary,
-          version,
-          reason: null,
-          hardwareAcceleration: hardwareDevice ? "vaapi" : null,
-          hardwareDevice,
-          checkedAt: new Date().toISOString(),
-        });
-      });
+      resolve({ ok: true, stdout: String(stdout ?? ""), stderr: String(stderr ?? "") });
     });
   });
+}
 
+/**
+ * Detect FFmpeg and a usable VAAPI candidate once per process.
+ *
+ * Every location from ffmpegCandidates() is tried in order: an explicit
+ * FFMPEG_PATH first, then the PATH/absolute fallbacks. Pass `force=true` (via
+ * `GET /api/system?refresh=1`) to re-run detection after installing FFmpeg or
+ * fixing the override, without restarting the container.
+ */
+export async function detectFfmpeg(force = false): Promise<FfmpegAvailability> {
+  if (availabilityCache.value && !force) return availabilityCache.value;
+
+  const candidates = ffmpegCandidates();
+  const failures: DetectionAttemptFailure[] = [];
+
+  for (const binary of candidates) {
+    const versionProbe = await execFileAsync(binary, ["-hide_banner", "-version"], 5000);
+    if (!versionProbe.ok) {
+      failures.push({ binary, code: versionProbe.error.code, message: versionProbe.error.message });
+      continue;
+    }
+
+    const version = /ffmpeg version (\S+)/.exec(versionProbe.stdout)?.[1] ?? null;
+    const hwProbe = await execFileAsync(binary, ["-hide_banner", "-hwaccels"], 5000);
+    const accelerators = parseHardwareAccelerators(
+      `${hwProbe.stdout}\n${hwProbe.stderr}`
+    );
+    const mode = (process.env.MACATTACK_FFMPEG_HWACCEL || "auto").trim().toLowerCase();
+    const wantsVaapi = mode === "auto" || mode === "vaapi";
+    const hardwareDevice =
+      wantsVaapi && accelerators.includes("vaapi") ? await accessibleVaapiDevice() : null;
+    const result: FfmpegAvailability = {
+      available: true,
+      path: binary,
+      version,
+      reason: null,
+      hardwareAcceleration: hardwareDevice ? "vaapi" : null,
+      hardwareDevice,
+      checkedAt: new Date().toISOString(),
+      triedPaths: candidates,
+    };
+    availabilityCache.value = result;
+    return result;
+  }
+
+  const result: FfmpegAvailability = {
+    available: false,
+    path: null,
+    version: null,
+    reason: describeAllFailures(failures),
+    hardwareAcceleration: null,
+    hardwareDevice: null,
+    checkedAt: new Date().toISOString(),
+    triedPaths: candidates,
+  };
   availabilityCache.value = result;
   return result;
 }
