@@ -13,6 +13,8 @@
 // deliberately rejects as a placeholder; allow it for this offline test only.
 process.env.MACATTACK_ALLOW_LOCAL_STREAMS = "1";
 
+import { getEventListeners } from "node:events";
+import { abortSubscriberCount } from "../src/lib/abort";
 import { checkMacStreamQuality, formatMacQualityLog } from "../src/lib/mac-quality";
 import {
   stalkerHandshake,
@@ -177,6 +179,40 @@ async function main() {
     checkCatchUp: false,
   });
   check("catch-up can be switched off", noCatchUp.catchUp.status === "not_checked", noCatchUp.catchUp);
+
+  // ── Abort listeners on the shared scan signal ────────────────────────────
+  // A scan reuses one AbortController for every MAC and every portal request,
+  // so each settled request must detach its abort listener (otherwise Node
+  // reports MaxListenersExceededWarning after 10 requests).
+  {
+    const controller = new AbortController();
+    const shared = { ...options, signal: controller.signal };
+    let channel: Parameters<typeof stalkerResolveStream>[2] | null = null;
+    for (let i = 0; i < 12; i += 1) {
+      const handshake = await stalkerHandshake(shared);
+      if (!handshake.token) {
+        check(`handshake ${i + 1} on the shared signal succeeded`, false, handshake.error || "no token");
+        break;
+      }
+      const listed = await stalkerListChannels(shared, handshake.token);
+      channel = channel ?? listed.channels[0] ?? null;
+      if (channel) await stalkerResolveStream(shared, handshake.token, channel);
+    }
+    const lingering = abortSubscriberCount(controller.signal);
+    check("36 portal requests leave no subscriber behind", lingering === 0, String(lingering));
+    check(
+      "36 portal requests keep a single native listener",
+      getEventListeners(controller.signal, "abort").length === 1,
+      String(getEventListeners(controller.signal, "abort").length)
+    );
+
+    let notified = 0;
+    controller.signal.addEventListener("abort", () => {
+      notified += 1;
+    });
+    controller.abort();
+    check("the shared signal still aborts after all requests", notified === 1, notified);
+  }
 
   console.log(`\n${checks - failures}/${checks} checks passed`);
   if (failures > 0) process.exit(1);

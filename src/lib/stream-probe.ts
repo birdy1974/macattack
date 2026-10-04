@@ -51,6 +51,7 @@ import net from "node:net";
 import dns from "node:dns";
 import { performance } from "node:perf_hooks";
 import { openProxyTunnel, tlsOverTunnel, type ProxyConfig } from "@/lib/proxy";
+import { onAbort } from "@/lib/abort";
 import { sleep } from "@/lib/parallel";
 
 // ============================================================================
@@ -662,6 +663,9 @@ async function singleRequest(url: string, options: RawRequestOptions): Promise<R
     const finish = (status: ProbeStatus) => {
       if (settled) return;
       settled = true;
+      // Detach from the scan-wide signal, otherwise every probe would leave
+      // another abort listener (and its captured request) behind.
+      detachAbort?.();
       resolve({
         status,
         statusCode,
@@ -679,6 +683,7 @@ async function singleRequest(url: string, options: RawRequestOptions): Promise<R
     };
 
     let request: http.ClientRequest;
+    let detachAbort: (() => void) | null = null;
     try {
       const requestOptions: http.RequestOptions & { servername?: string } = {
         protocol: target.protocol,
@@ -801,13 +806,10 @@ async function singleRequest(url: string, options: RawRequestOptions): Promise<R
       finish(timedOut ? "timeout" : "network_error");
     });
 
-    if (options.signal) {
-      const onAbort = () => {
-        abortedByUser = true;
-        request.destroy(new Error("AbortError"));
-      };
-      options.signal.addEventListener("abort", onAbort, { once: true });
-    }
+    detachAbort = onAbort(options.signal, () => {
+      abortedByUser = true;
+      request.destroy(new Error("AbortError"));
+    });
 
     request.end();
 

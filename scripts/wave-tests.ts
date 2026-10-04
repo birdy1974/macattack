@@ -13,8 +13,10 @@
  */
 
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { getEventListeners } from "node:events";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { abortSubscriberCount, onAbort } from "../src/lib/abort";
 import {
   mergeOutputFieldOrder,
   moveItem,
@@ -123,6 +125,67 @@ section("Output field ordering");
       "quality,macAddress"
   );
   check("an empty save clears the stored order", parseOutputFieldOrderSetting(serializeOutputFieldOrder([])).length === 0);
+}
+
+// ============================================================================
+// Abort listeners (one per request must be detached when the request settles)
+// ============================================================================
+section("AbortSignal listener hygiene");
+{
+  const native = (signal: AbortSignal) => getEventListeners(signal, "abort").length;
+
+  const controller = new AbortController();
+  check("no signal is a no-op that never throws", onAbort(undefined, () => {})() === undefined);
+
+  const detach = onAbort(controller.signal, () => {});
+  check("registering a listener is observable", abortSubscriberCount(controller.signal) === 1);
+  check("one native abort listener backs all subscribers", native(controller.signal) === 1, String(native(controller.signal)));
+  detach();
+  check("the disposer removes the listener", abortSubscriberCount(controller.signal) === 0);
+
+  let fired = 0;
+  onAbort(controller.signal, () => {
+    fired += 1;
+  });
+  controller.abort();
+  check("an abort still reaches the listener", fired === 1, String(fired));
+  check("an aborted signal keeps no native listener", native(controller.signal) === 0, String(native(controller.signal)));
+
+  const preAborted = new AbortController();
+  preAborted.abort();
+  let immediate = 0;
+  const noop = onAbort(preAborted.signal, () => {
+    immediate += 1;
+  });
+  check("an already-aborted signal fires immediately", immediate === 1, String(immediate));
+  check("the immediate path returns a safe no-op disposer", noop() === undefined);
+
+  // Regression for the MaxListenersExceededWarning: 40 concurrent operations
+  // (parallel MAC checks × channel probes) on the scan signal still add only
+  // one native listener, and a settled operation leaves no subscriber behind.
+  const shared = new AbortController();
+  let notified = 0;
+  const disposers: Array<() => void> = [];
+  for (let i = 0; i < 40; i += 1) {
+    disposers.push(
+      onAbort(shared.signal, () => {
+        notified += 1;
+      })
+    );
+  }
+  check("40 concurrent operations keep one native listener", native(shared.signal) === 1, String(native(shared.signal)));
+  shared.abort();
+  check("every concurrent operation is notified", notified === 40, String(notified));
+  check("the native listener is gone after abort", native(shared.signal) === 0, String(native(shared.signal)));
+
+  const settled = new AbortController();
+  for (let i = 0; i < 50; i += 1) {
+    const dispose = onAbort(settled.signal, () => {}) as () => void;
+    disposers.push(dispose);
+    dispose();
+  }
+  check("50 settled requests leave no subscriber behind", abortSubscriberCount(settled.signal) === 0);
+  check("a signal without live operations has no leak", abortSubscriberCount(controller.signal) === 0);
 }
 
 // ============================================================================
@@ -383,6 +446,22 @@ exit 0
         "thumbnail software retry drops the VAAPI arguments",
         thumbnailCalls.length === 2 && thumbnailCalls[0].includes("-hwaccel vaapi") && !thumbnailCalls[1].includes("-hwaccel vaapi")
       );
+
+      // A scan reuses one AbortSignal for all ffmpeg runs; each finished run
+      // must detach its listener (MaxListenersExceededWarning regression).
+      const scanSignal = new AbortController();
+      for (let run = 0; run < 12; run += 1) {
+        await captureThumbnail("https://mock.example/live.ts", { timeoutMs: 2000, signal: scanSignal.signal });
+      }
+      const ffmpegNative = getEventListeners(scanSignal.signal, "abort").length;
+      check("12 ffmpeg runs leave no subscriber behind", abortSubscriberCount(scanSignal.signal) === 0, String(abortSubscriberCount(scanSignal.signal)));
+      check("12 ffmpeg runs keep a single native listener", ffmpegNative === 1, String(ffmpegNative));
+      let ffmpegAbortNotified = 0;
+      onAbort(scanSignal.signal, () => {
+        ffmpegAbortNotified += 1;
+      });
+      scanSignal.abort();
+      check("the ffmpeg signal still aborts afterwards", ffmpegAbortNotified === 1, String(ffmpegAbortNotified));
     } catch (error) {
       check("runs the fake FFmpeg hardware-fallback probe", false, error instanceof Error ? error.message : String(error));
     } finally {

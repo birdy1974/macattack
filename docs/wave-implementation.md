@@ -47,7 +47,8 @@ Standing constraints were respected throughout:
 
 | Item | Where | Verified by |
 |---|---|---|
-| Xtream Codes support (login, catalogue, live stream sampling through the shared probe) | `src/lib/xtream-streams.ts`, `src/lib/xtream-quality.ts`, `/api/scan/xtream` | `npm run test:xtream` — 24 checks against the mock Xtream API in the fixture server |
+| Xtream Codes support (login, catalogue, live stream sampling through the shared probe) | `src/lib/xtream-streams.ts`, `src/lib/xtream-quality.ts`, `/api/scan/xtream` | `npm run test:xtream` — 27 checks against the mock Xtream API in the fixture server |
+| Abort-listener hygiene on the shared per-scan signal (no `MaxListenersExceededWarning`, no listener retained by a settled request) | `src/lib/abort.ts` (`onAbort` / `abortSubscriberCount`), used by `stalker-streams.ts`, `stream-probe.ts`, `xtream-streams.ts`, `ffmpeg-tools.ts` | `test:waves` (fan-out + disposer assertions), `test:probe` section 12, `test:quality` and `test:xtream` final sections assert 0 leftover subscribers after 15/36/24 operations |
 | RTSP / RTMP liveness (TCP + protocol handshake) and honest UDP labelling | `probeSocketLiveness()` / `detectStreamProtocol()` in `src/lib/stream-probe.ts` | `test:waves` (dead host, UDP `unverifiable`, unknown scheme) |
 | Genre aggregation (quality per genre) | `buildGenreGroups()` in `mac-quality.ts`, `quality_genre_summary` column, UI + CSV export | `test:quality` section 6 (groups and averages) |
 
@@ -57,10 +58,10 @@ Standing constraints were respected throughout:
 
 ```bash
 npm run fixtures                  # mock Stalker portal + Xtream API + CONNECT proxy (:4599)
-npm run test:probe                # 48 checks  (probe engine, retries, proxy egress)
-npm run test:quality              # 29 checks  (Stalker → quality pipeline, catch-up, genres)
-npm run test:xtream               # 24 checks  (Xtream API → measurement engine)
-npm run test:waves                # 105 checks (pure logic + mocked VAAPI fallback, no real ffmpeg/GPU)
+npm run test:probe                # 53 checks  (probe engine, retries, proxy egress, abort hygiene)
+npm run test:quality              # 32 checks  (Stalker → quality pipeline, catch-up, genres, abort hygiene)
+npm run test:xtream               # 27 checks  (Xtream API → measurement engine, abort hygiene)
+npm run test:waves                # 139 checks (pure logic + mocked VAAPI fallback + abort hygiene, no real ffmpeg/GPU)
 ```
 
 `test:waves` needs no server (only loopback sockets); the other three expect the

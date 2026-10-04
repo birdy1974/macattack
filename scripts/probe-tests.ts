@@ -8,6 +8,8 @@
  * analysis, HLS real-time deficit and DRM detection. No internet access needed.
  */
 
+import { getEventListeners } from "node:events";
+import { abortSubscriberCount } from "../src/lib/abort";
 import { probeStream, scoreStreamProbe } from "../src/lib/stream-probe";
 
 const PORT = Number(process.argv[2] || process.env.PROBE_FIXTURE_PORT || 4599);
@@ -166,6 +168,42 @@ async function main() {
     });
     check("dead proxy is reported honestly", deadProxy.status === "network_error", deadProxy.status);
     check("dead proxy error names the proxy", deadProxy.errors.some((line) => /proxy/i.test(line)), deadProxy.errors);
+  }
+
+  // ── 12. Abort listeners on the shared scan signal ────────────────────────
+  {
+    console.log("\n[12] Abort listeners are detached when probes settle");
+    const controller = new AbortController();
+    const native = () => getEventListeners(controller.signal, "abort").length;
+
+    for (let i = 0; i < 15; i += 1) {
+      await probeStream(`${BASE}/live.ts?seconds=1`, {
+        sampleMs: 400,
+        timeoutMs: 4000,
+        maxBytes: 200_000,
+        signal: controller.signal,
+      });
+    }
+    check("15 probes on one signal leave no subscriber behind", abortSubscriberCount(controller.signal) === 0, String(abortSubscriberCount(controller.signal)));
+    check("15 probes keep a single native listener", native() === 1, String(native()));
+
+    // Aborting must still reach an in-flight probe (the fix must not detach
+    // the listener before the request is actually finished).
+    const midFlight = new AbortController();
+    const pending = probeStream(`${BASE}/live.ts?seconds=30`, {
+      sampleMs: 20_000,
+      timeoutMs: 20_000,
+      signal: midFlight.signal,
+    });
+    setTimeout(() => midFlight.abort(), 300);
+    const aborted = await pending;
+    check(
+      "aborting mid-probe stops it",
+      aborted.status === "network_error" && aborted.errors.some((line) => /abort/i.test(line)),
+      { status: aborted.status, errors: aborted.errors }
+    );
+    check("an aborted probe leaves no subscriber behind", abortSubscriberCount(midFlight.signal) === 0);
+    check("an aborted probe removes its native listener", getEventListeners(midFlight.signal, "abort").length === 0);
   }
 
   console.log(`\n${checks - failures}/${checks} checks passed`);

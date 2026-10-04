@@ -562,10 +562,10 @@ bind mount must be writable by uid 1001, e.g.
 │   └── wave-implementation.md  # what shipped, how it is tested, limits
 ├── scripts/               # offline fixtures, integration and unit suites
 │   ├── probe-fixtures.mjs     # mock Stalker portal + Xtream API + CONNECT proxy
-│   ├── probe-tests.ts         # probe engine (48 checks)
-│   ├── mac-quality-tests.ts   # Stalker quality pipeline (29 checks)
-│   ├── xtream-tests.ts        # Xtream API path (24 checks)
-│   └── wave-tests.ts          # pure logic + mocked VAAPI picture/thumbnail fallback (123 checks)
+│   ├── probe-tests.ts         # probe engine (53 checks)
+│   ├── mac-quality-tests.ts   # Stalker quality pipeline (32 checks)
+│   ├── xtream-tests.ts        # Xtream API path (27 checks)
+│   └── wave-tests.ts          # pure logic + mocked VAAPI picture/thumbnail fallback + abort hygiene (139 checks)
 └── initial/               # Reference copy of the original local-build version
 ```
 

@@ -19,6 +19,7 @@
 import { execFile, spawn } from "node:child_process";
 import { Buffer } from "node:buffer";
 import { existsSync } from "node:fs";
+import { onAbort } from "@/lib/abort";
 
 export interface FfmpegAvailability {
   available: boolean;
@@ -664,10 +665,14 @@ function runFfmpegResult(
     let settled = false;
 
     const child = spawn(binary, args, { windowsHide: true });
+    let detachAbort: (() => void) | null = null;
     const finish = (error: string | null, exitCode: number | null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      // Detach from the scan-wide signal: ffmpeg runs many times per scan and
+      // a leftover listener per run trips Node's EventTarget leak warning.
+      detachAbort?.();
       resolve({ stdout: Buffer.concat(stdoutChunks), stderr, error, exitCode });
     };
 
@@ -677,16 +682,10 @@ function runFfmpegResult(
       finish("ffmpeg timed out", null);
     }, timeoutMs);
 
-    if (signal) {
-      signal.addEventListener(
-        "abort",
-        () => {
-          child.kill("SIGKILL");
-          finish("aborted", null);
-        },
-        { once: true }
-      );
-    }
+    detachAbort = onAbort(signal, () => {
+      child.kill("SIGKILL");
+      finish("aborted", null);
+    });
 
     child.stdout?.on("data", (chunk: Buffer) => {
       stdoutChunks.push(chunk);
