@@ -16,6 +16,7 @@
 
 import { execFile, spawn } from "node:child_process";
 import { Buffer } from "node:buffer";
+import { existsSync } from "node:fs";
 
 export interface FfmpegAvailability {
   available: boolean;
@@ -73,6 +74,36 @@ export function parseHardwareAccelerators(output: string): string[] {
   )];
 }
 
+/** True when running inside a container (Docker/Podman/k8s). */
+function runningInContainer(): boolean {
+  return (
+    existsSync("/.dockerenv") ||
+    existsSync("/run/.containerenv") ||
+    Boolean(process.env.KUBERNETES_SERVICE_HOST)
+  );
+}
+
+/** Explain *why* FFmpeg could not be started, with an actionable fix. */
+export function describeDetectionFailure(
+  binary: string,
+  error: { code?: string | number | null; message: string },
+  inContainer: boolean = runningInContainer()
+): string {
+  const configured = Boolean(process.env.FFMPEG_PATH);
+  if (error.code === "ENOENT") {
+    if (configured) {
+      return `FFMPEG_PATH is set to "${binary}" but no such executable exists.`;
+    }
+    return inContainer
+      ? "ffmpeg is not installed in this container. The current MacAttack image bundles it, so this container is running an older image: run ./update.sh (or `docker compose pull app && docker compose up -d`) to get the latest image."
+      : "ffmpeg is not on PATH. Install it (e.g. `apt install ffmpeg` / `brew install ffmpeg`) or set FFMPEG_PATH to the binary.";
+  }
+  if (error.code === "EACCES") {
+    return `"${binary}" exists but is not executable by this user (EACCES).`;
+  }
+  return `"${binary}" was found but failed to run: ${error.message}`;
+}
+
 /** Detect FFmpeg and a usable VAAPI candidate once per process. */
 export async function detectFfmpeg(force = false): Promise<FfmpegAvailability> {
   if (availabilityCache.value && !force) return availabilityCache.value;
@@ -85,9 +116,7 @@ export async function detectFfmpeg(force = false): Promise<FfmpegAvailability> {
           available: false,
           path: null,
           version: null,
-          reason: process.env.FFMPEG_PATH
-            ? `FFMPEG_PATH is set but not runnable: ${error.message}`
-            : "ffmpeg is not on PATH (the Docker image includes it; local runs can install it or set FFMPEG_PATH)",
+          reason: describeDetectionFailure(binary, error),
           hardwareAcceleration: null,
           hardwareDevice: null,
           checkedAt: new Date().toISOString(),
