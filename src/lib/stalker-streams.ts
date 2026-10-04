@@ -149,7 +149,12 @@ async function stalkerRequest(
 
     let settled = false;
     const finish = (response: StalkerResponse) => {
-      if (settled) return;
+      if (settled) {
+        // Safety: detach even on duplicate finish() calls so the abort
+        // listener is not left behind on the (long-lived, per-scan) signal.
+        detachAbort?.();
+        return;
+      }
       settled = true;
       // Detach from the (long-lived, per-scan) signal: one listener per request
       // would otherwise pile up for the whole scan.

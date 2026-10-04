@@ -661,7 +661,12 @@ async function singleRequest(url: string, options: RawRequestOptions): Promise<R
 
   return new Promise((resolve) => {
     const finish = (status: ProbeStatus) => {
-      if (settled) return;
+      if (settled) {
+        // Safety: detach even on duplicate finish() calls so the abort
+        // listener is not left behind on the (long-lived, per-scan) signal.
+        detachAbort?.();
+        return;
+      }
       settled = true;
       // Detach from the scan-wide signal, otherwise every probe would leave
       // another abort listener (and its captured request) behind.
