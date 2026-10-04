@@ -43,6 +43,7 @@ import {
   resetFfmpegDetection,
 } from "../src/lib/ffmpeg-tools";
 import { deleteThumbnail, readThumbnail, saveThumbnail, thumbnailStoreInfo } from "../src/lib/thumbnail-store";
+import { summariseThumbnails, thumbnailLogLines, type ThumbnailOutcome } from "../src/lib/thumbnail-report";
 import { parseXtreamUrl, xtreamStreamUrl } from "../src/lib/xtream-streams";
 import { detectStreamProtocol, probeStream, scoreStreamProbe, type StreamProbeResult } from "../src/lib/stream-probe";
 import {
@@ -686,7 +687,57 @@ section("Thumbnail store");
   check("rejects unknown files", (await readThumbnail("definitely-not-here.jpg")) === null);
   const storeInfo = await thumbnailStoreInfo();
   check("store info reports writability", typeof storeInfo.writable === "boolean");
+  check("store info names the fallback directory", storeInfo.fallbackDir.includes("macattack-thumbnails"), storeInfo.fallbackDir);
   if (saved) await deleteThumbnail(saved);
+}
+
+// ============================================================================
+// Thumbnail outcomes: the scan log must say where files went (or why not)
+// ============================================================================
+section("Thumbnail reporting");
+{
+  const saved: ThumbnailOutcome[] = [
+    { channel: "(NL) NPO 1", name: "001A79D92B61-0-123.jpg", ok: true, detail: "001A79D92B61-0-123.jpg in /app/data/thumbnails" },
+    { channel: "(NL) NPO 2", name: "001A79D92B61-1-124.jpg", ok: true, detail: "001A79D92B61-1-124.jpg in /app/data/thumbnails" },
+    { channel: "(NL) NPO 3", name: null, ok: false, detail: "no frame decoded within 20s (stream offline, DRM-protected or refusing another connection)" },
+  ];
+  const summary = await summariseThumbnails(true, true, saved);
+  check("summary keeps every outcome", summary.outcomes.length === 3);
+  check("summary points at the directory used", typeof summary.dir === "string" && summary.dir.length > 0, summary.dir ?? "");
+
+  const lines = thumbnailLogLines(summary);
+  const joined = lines.map((line) => `${line.level}: ${line.message}`).join("\n");
+  check("logs the saved thumbnail count", /Thumbnails saved: 2/.test(joined), joined);
+  check("logs which directory the files went to", joined.includes(summary.dir ?? "%%"), joined);
+  check("logs the failure reason per channel", /No thumbnail for \(NL\) NPO 3: no frame decoded/.test(joined), joined);
+
+  const disabled = thumbnailLogLines(await summariseThumbnails(false, false, []));
+  check("says when thumbnails are switched off", disabled.some((line) => /switched off/i.test(line.message)));
+
+  const noneAttempted = thumbnailLogLines(await summariseThumbnails(true, true, []));
+  check("explains when nothing was attempted", noneAttempted.some((line) => /no channel returned a playable link/i.test(line.message)));
+
+  // An unusable data directory must be reported instead of silently writing to
+  // the fallback (the "empty data directory" report this test comes from).
+  const originalDataDir = process.env.MACATTACK_DATA_DIR;
+  // A path under a *file* cannot be created (ENOTDIR) — deterministic stand-in
+  // for a bind mount the app user cannot write.
+  const blocker = join(tmpdir(), `macattack-thumbnail-blocker-${Date.now()}`);
+  writeFileSync(blocker, "not a directory");
+  try {
+    process.env.MACATTACK_DATA_DIR = blocker;
+    const fallbackSummary = await summariseThumbnails(true, true, [
+      { channel: "channel", name: "x.jpg", ok: true, detail: "x.jpg in fallback" },
+    ]);
+    check("names the fallback directory when the data dir is unusable", fallbackSummary.storeWarning !== null, String(fallbackSummary.storeWarning));
+    check("summary dir follows the fallback", (fallbackSummary.dir ?? "").includes("macattack-thumbnails"), fallbackSummary.dir ?? "");
+    const warningLines = thumbnailLogLines(fallbackSummary);
+    check("the fallback is a warning in the log", warningLines.some((line) => line.level === "warning" && /not writable/.test(line.message)), JSON.stringify(warningLines));
+  } finally {
+    if (originalDataDir === undefined) delete process.env.MACATTACK_DATA_DIR;
+    else process.env.MACATTACK_DATA_DIR = originalDataDir;
+    rmSync(blocker, { force: true });
+  }
 }
 
 // ============================================================================

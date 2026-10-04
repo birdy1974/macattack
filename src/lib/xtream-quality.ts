@@ -11,8 +11,12 @@
 import { probeStream, scoreStreamProbe, type StreamScore } from "@/lib/stream-probe";
 import type { PictureAnalysis } from "@/lib/ffmpeg-tools";
 import { aggregateChannels, type MacQualityChannelResult, type MacStreamQualityReport } from "@/lib/mac-quality";
-import { analyzePicture, captureThumbnail, detectFfmpeg } from "@/lib/ffmpeg-tools";
-import { saveThumbnail } from "@/lib/thumbnail-store";
+import { analyzePicture, detectFfmpeg } from "@/lib/ffmpeg-tools";
+import {
+  captureChannelThumbnail,
+  summariseThumbnails,
+  type ThumbnailOutcome,
+} from "@/lib/thumbnail-report";
 import { detectLabelMismatch } from "@/lib/label-mismatch";
 import { pMapLimit } from "@/lib/parallel";
 import {
@@ -152,6 +156,10 @@ export async function checkXtreamAccountQuality(
   }
 
   // Optional picture pass + thumbnails (sequential: keep load predictable).
+  const thumbnailsEnabled = options.thumbnails ?? true;
+  const captureThumbnails = thumbnailsEnabled && ffmpeg.available && (options.pictureChecks ?? true);
+  const thumbnails: ThumbnailOutcome[] = [];
+
   if (ffmpeg.available && (options.pictureChecks ?? true)) {
     for (let index = 0; index < channels.length; index += 1) {
       if (options.signal?.aborted) break;
@@ -178,14 +186,16 @@ export async function checkXtreamAccountQuality(
           labelMismatch: channels[index].labelMismatch,
         });
       }
-      if (options.thumbnails ?? true) {
-        const capture = await captureThumbnail(liveUrl, {
+      if (captureThumbnails) {
+        const outcome = await captureChannelThumbnail({
+          key: `xtream-${credentials.username}-${index}-${Date.now()}`,
+          channel: channels[index].name,
+          url: liveUrl,
           userAgent: "VLC/3.0.20 LibVLC/3.0.20",
           signal: options.signal,
         });
-        if (capture.ok && capture.jpeg) {
-          channels[index].thumbnail = await saveThumbnail(`xtream-${credentials.username}-${index}-${Date.now()}`, capture.jpeg);
-        }
+        thumbnails.push(outcome);
+        channels[index].thumbnail = outcome.name;
       }
     }
   }
@@ -233,6 +243,7 @@ export async function checkXtreamAccountQuality(
       bytesRead: 0,
       error: null,
     },
+    thumbnails: await summariseThumbnails(thumbnailsEnabled, captureThumbnails, thumbnails),
     aggregate,
     notes,
     limitations: [

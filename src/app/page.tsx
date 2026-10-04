@@ -429,7 +429,7 @@ export default function MacAttackPage() {
       hardwareDevice: string | null;
       checkedAt?: string;
     };
-    thumbnails: { dir: string; fileCount: number | null; maxAgeDays: number; writable?: boolean };
+    thumbnails: { dir: string; fallbackDir?: string; fileCount: number | null; maxAgeDays: number; writable?: boolean; usingFallback?: boolean; lastError?: string | null };
   } | null>(null);
   const [systemRefreshing, setSystemRefreshing] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -1420,7 +1420,7 @@ export default function MacAttackPage() {
             hardwareDevice: string | null;
             checkedAt?: string;
           };
-          thumbnails: { dir: string; fileCount: number | null; maxAgeDays: number; writable?: boolean };
+          thumbnails: { dir: string; fallbackDir?: string; fileCount: number | null; maxAgeDays: number; writable?: boolean; usingFallback?: boolean; lastError?: string | null };
         };
         setSystemInfo(data);
       }
@@ -1447,7 +1447,7 @@ export default function MacAttackPage() {
             hardwareDevice: string | null;
             checkedAt?: string;
           };
-          thumbnails: { dir: string; fileCount: number | null; maxAgeDays: number; writable?: boolean };
+          thumbnails: { dir: string; fallbackDir?: string; fileCount: number | null; maxAgeDays: number; writable?: boolean; usingFallback?: boolean; lastError?: string | null };
         };
         setSystemInfo(data);
       }
@@ -1942,6 +1942,14 @@ export default function MacAttackPage() {
                       </span>
                     )}
                   </p>
+                  {systemInfo.thumbnails.usingFallback && (
+                    <p className="text-xs text-yellow-300">
+                      Writes fall back to <code>{systemInfo.thumbnails.fallbackDir ?? "/tmp/macattack-thumbnails"}</code>{" "}
+                      (cleared when the container is recreated). Fix the mount permissions to keep thumbnails in the data
+                      directory
+                      {systemInfo.thumbnails.lastError ? ` — ${systemInfo.thumbnails.lastError}` : ""}.
+                    </p>
+                  )}
                 </div>
               ) : (
                 <p className="text-xs text-gray-500">Detecting…</p>

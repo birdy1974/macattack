@@ -587,10 +587,34 @@ export async function captureThumbnail(
   );
   const { stdout, error } = execution.result;
 
-  if (stdout.length === 0) return { ok: false, jpeg: null, error: error || "No frame captured" };
+  if (stdout.length === 0) {
+    return { ok: false, jpeg: null, error: describeCaptureFailure(execution.result, options.timeoutMs ?? 20000) };
+  }
   // Guard against a text error page being "captured".
   if (!isJpeg(stdout)) return { ok: false, jpeg: null, error: "ffmpeg output was not a JPEG frame" };
+  void error;
   return { ok: true, jpeg: stdout, error: null };
+}
+
+/**
+ * Explain why no frame was captured instead of returning a bare "No frame
+ * captured": a 20 s silence is usually an offline/DRM/connection-limited
+ * stream, and ffmpeg's own stderr line (403, "Invalid data", "Conversion
+ * failed") tells the operator what to look at.
+ */
+function describeCaptureFailure(result: RunResult, timeoutMs: number): string {
+  if (result.error) {
+    return /timed out/i.test(result.error)
+      ? `no frame decoded within ${Math.round(timeoutMs / 1000)}s (stream offline, DRM-protected or refusing another connection)`
+      : result.error;
+  }
+
+  const lines = result.stderr
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(/^\[[^\]]+\]\s*/, ""))
+    .filter((line) => line.length > 0 && !/^conversion failed!?$/i.test(line));
+  const last = lines[lines.length - 1];
+  return last ? last.slice(0, 200) : "ffmpeg produced no JPEG frame";
 }
 
 function isJpeg(buffer: Buffer): boolean {

@@ -512,12 +512,34 @@ docker exec mac-attack printenv FFMPEG_PATH   # should print nothing in Docker
 docker compose logs app | grep -i ffmpeg
 ```
 
-### Thumbnails stay at 0 files
-The panel reports `not writable` when the app user (uid 1001) cannot write to
-the mounted directory. A Docker-managed volume (the default
-`mac-attack-data:/app/data` in `docker-compose.yml`) starts writable; a host
-bind mount must be writable by uid 1001, e.g.
+### Thumbnails are missing / the data directory stays empty
+Every quality check now logs what happened to each capture, so start there:
+
+- `📸 Thumbnails saved: N → /app/data/thumbnails` — the files are there (inside
+  the container/volume, not necessarily in a host folder).
+- `⚠ <dir> is not writable by the app user (uid 1001) — thumbnails are written
+  to /tmp/macattack-thumbnails instead …` — the configured data directory cannot
+  be written, so MacAttack kept working by using the fallback directory. Those
+  files are served by the app but disappear when the container is recreated.
+  Fix the mount or its ownership, then press **↻ Re-check** in the Host
+  capabilities panel.
+- `⚠ No thumbnail for <channel>: <reason>` — ffmpeg could not grab a frame.
+  Common reasons on real portals: `no frame decoded within 20s (…)` when the
+  stream is offline/DRM-protected or the portal refuses another simultaneous
+  connection, or an ffmpeg stderr line such as `Server returned 403 Forbidden`.
+  Lower **Channels to probe** / check the portal's connection limit if a MAC
+  allows only one at a time.
+
+Where the files live: `<MACATTACK_DATA_DIR>/thumbnails` inside the container
+(`/app/data/thumbnails` with the bundled compose file). With the default
+Docker-managed volume `mac-attack-data:/app/data` that directory is **not** a
+host folder — list it with
+`docker exec mac-attack ls -la /app/data/thumbnails`. A host bind mount must be
+writable by uid 1001, e.g.
 `chown -R 1001:1001 /volume1/docker/mac-attack/data` on the NAS.
+
+The Host capabilities panel reports the directory, the file count, whether it is
+writable, and whether writes are falling back to `/tmp`.
 
 ---
 

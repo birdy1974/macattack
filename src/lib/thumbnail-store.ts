@@ -12,6 +12,25 @@ import path from "node:path";
 
 const FALLBACK_DIR = path.join(process.env.TMPDIR || "/tmp", "macattack-thumbnails");
 
+/** Diagnostics for the last write attempt, surfaced in the scan log/UI. */
+let lastWriteDir: string | null = null;
+let lastStoreError: string | null = null;
+let usingFallbackDir = false;
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Directory the most recent successful save went into. */
+export function lastThumbnailWriteDir(): string | null {
+  return lastWriteDir;
+}
+
+/** Why the configured thumbnail directory could not be used (null = fine). */
+export function thumbnailStoreError(): string | null {
+  return lastStoreError;
+}
+
 export function thumbnailsDir(): string {
   const base = process.env.MACATTACK_DATA_DIR || path.join(process.cwd(), "data");
   return path.join(base, "thumbnails");
@@ -25,8 +44,15 @@ export async function ensureThumbnailDir(): Promise<string> {
   const dir = thumbnailsDir();
   try {
     await fs.mkdir(dir, { recursive: true });
+    usingFallbackDir = false;
     return dir;
-  } catch {
+  } catch (error) {
+    // A bind mount owned by another UID (the container runs as uid 1001) cannot
+    // be created/written by the app user. Keep the fallback so thumbnails still
+    // work, but remember why so the scan log and the Host capabilities panel can
+    // say where the files actually went instead of leaving an empty directory.
+    lastStoreError = `cannot write to ${dir} (${describeError(error)})`;
+    usingFallbackDir = true;
     await fs.mkdir(FALLBACK_DIR, { recursive: true });
     return FALLBACK_DIR;
   }
@@ -39,8 +65,11 @@ export async function saveThumbnail(key: string, jpeg: Buffer): Promise<string |
     const safeKey = key.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80);
     const name = `${safeKey}-${Date.now()}.jpg`;
     await fs.writeFile(path.join(dir, name), jpeg);
+    lastWriteDir = dir;
+    usingFallbackDir = dir === FALLBACK_DIR;
     return name;
-  } catch {
+  } catch (error) {
+    lastStoreError = `could not write ${key} (${describeError(error)})`;
     return null;
   }
 }
@@ -105,9 +134,12 @@ export async function pruneThumbnails(maxAgeMs = 14 * 24 * 60 * 60 * 1000): Prom
  */
 export async function thumbnailStoreInfo(): Promise<{
   dir: string;
+  fallbackDir: string;
   fileCount: number | null;
   maxAgeDays: number;
   writable: boolean;
+  usingFallback: boolean;
+  lastError: string | null;
 }> {
   const dir = thumbnailsDir();
   let fileCount: number | null = null;
@@ -122,5 +154,13 @@ export async function thumbnailStoreInfo(): Promise<{
     fileCount = 0; // directory not created yet — nothing stored
     writable = false;
   }
-  return { dir, fileCount, maxAgeDays: 14, writable };
+  return {
+    dir,
+    fallbackDir: FALLBACK_DIR,
+    fileCount,
+    maxAgeDays: 14,
+    writable,
+    usingFallback: usingFallbackDir || !writable,
+    lastError: lastStoreError,
+  };
 }

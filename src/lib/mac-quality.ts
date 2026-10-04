@@ -42,8 +42,14 @@ import {
   type StalkerChannel,
 } from "@/lib/stalker-streams";
 import { buildUserAgentCandidates } from "@/lib/user-agents";
-import { detectFfmpeg, analyzePicture, captureThumbnail, type PictureAnalysis } from "@/lib/ffmpeg-tools";
-import { saveThumbnail } from "@/lib/thumbnail-store";
+import { detectFfmpeg, analyzePicture, type PictureAnalysis } from "@/lib/ffmpeg-tools";
+import {
+  captureChannelThumbnail,
+  summariseThumbnails,
+  thumbnailLogLines,
+  type MacThumbnailReport,
+  type ThumbnailOutcome,
+} from "@/lib/thumbnail-report";
 import { detectLabelMismatch } from "@/lib/label-mismatch";
 import { pMapLimit } from "@/lib/parallel";
 import { redactProxy, type ProxyConfig } from "@/lib/proxy";
@@ -155,6 +161,7 @@ export interface MacStreamQualityReport {
   channels: MacQualityChannelResult[];
   genreGroups: GenreGroupSummary[];
   catchUp: CatchUpVerification;
+  thumbnails: MacThumbnailReport;
   aggregate: MacQualityAggregate;
   notes: string[];
   limitations: string[];
@@ -456,6 +463,13 @@ export async function checkMacStreamQuality(
     return entry?.url ? entry.url : null;
   };
 
+  // Thumbnail bookkeeping: the scan log must say what happened to every
+  // capture (saved where, or why not) — a silent empty directory is the worst
+  // possible outcome for the operator.
+  const thumbnailsEnabled = options.thumbnails ?? true;
+  const thumbnails: ThumbnailOutcome[] = [];
+  const captureThumbnails = thumbnailsEnabled && ffmpeg.available && (options.pictureChecks ?? true);
+
   if (ffmpeg.available && (options.pictureChecks ?? true)) {
     for (let index = 0; index < channels.length; index += 1) {
       if (options.signal?.aborted) break;
@@ -490,16 +504,17 @@ export async function checkMacStreamQuality(
         });
       }
 
-      if (options.thumbnails ?? true) {
-        const capture = await captureThumbnail(liveUrl, {
+      if (captureThumbnails) {
+        const outcome = await captureChannelThumbnail({
+          key: `${options.mac.replace(/[:.]/g, "")}-${index}-${Date.now()}`,
+          channel: channel.name,
+          url: liveUrl,
           userAgent: handshake.userAgent || undefined,
           signal: options.signal,
           timeoutMs: 20000,
         });
-        if (capture.ok && capture.jpeg) {
-          const name = await saveThumbnail(`${options.mac.replace(/[:.]/g, "")}-${index}-${Date.now()}`, capture.jpeg);
-          channel.thumbnail = name;
-        }
+        thumbnails.push(outcome);
+        channel.thumbnail = outcome.name;
       }
     }
   }
@@ -557,6 +572,7 @@ export async function checkMacStreamQuality(
     channels,
     genreGroups,
     catchUp,
+    thumbnails: await summariseThumbnails(thumbnailsEnabled, captureThumbnails, thumbnails),
     aggregate,
     notes,
     limitations,
@@ -707,6 +723,12 @@ function emptyReport(
     tooling: { ffmpeg: { available: ffmpeg.available, version: ffmpeg.version, reason: ffmpeg.reason } },
     channels: [],
     genreGroups: [],
+    thumbnails: {
+      enabled: options.thumbnails ?? true,
+      dir: null,
+      outcomes: [],
+      storeWarning: null,
+    },
     catchUp: {
       status: "not_checked",
       channelName: null,
@@ -812,10 +834,13 @@ export function formatMacQualityLog(report: MacStreamQualityReport): Array<{ lev
     }
   }
 
+  lines.push(...thumbnailLogLines(report.thumbnails));
+
   for (const limitation of report.limitations.slice(0, 2)) {
     lines.push({ level: "info", message: `  ⓘ ${limitation}` });
   }
   return lines;
 }
+
 
 export { resolutionLabel };
