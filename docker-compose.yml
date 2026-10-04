@@ -79,6 +79,11 @@ services:
         condition: service_healthy
     # FFmpeg is included in the published amd64 + arm64 image, so picture
     # checks, FPS/bitrate profiling, and thumbnails work without host mounts.
+    # Do NOT set FFMPEG_PATH here: the app finds the bundled binary on PATH,
+    # and a wrong override only hides it (local source runs are the exception).
+    # If the dashboard's Host capabilities panel reports "ffmpeg: not found",
+    # this container is running an older image — pull the latest one:
+    #   docker compose pull app && docker compose up -d   (or ./update.sh)
     # Optional Synology DS918+ VAAPI mapping lives in docker-compose.vaapi.yml;
     # the app uses software decoding automatically when VAAPI is unavailable.
 

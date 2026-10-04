@@ -7,7 +7,7 @@
  * which blocks path traversal.
  */
 
-import { promises as fs } from "node:fs";
+import { constants, promises as fs } from "node:fs";
 import path from "node:path";
 
 const FALLBACK_DIR = path.join(process.env.TMPDIR || "/tmp", "macattack-thumbnails");
@@ -96,15 +96,31 @@ export async function pruneThumbnails(maxAgeMs = 14 * 24 * 60 * 60 * 1000): Prom
   return removed;
 }
 
-/** Where thumbnails live and how many are stored (for the system panel). */
-export async function thumbnailStoreInfo(): Promise<{ dir: string; fileCount: number | null; maxAgeDays: number }> {
+/**
+ * Where thumbnails live and how many are stored (for the system panel).
+ *
+ * `writable` reports whether the app user can actually create the directory
+ * and write into it. A bind mount owned by another UID (the container runs as
+ * uid 1001) shows up here as `writable: false` instead of a silent "0 files".
+ */
+export async function thumbnailStoreInfo(): Promise<{
+  dir: string;
+  fileCount: number | null;
+  maxAgeDays: number;
+  writable: boolean;
+}> {
+  const dir = thumbnailsDir();
   let fileCount: number | null = null;
+  let writable = false;
   try {
-    const dir = thumbnailsDir();
+    await fs.mkdir(dir, { recursive: true });
+    await fs.access(dir, constants.W_OK);
+    writable = true;
     const names = await fs.readdir(dir);
     fileCount = names.filter((name) => name.endsWith(".jpg")).length;
   } catch {
     fileCount = 0; // directory not created yet — nothing stored
+    writable = false;
   }
-  return { dir: thumbnailsDir(), fileCount, maxAgeDays: 14 };
+  return { dir, fileCount, maxAgeDays: 14, writable };
 }
