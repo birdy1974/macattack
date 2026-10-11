@@ -94,6 +94,7 @@ interface ScanResult {
   qualityCodec?: string | null;
   qualityThroughputMbps?: number | null;
   qualityRequiredMbps?: number | null;
+  qualityFirstByteMs?: number | null;
   qualityChannelsPlayable?: number | null;
   qualityChannelsProbed?: number | null;
   qualityCheckedAt?: string | null;
@@ -153,6 +154,14 @@ interface StreamQualityChannelSummary {
   probe: {
     status: string;
     container: string;
+    timings?: {
+      dnsMs: number | null;
+      tcpMs: number | null;
+      tlsMs: number | null;
+      ttfbMs: number | null;
+      firstByteMs: number | null;
+      firstMediaByteMs?: number | null;
+    } | null;
     sustainedMbps: number | null;
     requiredMbps: number | null;
     resolution: { label: string } | null;
@@ -213,6 +222,7 @@ const AVAILABLE_FIELDS = [
   { key: "qualityCodec", label: "Stream Video Codec (measured)", default: false },
   { key: "qualityThroughputMbps", label: "Stream Throughput (Mbps measured)", default: true },
   { key: "qualityRequiredMbps", label: "Stream Required Bitrate (Mbps)", default: false },
+  { key: "qualityFirstByteMs", label: "Stream Time to First Byte (ms)", default: true },
   { key: "qualityChannels", label: "Stream Channels Playable/Probed", default: false },
   { key: "qualityMeasured", label: "Stream Quality Measured At", default: false },
   { key: "qualityRetries", label: "Stream Retries (transient)", default: false },
@@ -300,6 +310,14 @@ function getPlaybackStability(job: ScanJob | null, results: ScanResult[]): {
     reason,
     badge: "border-amber-800 bg-amber-950/50 text-amber-300",
   };
+}
+
+/** Request start → first media byte (HLS: first segment), mirrors timeToFirstByteMs in stream-probe. */
+function firstByteOf(probe: StreamQualityChannelSummary["probe"]): number | null {
+  if (!probe?.timings) return null;
+  return probe.container === "hls"
+    ? probe.timings.firstMediaByteMs ?? null
+    : probe.timings.firstByteMs ?? null;
 }
 
 function subscribeLogAutoRefresh(listener: () => void): () => void {
@@ -1196,6 +1214,9 @@ export default function MacAttackPage() {
     if (field === "qualityThroughputMbps") {
       return result.qualityThroughputMbps != null ? `${result.qualityThroughputMbps.toFixed(2)} Mbps` : "—";
     }
+    if (field === "qualityFirstByteMs") {
+      return result.qualityFirstByteMs != null ? `${Math.round(result.qualityFirstByteMs)} ms` : "not measured";
+    }
     if (field === "qualityRequiredMbps") {
       return result.qualityRequiredMbps != null ? `${result.qualityRequiredMbps.toFixed(2)} Mbps` : "—";
     }
@@ -1308,6 +1329,7 @@ export default function MacAttackPage() {
         qualityCodec?: string | null;
         qualityThroughputMbps?: number | null;
         qualityRequiredMbps?: number | null;
+        qualityFirstByteMs?: number | null;
         qualityChannelsPlayable?: number | null;
         qualityChannelsProbed?: number | null;
         qualityCheckedAt?: string | null;
@@ -1331,6 +1353,7 @@ export default function MacAttackPage() {
                 qualityCodec: data.qualityCodec ?? result.qualityCodec,
                 qualityThroughputMbps: data.qualityThroughputMbps ?? result.qualityThroughputMbps,
                 qualityRequiredMbps: data.qualityRequiredMbps ?? result.qualityRequiredMbps,
+                qualityFirstByteMs: data.qualityFirstByteMs ?? result.qualityFirstByteMs,
                 qualityChannelsPlayable: data.qualityChannelsPlayable ?? result.qualityChannelsPlayable,
                 qualityChannelsProbed: data.qualityChannelsProbed ?? result.qualityChannelsProbed,
                 qualityCheckedAt: data.qualityCheckedAt ?? result.qualityCheckedAt,
@@ -3749,6 +3772,9 @@ export default function MacAttackPage() {
                                               {result.qualityStabilityScore ?? "—"}/10
                                             </p>
                                             <p className="text-xs text-gray-500 mt-0.5">
+                                              {result.qualityFirstByteMs != null
+                                                ? `first byte ${Math.round(result.qualityFirstByteMs)} ms (median) · `
+                                                : ""}
                                               {result.qualityChannelsProbed != null
                                                 ? `${result.qualityChannelsPlayable ?? 0}/${result.qualityChannelsProbed} channels playable`
                                                 : "channels not probed"}
@@ -3979,6 +4005,7 @@ export default function MacAttackPage() {
                                                   <th className="text-left py-1 pr-3">Speed</th>
                                                   <th className="text-left py-1 pr-3">Quality</th>
                                                   <th className="text-left py-1 pr-3">Stability</th>
+                                                  <th className="text-left py-1 pr-3">First byte</th>
                                                   <th className="text-left py-1">Evidence</th>
                                                 </tr>
                                               </thead>
@@ -3995,6 +4022,12 @@ export default function MacAttackPage() {
                                                     <td className="py-1 pr-3 font-mono">{channel.score?.speed ?? "—"}</td>
                                                     <td className="py-1 pr-3 font-mono">{channel.score?.quality ?? "—"}</td>
                                                     <td className="py-1 pr-3 font-mono">{channel.score?.stability ?? "—"}</td>
+                                                    <td className="py-1 pr-3 font-mono" title="Request start to first media byte (HLS: first segment)">
+                                                      {(() => {
+                                                        const ms = firstByteOf(channel.probe);
+                                                        return ms != null ? `${Math.round(ms)} ms` : "—";
+                                                      })()}
+                                                    </td>
                                                     <td className="py-1 text-gray-500 max-w-96 whitespace-pre-wrap break-words">
                                                       {channel.score?.evidence?.slice(0, 2).join(" · ") ?? "—"}
                                                       {channel.score?.penalties && channel.score.penalties.length > 0

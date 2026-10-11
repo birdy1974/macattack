@@ -338,7 +338,7 @@ The report separates portal responsiveness from actual stream delivery:
 - **When a MAC passes your filters, MacAttack measures the real media path** (on by default, see step 8):
   it lists the portal's channels, resolves real stream URLs with `create_link`, and probes either the channels named
   in the watch list (see step 8) or a genre-spread sample of those streams. It measures sustained throughput vs. the bitrate the stream needs, the variant
-  ladder (resolution/codec/bandwidth), HLS segment transfer time vs. segment duration (can the connection
+  ladder (resolution/codec/bandwidth), time to first media byte (request → first byte of the stream; for HLS, the first segment), HLS segment transfer time vs. segment duration (can the connection
   keep up with real time?), MPEG-TS continuity-counter errors and scrambled packets, and DRM.
 - The result is a **speed / picture-quality / stability / overall score (0–10) with a verdict**, stored per
   result and exportable (`Stream Quality Verdict`, `Stream Quality Score`, …). Every report lists what it

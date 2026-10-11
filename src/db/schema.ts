@@ -145,6 +145,8 @@ export const scanResults = pgTable("scan_results", {
   qualityRequiredMbps: real("quality_required_mbps"),
   qualityChannelsPlayable: integer("quality_channels_playable"),
   qualityChannelsProbed: integer("quality_channels_probed"),
+  /** Median time from request to first media byte across probed channels (ms). */
+  qualityFirstByteMs: real("quality_first_byte_ms"),
   qualityCheckedAt: timestamp("quality_checked_at"),
   qualityReport: jsonb("quality_report").$type<unknown>(),
   /** Extra evidence columns for the results table / CSV. */

@@ -78,6 +78,7 @@ const JOB_ALTERS = [
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS xtream_password TEXT",
 ];
 const RESULT_ALTERS = [
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_first_byte_ms REAL",
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS response_time_ms INTEGER",
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS handshake_time_ms INTEGER",
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS account_info_time_ms INTEGER",

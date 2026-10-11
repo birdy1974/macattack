@@ -69,6 +69,7 @@ function flatten(report: MacStreamQualityReport) {
     qualityRequiredMbps: measured?.probe?.requiredMbps ?? null,
     qualityChannelsPlayable: report.aggregate.channelsPlayable,
     qualityChannelsProbed: report.aggregate.channelsProbed,
+    qualityFirstByteMs: report.aggregate.firstByteMsMedian,
     qualityCheckedAt: new Date(report.measuredAt),
     qualityReport: report,
   };

@@ -24,6 +24,7 @@
 
 import {
   probeStream,
+  timeToFirstByteMs,
   scoreStreamProbe,
   resolutionLabel,
   type StreamProbeResult,
@@ -125,6 +126,10 @@ export interface CatchUpVerification {
 }
 
 export interface MacQualityAggregate {
+  /** Median time from HTTP request to the first media byte, across measured channels (ms). */
+  firstByteMsMedian: number | null;
+  /** Slowest channel's time to first media byte (ms). */
+  firstByteMsMax: number | null;
   channelsProbed: number;
   channelsPlayable: number;
   linksFailed: number;
@@ -275,7 +280,24 @@ export function aggregateChannels(channels: AggregatableChannel[]): MacQualityAg
   const frozenChannels = scores.filter((score) => score.frozen).length;
   const verdict = verdictFor(overallScore);
 
+  // Time to first media byte: request start → first body byte of the stream URL.
+  const firstBytes = probes
+    .map((probe) => timeToFirstByteMs(probe))
+    .filter((ms): ms is number => typeof ms === "number" && Number.isFinite(ms));
+  const sortedFirstBytes = [...firstBytes].sort((a, b) => a - b);
+  const medianFirstByte =
+    sortedFirstBytes.length === 0
+      ? null
+      : Math.round(
+          (sortedFirstBytes.length % 2
+            ? sortedFirstBytes[(sortedFirstBytes.length - 1) / 2]
+            : (sortedFirstBytes[sortedFirstBytes.length / 2 - 1] + sortedFirstBytes[sortedFirstBytes.length / 2]) / 2) *
+            10
+        ) / 10;
+
   return {
+    firstByteMsMedian: medianFirstByte,
+    firstByteMsMax: sortedFirstBytes.length === 0 ? null : Math.round(sortedFirstBytes[sortedFirstBytes.length - 1] * 10) / 10,
     channelsProbed: scores.length,
     channelsPlayable: playable,
     linksFailed: channels.filter((entry) => !entry.probe).length,
@@ -782,6 +804,8 @@ function emptyReport(
       error: notes[0] ?? null,
     },
     aggregate: {
+      firstByteMsMedian: null,
+      firstByteMsMax: null,
       channelsProbed: 0,
       channelsPlayable: 0,
       linksFailed: 0,
@@ -827,6 +851,14 @@ export function formatMacQualityLog(report: MacStreamQualityReport): Array<{ lev
       `Stream quality: ${aggregate.label} — overall ${aggregate.overallScore ?? "?"}/10 ` +
       `(speed ${aggregate.speedScore ?? "?"} · quality ${aggregate.qualityScore ?? "?"} · stability ${aggregate.stabilityScore ?? "?"})`,
   });
+  if (aggregate.firstByteMsMedian !== null) {
+    lines.push({
+      level: "info",
+      message: `Time to first byte: median ${Math.round(aggregate.firstByteMsMedian)} ms, slowest ${Math.round(
+        aggregate.firstByteMsMax ?? aggregate.firstByteMsMedian
+      )} ms`,
+    });
+  }
   lines.push({
     level: "info",
     message:
@@ -858,7 +890,9 @@ export function formatMacQualityLog(report: MacStreamQualityReport): Array<{ lev
     const resolution = probe.resolution?.label ?? "unknown resolution";
     const speed = probe.sustainedMbps !== null ? `${probe.sustainedMbps.toFixed(2)} Mbps` : "no throughput figure";
     const required = probe.requiredMbps !== null ? ` of ${probe.requiredMbps.toFixed(2)} required` : "";
+    const firstByte = timeToFirstByteMs(probe);
     const extras = [
+      firstByte !== null && firstByte !== undefined ? `first byte ${Math.round(firstByte)} ms` : null,
       channel.labelMismatch ? "MISLABELED" : null,
       channel.picture?.frozenDetected ? "FROZEN PICTURE" : null,
       probe.retryCount > 0 ? `${probe.retryCount} retry` : null,

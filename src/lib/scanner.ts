@@ -1943,6 +1943,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
                   qualityRequiredMbps: measuredChannel?.probe?.requiredMbps ?? null,
                   qualityChannelsPlayable: aggregate.channelsPlayable,
                   qualityChannelsProbed: aggregate.channelsProbed,
+                  qualityFirstByteMs: aggregate.firstByteMsMedian,
                   qualityCheckedAt: new Date(qualityReport.measuredAt),
                   qualityReport,
                   qualityFrozen: aggregate.frozenChannels > 0 ? 1 : 0,

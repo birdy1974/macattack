@@ -66,6 +66,7 @@ export async function GET(request: NextRequest) {
         qualityRequiredMbps: scanResults.qualityRequiredMbps,
         qualityChannelsPlayable: scanResults.qualityChannelsPlayable,
         qualityChannelsProbed: scanResults.qualityChannelsProbed,
+        qualityFirstByteMs: scanResults.qualityFirstByteMs,
         qualityCheckedAt: scanResults.qualityCheckedAt,
         qualityFrozen: scanResults.qualityFrozen,
         qualityLabelMismatch: scanResults.qualityLabelMismatch,
