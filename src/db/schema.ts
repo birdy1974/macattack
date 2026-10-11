@@ -70,7 +70,9 @@ export const scanJobs = pgTable("scan_jobs", {
   // ── Stream quality check (runs for every MAC that passes the filters) ──
   qualityCheckEnabled: integer("quality_check_enabled").notNull().default(1),
   qualityChannels: integer("quality_channels").notNull().default(3),
-  qualitySampleMs: integer("quality_sample_ms").notNull().default(8000),
+  qualitySampleMs: integer("quality_sample_ms").notNull().default(30000),
+  /** Comma-separated channel names to measure instead of the genre spread (fuzzy-matched). */
+  qualityChannelWatchlist: text("quality_channel_watchlist").notNull().default(""),
   // Optional add-ons (all safe to leave off / unavailable)
   uaRotationEnabled: integer("ua_rotation_enabled").notNull().default(1),
   pictureChecksEnabled: integer("picture_checks_enabled").notNull().default(1),

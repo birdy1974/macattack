@@ -42,6 +42,7 @@ import {
   type StalkerChannel,
 } from "@/lib/stalker-streams";
 import { buildUserAgentCandidates } from "@/lib/user-agents";
+import { selectWatchlistChannels, parseWatchlist } from "@/lib/channel-watchlist";
 import { detectFfmpeg, analyzePicture, type PictureAnalysis } from "@/lib/ffmpeg-tools";
 import {
   captureChannelThumbnail,
@@ -63,9 +64,14 @@ export interface MacQualityCheckOptions {
   portalBase: string;
   mac: string;
   timeoutMs?: number;
-  /** How many channels to probe (default 3, clamped 1–8). */
+  /** How many channels to probe (default 3, clamped 1–8). Ignored when `watchlist` is set. */
   channelsToProbe?: number;
-  /** Media sample window per channel (default 8000 ms). */
+  /**
+   * Channel names to measure instead of the genre spread (fuzzy-matched; every
+   * channel sharing a matched name is probed). Empty/null = automatic selection.
+   */
+  watchlist?: string[] | string | null;
+  /** Media sample window per channel (default 30000 ms, clamped 3000–60000). */
   sampleMs?: number;
   maxBytesPerProbe?: number;
   signal?: AbortSignal;
@@ -89,6 +95,8 @@ export interface MacQualityCheckOptions {
 
 export interface MacQualityChannelResult {
   name: string;
+  /** Watch-list entry that selected this channel (null when chosen by genre spread). */
+  watchQuery?: string | null;
   genreId: string | null;
   genreTitle: string | null;
   /** Token-redacted URL so stored reports cannot be replayed. */
@@ -168,7 +176,9 @@ export interface MacStreamQualityReport {
 }
 
 const DEFAULT_CHANNELS = 3;
-const DEFAULT_SAMPLE_MS = 8000;
+const DEFAULT_SAMPLE_MS = 30000;
+const MIN_SAMPLE_MS = 3000;
+const MAX_SAMPLE_MS = 60000;
 const DEFAULT_CONCURRENCY = 2;
 
 function clamp(value: number, min: number, max: number): number {
@@ -295,13 +305,16 @@ export async function checkMacStreamQuality(
 ): Promise<MacStreamQualityReport> {
   const startedAt = Date.now();
   const channelsToProbe = clamp(options.channelsToProbe ?? DEFAULT_CHANNELS, 1, 8);
-  const sampleMs = clamp(options.sampleMs ?? DEFAULT_SAMPLE_MS, 3000, 30000);
+  const sampleMs = clamp(options.sampleMs ?? DEFAULT_SAMPLE_MS, MIN_SAMPLE_MS, MAX_SAMPLE_MS);
   const concurrency = clamp(options.concurrency ?? DEFAULT_CONCURRENCY, 1, 4);
+  const watchQueries = parseWatchlist(options.watchlist);
   const notes: string[] = [];
 
   const limitations = [
     "Measured from the scanner host's network (or the configured proxy), not the viewer's device, Wi-Fi or ISP route.",
-    `Only ${channelsToProbe} channel(s) were sampled for a few seconds each — peak-hour congestion and future outages are not covered.`,
+    watchQueries.length > 0
+      ? `Only the watch-listed channels were sampled (${sampleMs / 1000} s each) — peak-hour congestion and future outages are not covered.`
+      : `Only ${channelsToProbe} channel(s) were sampled (${sampleMs / 1000} s each) — peak-hour congestion and future outages are not covered.`,
     "Stream URLs are stored with session tokens removed; re-checking requires a fresh create_link.",
   ];
 
@@ -357,7 +370,10 @@ export async function checkMacStreamQuality(
   clientOptions.userAgent = handshake.userAgent ?? undefined;
 
   // ── channel list ──────────────────────────────────────────────────────────
-  const list = await stalkerListChannels(clientOptions, handshake.token, { maxChannels: 400, maxGenres: 8 });
+  const list = await stalkerListChannels(clientOptions, handshake.token, {
+    maxChannels: watchQueries.length > 0 ? 3000 : 400,
+    maxGenres: 8,
+  });
   notes.push(
     list.source === "get_all_channels"
       ? `Channel list from get_all_channels (${list.channels.length} channels)`
@@ -366,7 +382,30 @@ export async function checkMacStreamQuality(
         : `No channel list available: ${list.error ?? "unknown reason"}`
   );
 
-  const selection = selectChannelsForProbe(list.channels, channelsToProbe);
+  // Which watch-list entry picked each channel (for the report and the log).
+  const watchQueryFor = new Map<StalkerChannel, string>();
+  let selection: StalkerChannel[];
+  if (watchQueries.length > 0) {
+    const { selected, matches } = selectWatchlistChannels(list.channels, watchQueries);
+    selection = selected.map((entry) => entry.channel);
+    for (const entry of selected) watchQueryFor.set(entry.channel, entry.query);
+    for (const match of matches) {
+      if (match.tier === "none") {
+        notes.push(`Watch list: no channel matched "${match.query}"`);
+        continue;
+      }
+      const names = match.channels.map((channel) => channel.name);
+      const preview = names.slice(0, 4).join(", ") + (names.length > 4 ? `, +${names.length - 4} more` : "");
+      notes.push(
+        `Watch list "${match.query}": ${match.channels.length} channel(s) via ${match.tier} match — ${preview}`
+      );
+    }
+    if (list.source === "ordered_list") {
+      notes.push("Channel list came from per-genre ordered lists, so a watch-listed channel may be missing from it.");
+    }
+  } else {
+    selection = selectChannelsForProbe(list.channels, channelsToProbe);
+  }
   const genreTitles = list.genreTitles;
 
   // ── resolve links (small parallel pool; cheap API calls) ──────────────────
@@ -393,6 +432,7 @@ export async function checkMacStreamQuality(
         linksFailed += 1;
         return {
           name: channel.name,
+          watchQuery: watchQueryFor.get(channel) ?? null,
           genreId: channel.genreId,
           genreTitle: channel.genreId ? genreTitles[channel.genreId] ?? null : null,
           url: null,
@@ -426,6 +466,7 @@ export async function checkMacStreamQuality(
 
       return {
         name: channel.name,
+        watchQuery: watchQueryFor.get(channel) ?? null,
         genreId: channel.genreId,
         genreTitle: channel.genreId ? genreTitles[channel.genreId] ?? null : null,
         url: redactStreamUrl(url),
@@ -446,6 +487,7 @@ export async function checkMacStreamQuality(
     .filter((entry): entry is NonNullable<typeof entry> => !!entry)
     .map((entry) => ({
       name: entry.name,
+      watchQuery: entry.watchQuery,
       genreId: entry.genreId,
       genreTitle: entry.genreTitle,
       url: entry.url,

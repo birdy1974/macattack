@@ -64,7 +64,7 @@ export async function POST(request: NextRequest) {
     const { report, account, error } = await checkXtreamAccountQuality({
       credentials,
       channelsToProbe: Math.max(1, Math.min(Number(body.channels) || 3, 8)),
-      sampleMs: Math.max(3000, Math.min(Number(body.sampleMs) || 8000, 30000)),
+      sampleMs: Math.max(3000, Math.min(Number(body.sampleMs) || 8000, 60000)),
       pictureChecks: body.pictureChecks !== false,
       thumbnails: body.thumbnails !== false,
     });

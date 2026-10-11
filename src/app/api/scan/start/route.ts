@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { scanJobs } from "@/db/schema";
 import { startScan } from "@/lib/scanner";
 import { parseMacList } from "@/lib/mac-list";
+import { parseWatchlist } from "@/lib/channel-watchlist";
 
 export async function POST(request: NextRequest) {
   try {
@@ -36,6 +37,7 @@ export async function POST(request: NextRequest) {
       qualityCheckEnabled?: boolean;
       qualityChannels?: number;
       qualitySampleMs?: number;
+      qualityChannelWatchlist?: string;
       uaRotationEnabled?: boolean;
       pictureChecksEnabled?: boolean;
       thumbnailsEnabled?: boolean;
@@ -84,7 +86,8 @@ export async function POST(request: NextRequest) {
       expireFilterIncludeUnlimited = true,
       qualityCheckEnabled = true,
       qualityChannels = 3,
-      qualitySampleMs = 8000,
+      qualitySampleMs = 30000,
+      qualityChannelWatchlist = "",
       uaRotationEnabled = true,
       pictureChecksEnabled = true,
       thumbnailsEnabled = true,
@@ -146,7 +149,8 @@ export async function POST(request: NextRequest) {
         expireFilterIncludeUnlimited: expireFilterIncludeUnlimited ? 1 : 0,
         qualityCheckEnabled: qualityCheckEnabled ? 1 : 0,
         qualityChannels: Math.max(1, Math.min(Number(qualityChannels) || 3, 8)),
-        qualitySampleMs: Math.max(3000, Math.min(Number(qualitySampleMs) || 8000, 30000)),
+        qualitySampleMs: Math.max(3000, Math.min(Number(qualitySampleMs) || 30000, 60000)),
+        qualityChannelWatchlist: parseWatchlist(qualityChannelWatchlist).join(", "),
         uaRotationEnabled: uaRotationEnabled ? 1 : 0,
         pictureChecksEnabled: pictureChecksEnabled ? 1 : 0,
         thumbnailsEnabled: thumbnailsEnabled ? 1 : 0,

@@ -12,7 +12,8 @@
     "test:quality": "npx --yes tsx scripts/mac-quality-tests.ts",
     "probe:url": "npx --yes tsx scripts/probe-selftest.ts",
     "test:waves": "npx --yes tsx scripts/wave-tests.ts",
-    "test:xtream": "npx --yes tsx scripts/xtream-tests.ts"
+    "test:xtream": "npx --yes tsx scripts/xtream-tests.ts",
+    "test:watchlist": "npx --yes tsx scripts/watchlist-tests.ts"
   },
   "dependencies": {
     "dotenv": "17.3.1",

@@ -97,7 +97,7 @@ export async function checkXtreamAccountQuality(
   }
 
   const channelsToProbe = clamp(options.channelsToProbe ?? DEFAULT_CHANNELS, 1, 8);
-  const sampleMs = clamp(options.sampleMs ?? DEFAULT_SAMPLE_MS, 3000, 30000);
+  const sampleMs = clamp(options.sampleMs ?? DEFAULT_SAMPLE_MS, 3000, 60000);
   const concurrency = clamp(options.concurrency ?? 2, 1, 4);
 
   const login = await xtreamAccount(credentials, { timeoutMs: options.timeoutMs, signal: options.signal });

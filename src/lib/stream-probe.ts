@@ -203,7 +203,7 @@ export interface StreamProbeResult {
 }
 
 export interface StreamProbeOptions {
-  /** How long to watch the media path. Default 8000 ms, clamped 2000–30000. */
+  /** How long to watch the media path. Default 8000 ms, clamped 2000–60000. */
   sampleMs?: number;
   /** Per-request inactivity/connect timeout. Default 8000 ms. */
   timeoutMs?: number;
@@ -1327,7 +1327,7 @@ export async function probeStream(
   url: string,
   options: StreamProbeOptions = {}
 ): Promise<StreamProbeResult> {
-  const sampleMs = clamp(options.sampleMs ?? DEFAULT_SAMPLE_MS, 2000, 30000);
+  const sampleMs = clamp(options.sampleMs ?? DEFAULT_SAMPLE_MS, 2000, 60000);
   const timeoutMs = clamp(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, 1500, 30000);
   const maxBytes = clamp(options.maxBytes ?? DEFAULT_MAX_BYTES, 256 * 1024, 512 * 1024 * 1024);
   const maxDepth = clamp(options.maxPlaylistDepth ?? 3, 1, 5);

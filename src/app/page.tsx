@@ -9,6 +9,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import Image from "next/image";
+import { parseWatchlist } from "@/lib/channel-watchlist";
 import {
   DEFAULT_WEEK_SCHEDULE,
   WEEKDAYS,
@@ -27,6 +28,9 @@ interface ScanJob {
   portalUrl: string;
   macPrefix: string;
   status: string;
+  qualityCheckEnabled?: number | boolean;
+  qualitySampleMs?: number;
+  qualityChannelWatchlist?: string;
   timeoutMs: number;
   outputFilename: string;
   selectedFields: string[];
@@ -245,6 +249,59 @@ const AVAILABLE_FIELDS = [
 const LOG_AUTO_REFRESH_STORAGE_KEY = "macattack.logAutoRefresh";
 const logAutoRefreshListeners = new Set<() => void>();
 
+/**
+ * Playback stability for the job-level report, derived from the per-MAC media
+ * path measurements (the same numbers shown in each result's "Measured stream
+ * quality" block). NOT TESTED only when no MAC produced a measurement.
+ */
+function getPlaybackStability(job: ScanJob | null, results: ScanResult[]): {
+  measured: number;
+  average: number | null;
+  label: string;
+  reason: string;
+  badge: string;
+} {
+  const measuredResults = results.filter(
+    (result) =>
+      typeof result.qualityStabilityScore === "number" &&
+      (result.qualityChannelsProbed ?? 0) > 0
+  );
+  if (measuredResults.length > 0) {
+    const average =
+      Math.round(
+        (measuredResults.reduce((sum, result) => sum + (result.qualityStabilityScore ?? 0), 0) /
+          measuredResults.length) *
+          10
+      ) / 10;
+    const badge =
+      average >= 7
+        ? "border-green-800 bg-green-950/50 text-green-300"
+        : average >= 5
+          ? "border-yellow-800 bg-yellow-950/40 text-yellow-300"
+          : "border-red-800 bg-red-950/40 text-red-300";
+    return {
+      measured: measuredResults.length,
+      average,
+      label: `Playback stability: ${average}/10`,
+      reason: `Measured on ${measuredResults.length} MAC${measuredResults.length === 1 ? "" : "s"} via the media path`,
+      badge,
+    };
+  }
+  const reason =
+    job?.qualityCheckEnabled === 0 || job?.qualityCheckEnabled === false
+      ? "The stream quality check was switched off for this scan."
+      : !job || job.totalFound === 0
+        ? "No MAC has passed the filters yet, so no channel has been opened."
+        : "No channel could be measured for the MACs found so far. Check the scan log for the stream-quality lines.";
+  return {
+    measured: 0,
+    average: null,
+    label: "Playback stability: NOT TESTED",
+    reason,
+    badge: "border-amber-800 bg-amber-950/50 text-amber-300",
+  };
+}
+
 function subscribeLogAutoRefresh(listener: () => void): () => void {
   logAutoRefreshListeners.add(listener);
   // Keep multiple open tabs in sync.
@@ -318,7 +375,9 @@ export default function MacAttackPage() {
   const [genreMatchSeries, setGenreMatchSeries] = useState(true);
   const [qualityCheckEnabled, setQualityCheckEnabled] = useState(true);
   const [qualityChannels, setQualityChannels] = useState(3);
-  const [qualitySampleMs, setQualitySampleMs] = useState(8000);
+  const [qualitySampleMs, setQualitySampleMs] = useState(30000);
+  const [qualityWatchlist, setQualityWatchlist] = useState("NPO 1, RTL 4, ZIGGO");
+  const qualityWatchlistCount = parseWatchlist(qualityWatchlist).length;
   // Wave add-ons (all optional; ffmpeg-dependent ones are labelled in the UI)
   const [uaRotationEnabled, setUaRotationEnabled] = useState(true);
   const [pictureChecksEnabled, setPictureChecksEnabled] = useState(true);
@@ -606,6 +665,9 @@ export default function MacAttackPage() {
               expireFilterEnabled?: number | boolean;
               expireFilterMinDate?: string | null;
               expireFilterIncludeUnlimited?: number | boolean;
+              qualityCheckEnabled?: number | boolean;
+              qualitySampleMs?: number;
+              qualityChannelWatchlist?: string;
             };
             if (j.genreFilterEnabled !== undefined) {
               setGenreFilterEnabled(Boolean(j.genreFilterEnabled));
@@ -613,6 +675,11 @@ export default function MacAttackPage() {
               setGenreMatchLive(j.genreFilterMatchLive !== 0 && j.genreFilterMatchLive !== false);
               setGenreMatchVod(j.genreFilterMatchVod !== 0 && j.genreFilterMatchVod !== false);
               setGenreMatchSeries(j.genreFilterMatchSeries !== 0 && j.genreFilterMatchSeries !== false);
+            }
+            if (j.qualityCheckEnabled !== undefined) {
+              setQualityCheckEnabled(Boolean(j.qualityCheckEnabled));
+              if (j.qualitySampleMs) setQualitySampleMs(j.qualitySampleMs);
+              if (typeof j.qualityChannelWatchlist === "string") setQualityWatchlist(j.qualityChannelWatchlist);
             }
             if (j.expireFilterEnabled !== undefined) {
               setExpireFilterEnabled(Boolean(j.expireFilterEnabled));
@@ -775,6 +842,7 @@ export default function MacAttackPage() {
           qualityCheckEnabled,
           qualityChannels,
           qualitySampleMs,
+          qualityChannelWatchlist: qualityWatchlist,
           uaRotationEnabled,
           pictureChecksEnabled,
           thumbnailsEnabled,
@@ -1615,6 +1683,7 @@ export default function MacAttackPage() {
     return "text-red-300";
   };
 
+  const playbackStability = getPlaybackStability(job, results);
   const getPortalCheckAssessment = (currentJob: ScanJob) => {
     if (currentJob.httpError) {
       return { label: "HTTP check failed", color: "text-red-300" };
@@ -2704,13 +2773,14 @@ export default function MacAttackPage() {
                       <div className="flex flex-wrap gap-1">
                         {[
                           { label: "Today", offset: 0 },
-                          { label: "+1 mo", offset: 30 },
+                          { label: "+9 mo", offset: 0, months: 9 },
                           { label: "+3 mo", offset: 90 },
                           { label: "+6 mo", offset: 180 },
                           { label: "+1 yr", offset: 365 },
                         ].map((p) => {
                           const d = new Date();
-                          d.setDate(d.getDate() + p.offset);
+                          if (p.months) d.setMonth(d.getMonth() + p.months);
+                          else d.setDate(d.getDate() + p.offset);
                           const iso = d.toISOString().slice(0, 10);
                           return (
                             <button
@@ -2768,13 +2838,32 @@ export default function MacAttackPage() {
                   <span className="block text-xs text-gray-500 mt-1">
                     When a MAC passes the filters, MacAttack lists the portal&apos;s channels, resolves real
                     stream URLs with <em>create_link</em> and measures throughput vs. required bitrate,
-                    resolution/codec and transport-stream stability. Adds roughly 10–30 seconds per found MAC.
+                    resolution/codec and transport-stream stability. Each probed channel is sampled for the
+                    sample window below, so a found MAC adds about{" "}
+                    {Math.round((qualityWatchlistCount > 0 ? qualityWatchlistCount : qualityChannels) * (qualitySampleMs / 1000))} s
+                    with the current settings (channels × sample; probes run in parallel, so it is often less).
                   </span>
                 </span>
               </label>
 
               {qualityCheckEnabled && (
                 <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <label className="block sm:col-span-2">
+                    <span className="text-xs text-gray-400">Channel watch list (optional, fuzzy match)</span>
+                    <input
+                      type="text"
+                      value={qualityWatchlist}
+                      onChange={(e) => setQualityWatchlist(e.target.value)}
+                      disabled={isRunning}
+                      placeholder="NPO 1, RTL 4, ZIGGO"
+                      className="mt-1 w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 focus:outline-none focus:border-cyan-500 disabled:opacity-50"
+                    />
+                    <span className="block text-xs text-gray-500 mt-1">
+                      Comma-separated. Names match ignoring case, spaces, HD/FHD tags and country prefixes
+                      (e.g. &quot;NPO1&quot; finds &quot;NL: NPO 1 HD&quot;). Every channel that carries a matched name is
+                      measured and recorded. Leave empty to probe the automatic genre spread instead.
+                    </span>
+                  </label>
                   <label className="block">
                     <span className="text-xs text-gray-400">Channels to probe (1–8)</span>
                     <input
@@ -2787,22 +2876,22 @@ export default function MacAttackPage() {
                       className="mt-1 w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 focus:outline-none focus:border-cyan-500 disabled:opacity-50"
                     />
                     <span className="block text-xs text-gray-500 mt-1">
-                      Spread across genres so one broken category cannot dominate the verdict.
+                      Used when no watch list is set. Spread across genres so one broken category cannot dominate the verdict.
                     </span>
                   </label>
                   <label className="block">
-                    <span className="text-xs text-gray-400">Sample per channel (3–30 seconds)</span>
+                    <span className="text-xs text-gray-400">Sample per channel (3–60 seconds)</span>
                     <input
                       type="number"
                       min={3}
-                      max={30}
+                      max={60}
                       value={Math.round(qualitySampleMs / 1000)}
-                      onChange={(e) => setQualitySampleMs(Math.max(3, Math.min(30, Number(e.target.value) || 8)) * 1000)}
+                      onChange={(e) => setQualitySampleMs(Math.max(3, Math.min(60, Number(e.target.value) || 30)) * 1000)}
                       disabled={isRunning}
                       className="mt-1 w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 focus:outline-none focus:border-cyan-500 disabled:opacity-50"
                     />
                     <span className="block text-xs text-gray-500 mt-1">
-                      Longer windows catch stalls and bitrate dips; shorter windows keep scans fast.
+                      Default 30 s (maximum 60 s). Longer windows catch stalls and bitrate dips; shorter windows keep scans fast.
                     </span>
                   </label>
                 </div>
@@ -3104,6 +3193,7 @@ export default function MacAttackPage() {
             {/* Portal connectivity and playback-scope report */}
             {job && (job.diagnosticsAt || job.pingAvgMs !== null || job.httpTotalMs !== null) && (
               <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
+
                 <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
                   <div>
                     <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">
@@ -3115,19 +3205,33 @@ export default function MacAttackPage() {
                         : "measurement time unavailable"}
                     </p>
                   </div>
-                  <span className="px-3 py-1.5 rounded-full border border-amber-800 bg-amber-950/50 text-xs font-semibold text-amber-300">
-                    Playback stability: NOT TESTED
+                  <span
+                    className={`px-3 py-1.5 rounded-full border text-xs font-semibold ${playbackStability.badge}`}
+                    title={playbackStability.reason}
+                  >
+                    {playbackStability.label}
                   </span>
                 </div>
 
-                <div className="mb-4 rounded-lg border border-amber-900/70 bg-amber-950/25 p-3">
-                  <p className="text-sm font-semibold text-amber-200">
-                    No stream-quality score is available from this scan.
-                  </p>
-                  <p className="text-xs leading-relaxed text-gray-300 mt-1">
-                    These checks measure the scanner server&apos;s connection to the portal and its control API. The scanner does not open a channel or play media, so it cannot report startup time, bitrate, stalls, or freeze likelihood. The media server and the viewer&apos;s device/network may use a different route.
-                  </p>
-                </div>
+                {playbackStability.measured > 0 ? (
+                  <div className="mb-4 rounded-lg border border-cyan-900/70 bg-cyan-950/20 p-3">
+                    <p className="text-sm font-semibold text-cyan-200">
+                      Stream quality measured for {playbackStability.measured} MAC{playbackStability.measured === 1 ? "" : "s"} (average stability {playbackStability.average}/10).
+                    </p>
+                    <p className="text-xs leading-relaxed text-gray-300 mt-1">
+                      Channels were opened and sampled from the scanner host (or the configured proxy) for the sample window set in the stream quality check. Transport-stream stability, throughput and resolution are per MAC under &quot;Measured stream quality&quot; in each result. The viewer&apos;s device, Wi-Fi and ISP route are not measured, and peak-hour congestion is not covered.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="mb-4 rounded-lg border border-amber-900/70 bg-amber-950/25 p-3">
+                    <p className="text-sm font-semibold text-amber-200">
+                      No stream-quality score is available from this scan.
+                    </p>
+                    <p className="text-xs leading-relaxed text-gray-300 mt-1">
+                      These portal checks measure the scanner server&apos;s connection to the portal and its control API. Channel playback is measured separately, per MAC, by the stream quality check (🎚️ on before the scan). It opens the channels a found MAC can play and samples them, which gives throughput, resolution/codec and transport-stream stability. {playbackStability.reason}
+                    </p>
+                  </div>
+                )}
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3 mb-4">
                   <div className="bg-gray-800/60 rounded-lg p-3">

@@ -102,7 +102,7 @@ export async function POST(request: NextRequest) {
       intervalMinutes: Math.max(MIN_INTERVAL_MINUTES, Math.min(Number(body.intervalMinutes) || 360, 10080)),
       alertOn: (body.alertOn || "degrading,poor,unusable").slice(0, 120),
       channels: Math.max(1, Math.min(Number(body.channels) || 3, 8)),
-      sampleMs: Math.max(3000, Math.min(Number(body.sampleMs) || 8000, 30000)),
+      sampleMs: Math.max(3000, Math.min(Number(body.sampleMs) || 8000, 60000)),
     };
 
     const [existing] = await db.select().from(monitors).where(eq(monitors.resultId, resultId)).limit(1);
