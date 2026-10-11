@@ -4,6 +4,7 @@ import { db } from "@/db";
 import { qualityProbeRuns, scanJobs, scanResults, settings } from "@/db/schema";
 import { validateStalkerPortal } from "@/lib/scanner";
 import { checkMacStreamQuality, type MacStreamQualityReport } from "@/lib/mac-quality";
+import { parseWatchlist } from "@/lib/channel-watchlist";
 import { detectDegradation, summariseHistory, type ProbeRun } from "@/lib/quality-history";
 import { parseProxyList } from "@/lib/proxy";
 import { parseUserAgentList, userAgentSettingKey } from "@/lib/user-agents";
@@ -68,6 +69,7 @@ function flatten(report: MacStreamQualityReport) {
     qualityRequiredMbps: measured?.probe?.requiredMbps ?? null,
     qualityChannelsPlayable: report.aggregate.channelsPlayable,
     qualityChannelsProbed: report.aggregate.channelsProbed,
+    qualityFirstByteMs: report.aggregate.firstByteMsMedian,
     qualityCheckedAt: new Date(report.measuredAt),
     qualityReport: report,
   };
@@ -202,6 +204,8 @@ export async function POST(request: NextRequest) {
     resultId?: number;
     channels?: number;
     sampleMs?: number;
+    /** Comma-separated channel names; overrides the job's watch list when present. */
+    watchlist?: string;
     pictureChecks?: boolean;
     thumbnails?: boolean;
     catchUp?: boolean;
@@ -243,7 +247,7 @@ export async function POST(request: NextRequest) {
           endpoint: "player_api",
         },
         channelsToProbe: Math.max(1, Math.min(Number(body.channels) || 3, 8)),
-        sampleMs: Math.max(3000, Math.min(Number(body.sampleMs) || 8000, 30000)),
+        sampleMs: Math.max(3000, Math.min(Number(body.sampleMs) || 30000, 60000)),
         pictureChecks: body.pictureChecks !== false,
         thumbnails: body.thumbnails !== false,
       });
@@ -281,7 +285,8 @@ export async function POST(request: NextRequest) {
       mac: row.result.macAddress,
       timeoutMs: Math.max(row.job.timeoutMs || 5000, 8000),
       channelsToProbe: Math.max(1, Math.min(Number(body.channels) || row.job.qualityChannels || 3, 8)),
-      sampleMs: Math.max(3000, Math.min(Number(body.sampleMs) || row.job.qualitySampleMs || 8000, 30000)),
+      watchlist: parseWatchlist(typeof body.watchlist === "string" ? body.watchlist : row.job.qualityChannelWatchlist),
+      sampleMs: Math.max(3000, Math.min(Number(body.sampleMs) || row.job.qualitySampleMs || 30000, 60000)),
       userAgents: parseUserAgentList(settingsMap.ua_list),
       rememberedUserAgent: settingsMap[userAgentSettingKey(hostOf(serverPath))] || null,
       proxy: wantedProxy,

@@ -104,6 +104,7 @@ export async function GET(request: NextRequest) {
       qualityCodec: "Stream Video Codec (measured)",
       qualityThroughputMbps: "Stream Throughput (Mbps measured)",
       qualityRequiredMbps: "Stream Required Bitrate (Mbps)",
+      qualityFirstByteMs: "Stream Time to First Byte (ms, median)",
       qualityChannels: "Stream Channels Playable/Probed",
       qualityMeasured: "Stream Quality Measured At",
       qualityRetries: "Stream Retries (transient)",
@@ -241,6 +242,10 @@ export async function GET(request: NextRequest) {
         case "qualityThroughputMbps":
           return result.qualityThroughputMbps !== null && result.qualityThroughputMbps !== undefined
             ? String(result.qualityThroughputMbps)
+            : "";
+        case "qualityFirstByteMs":
+          return result.qualityFirstByteMs !== null && result.qualityFirstByteMs !== undefined
+            ? String(Math.round(result.qualityFirstByteMs))
             : "";
         case "qualityRequiredMbps":
           return result.qualityRequiredMbps !== null && result.qualityRequiredMbps !== undefined

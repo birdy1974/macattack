@@ -64,7 +64,8 @@ const JOB_ALTERS = [
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS expire_filter_include_unlimited INTEGER NOT NULL DEFAULT 1",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS quality_check_enabled INTEGER NOT NULL DEFAULT 1",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS quality_channels INTEGER NOT NULL DEFAULT 3",
-  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS quality_sample_ms INTEGER NOT NULL DEFAULT 8000",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS quality_sample_ms INTEGER NOT NULL DEFAULT 30000",
+  "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS quality_channel_watchlist TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS portal_urls JSONB",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS scan_mode TEXT NOT NULL DEFAULT 'prefix'",
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS mac_list JSONB",
@@ -77,6 +78,7 @@ const JOB_ALTERS = [
   "ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS xtream_password TEXT",
 ];
 const RESULT_ALTERS = [
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_first_byte_ms REAL",
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS response_time_ms INTEGER",
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS handshake_time_ms INTEGER",
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS account_info_time_ms INTEGER",

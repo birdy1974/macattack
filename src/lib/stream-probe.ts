@@ -84,6 +84,23 @@ export interface ProbeTimings {
   ttfbMs: number | null;
   /** Time until the first media byte arrived (headers present, body flowing). */
   firstByteMs: number | null;
+  /**
+   * Time from request start to the first byte of the first *media* payload.
+   * For HLS this is the first media segment (playback cannot start before it);
+   * for direct streams it equals firstByteMs. Set only by HLS probes.
+   */
+  firstMediaByteMs?: number | null;
+}
+
+/**
+ * The start-up metric the quality report shows: request → first media byte.
+ * HLS uses the first segment (the playlist alone does not start playback).
+ */
+export function timeToFirstByteMs(probe: { container: string; timings: ProbeTimings | null }): number | null {
+  const timings = probe.timings;
+  if (!timings) return null;
+  if (probe.container === "hls") return timings.firstMediaByteMs ?? null;
+  return timings.firstByteMs ?? null;
 }
 
 export interface ThroughputSample {
@@ -203,7 +220,7 @@ export interface StreamProbeResult {
 }
 
 export interface StreamProbeOptions {
-  /** How long to watch the media path. Default 8000 ms, clamped 2000–30000. */
+  /** How long to watch the media path. Default 8000 ms, clamped 2000–60000. */
   sampleMs?: number;
   /** Per-request inactivity/connect timeout. Default 8000 ms. */
   timeoutMs?: number;
@@ -1327,7 +1344,7 @@ export async function probeStream(
   url: string,
   options: StreamProbeOptions = {}
 ): Promise<StreamProbeResult> {
-  const sampleMs = clamp(options.sampleMs ?? DEFAULT_SAMPLE_MS, 2000, 30000);
+  const sampleMs = clamp(options.sampleMs ?? DEFAULT_SAMPLE_MS, 2000, 60000);
   const timeoutMs = clamp(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, 1500, 30000);
   const maxBytes = clamp(options.maxBytes ?? DEFAULT_MAX_BYTES, 256 * 1024, 512 * 1024 * 1024);
   const maxDepth = clamp(options.maxPlaylistDepth ?? 3, 1, 5);
@@ -1871,6 +1888,7 @@ async function sampleHlsMedia(
     status: "measured",
     container: "hls",
     finalUrl: playlistUrl,
+    timings: context.timings,
     redirectChain: context.redirectChain,
     contentType: context.contentType || null,
     hls,
@@ -1929,7 +1947,9 @@ async function sampleHlsMedia(
       },
       onChunk: (chunk, atMs) => {
         segmentBytes += chunk.length;
-        if (segmentTtfb === null) segmentTtfb = atMs - segmentStart;
+        // atMs is relative to the request's own start; take the time from the
+        // segment request start so the value is comparable across segments.
+        if (segmentTtfb === null) segmentTtfb = nowMs() - segmentStart;
         transferStartAt = transferStartAt ?? atMs;
         lastAt = atMs;
       },
@@ -1957,6 +1977,11 @@ async function sampleHlsMedia(
       }
     } else {
       hls.segmentsFailed += 1;
+    }
+
+    // First media segment decides start-up: keep its time to first byte.
+    if (ok && segmentTtfb !== null && context.timings.firstMediaByteMs == null) {
+      context.timings.firstMediaByteMs = round(segmentTtfb, 1);
     }
 
     hls.segments.push({

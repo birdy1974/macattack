@@ -52,6 +52,7 @@ import {
 } from "@/lib/filters";
 import { extractPortalExpiry, extractPortalFields } from "@/lib/portal-result-fields";
 import { checkMacStreamQuality, formatMacQualityLog } from "@/lib/mac-quality";
+import { parseWatchlist } from "@/lib/channel-watchlist";
 import { HostRateLimiter, hostOf } from "@/lib/parallel";
 import { buildUserAgentCandidates, parseUserAgentList, userAgentSettingKey } from "@/lib/user-agents";
 import { parseProxyList } from "@/lib/proxy";
@@ -1034,7 +1035,8 @@ export async function startScan(jobId: number, skipVerification: boolean = false
       catchUp: (job.catchUpCheckEnabled ?? 1) !== 0,
       concurrency: Math.max(1, Math.min(job.concurrency ?? 1, 4)),
       channels: Math.max(1, Math.min(job.qualityChannels ?? 3, 8)),
-      sampleMs: Math.max(3000, Math.min(job.qualitySampleMs ?? 8000, 30000)),
+      sampleMs: Math.max(3000, Math.min(job.qualitySampleMs ?? 30000, 60000)),
+      watchlist: parseWatchlist(job.qualityChannelWatchlist),
     };
 
     // Track how many valid-but-filtered MACs we rejected (for progress).
@@ -1076,9 +1078,13 @@ export async function startScan(jobId: number, skipVerification: boolean = false
       await addLog(
         jobId,
         "info",
-        `Stream quality check ON: ${qualityCheck.channels} channel(s) per found MAC, ${(
-          qualityCheck.sampleMs / 1000
-        ).toFixed(0)}s sample each`
+        qualityCheck.watchlist.length > 0
+          ? `Stream quality check ON: watch list ${qualityCheck.watchlist.map((q) => `"${q}"`).join(", ")} (all matching channels) per found MAC, ${(
+              qualityCheck.sampleMs / 1000
+            ).toFixed(0)}s sample each`
+          : `Stream quality check ON: ${qualityCheck.channels} channel(s) per found MAC, ${(
+              qualityCheck.sampleMs / 1000
+            ).toFixed(0)}s sample each`
       );
     } else {
       await addLog(jobId, "info", "Stream quality check OFF (portal/account checks only)");
@@ -1876,7 +1882,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             await addLog(
               jobId,
               "info",
-              `Checking stream quality for ${mac} (${qualityCheck.channels} channel(s), ${(
+              `Checking stream quality for ${mac} (${qualityCheck.watchlist.length > 0 ? `${qualityCheck.watchlist.length} watch-list entr${qualityCheck.watchlist.length === 1 ? "y" : "ies"}` : `${qualityCheck.channels} channel(s)`}, ${(
                 qualityCheck.sampleMs / 1000
               ).toFixed(0)}s each)...`
             );
@@ -1888,6 +1894,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
                 mac,
                 timeoutMs,
                 channelsToProbe: qualityCheck.channels,
+                watchlist: qualityCheck.watchlist,
                 sampleMs: qualityCheck.sampleMs,
                 signal: controller.signal,
                 userAgents,
@@ -1936,6 +1943,7 @@ export async function startScan(jobId: number, skipVerification: boolean = false
                   qualityRequiredMbps: measuredChannel?.probe?.requiredMbps ?? null,
                   qualityChannelsPlayable: aggregate.channelsPlayable,
                   qualityChannelsProbed: aggregate.channelsProbed,
+                  qualityFirstByteMs: aggregate.firstByteMsMedian,
                   qualityCheckedAt: new Date(qualityReport.measuredAt),
                   qualityReport,
                   qualityFrozen: aggregate.frozenChannels > 0 ? 1 : 0,

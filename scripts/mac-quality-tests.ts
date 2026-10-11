@@ -16,6 +16,7 @@ process.env.MACATTACK_ALLOW_LOCAL_STREAMS = "1";
 import { getEventListeners } from "node:events";
 import { abortSubscriberCount } from "../src/lib/abort";
 import { checkMacStreamQuality, formatMacQualityLog } from "../src/lib/mac-quality";
+import { timeToFirstByteMs } from "../src/lib/stream-probe";
 import {
   stalkerHandshake,
   stalkerListChannels,
@@ -102,6 +103,30 @@ async function main() {
   check("aggregate overall score present", typeof report.aggregate.overallScore === "number", report.aggregate.overallScore);
   check("aggregate has speed/quality/stability", [report.aggregate.speedScore, report.aggregate.qualityScore, report.aggregate.stabilityScore].every((value) => typeof value === "number"));
   check("verdict is a known band", ["excellent", "good", "fair", "poor", "unusable"].includes(report.aggregate.verdict), report.aggregate.verdict);
+  // Time to first byte: recorded per channel and as a median across channels.
+  const measuredFirstBytes = report.channels
+    .filter((channel) => channel.probe && channel.probe.status === "measured")
+    .map((channel) => timeToFirstByteMs(channel.probe!));
+  check(
+    "first byte recorded for every measured channel (>= 0 ms)",
+    measuredFirstBytes.length > 0 && measuredFirstBytes.every((ms) => typeof ms === "number" && ms >= 0),
+    measuredFirstBytes
+  );
+  check(
+    "HLS first byte is the first segment (measured HLS channels), not the playlist",
+    report.channels.every(
+      (channel) =>
+        !channel.probe ||
+        channel.probe.status !== "measured" ||
+        channel.probe.container !== "hls" ||
+        typeof channel.probe.timings?.firstMediaByteMs === "number"
+    ),
+  );
+  check(
+    "aggregate first-byte median is present",
+    typeof report.aggregate.firstByteMsMedian === "number" && report.aggregate.firstByteMsMedian >= 0,
+    report.aggregate.firstByteMsMedian
+  );
   check("limitations documented", report.limitations.length >= 3, report.limitations.length);
 
   const tokens = JSON.stringify(report);

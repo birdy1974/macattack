@@ -70,7 +70,9 @@ export const scanJobs = pgTable("scan_jobs", {
   // ── Stream quality check (runs for every MAC that passes the filters) ──
   qualityCheckEnabled: integer("quality_check_enabled").notNull().default(1),
   qualityChannels: integer("quality_channels").notNull().default(3),
-  qualitySampleMs: integer("quality_sample_ms").notNull().default(8000),
+  qualitySampleMs: integer("quality_sample_ms").notNull().default(30000),
+  /** Comma-separated channel names to measure instead of the genre spread (fuzzy-matched). */
+  qualityChannelWatchlist: text("quality_channel_watchlist").notNull().default(""),
   // Optional add-ons (all safe to leave off / unavailable)
   uaRotationEnabled: integer("ua_rotation_enabled").notNull().default(1),
   pictureChecksEnabled: integer("picture_checks_enabled").notNull().default(1),
@@ -143,6 +145,8 @@ export const scanResults = pgTable("scan_results", {
   qualityRequiredMbps: real("quality_required_mbps"),
   qualityChannelsPlayable: integer("quality_channels_playable"),
   qualityChannelsProbed: integer("quality_channels_probed"),
+  /** Median time from request to first media byte across probed channels (ms). */
+  qualityFirstByteMs: real("quality_first_byte_ms"),
   qualityCheckedAt: timestamp("quality_checked_at"),
   qualityReport: jsonb("quality_report").$type<unknown>(),
   /** Extra evidence columns for the results table / CSV. */

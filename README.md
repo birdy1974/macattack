@@ -336,9 +336,9 @@ The report separates portal responsiveness from actual stream delivery:
 - At scan start, MacAttack records eight TCP connection attempts to the portal, including the individual timings, failures, median, p95, variation, and sample window. It also records one HTTP handshake-endpoint timing breakdown (DNS, TCP, TLS, TTFB, total, and status).
 - For each saved result, it records the Stalker handshake and `account_info` request times separately and together. These are control/API timings, not channel startup times.
 - **When a MAC passes your filters, MacAttack measures the real media path** (on by default, see step 8):
-  it lists the portal's channels, resolves real stream URLs with `create_link`, and probes a genre-spread
-  sample of those streams. It measures sustained throughput vs. the bitrate the stream needs, the variant
-  ladder (resolution/codec/bandwidth), HLS segment transfer time vs. segment duration (can the connection
+  it lists the portal's channels, resolves real stream URLs with `create_link`, and probes either the channels named
+  in the watch list (see step 8) or a genre-spread sample of those streams. It measures sustained throughput vs. the bitrate the stream needs, the variant
+  ladder (resolution/codec/bandwidth), time to first media byte (request → first byte of the stream; for HLS, the first segment), HLS segment transfer time vs. segment duration (can the connection
   keep up with real time?), MPEG-TS continuity-counter errors and scrambled packets, and DRM.
 - The result is a **speed / picture-quality / stability / overall score (0–10) with a verdict**, stored per
   result and exportable (`Stream Quality Verdict`, `Stream Quality Score`, …). Every report lists what it
@@ -348,8 +348,15 @@ The report separates portal responsiveness from actual stream delivery:
 ### 8. Stream quality check (optional, on by default)
 The **🎚️ Stream quality check** panel controls the media-path probe:
 
-- **Channels to probe (1–8)** — spread across genres so one broken category cannot dominate the verdict.
-- **Sample per channel (3–30 s)** — longer windows catch stalls and bitrate dips.
+- **Channel watch list** — comma-separated channel names to measure, default `NPO 1, RTL 4, ZIGGO`. Matching is
+  fuzzy: case, spaces, HD/FHD tags and country prefixes are ignored (`NPO1` finds `NL: NPO 1 HD`). It tries an exact
+  name first, then a whole-word match (`ZIGGO` → `ZIGGO SPORT 1`, only if no exact `ZIGGO` exists), then a close
+  spelling. **Every channel that carries a matched name is measured and recorded**, including duplicates. Unmatched
+  names are reported in the scan log and the report notes. Clear the field to use the automatic genre spread instead.
+- **Channels to probe (1–8)** — used only without a watch list. Spread across genres so one broken category cannot
+  dominate the verdict.
+- **Sample per channel (3–60 s, default 30 s)** — longer windows catch stalls and bitrate dips; each probed channel
+  streams for this long, so a MAC with many watch-listed duplicates takes proportionally longer.
 
 The UI shows a **Streams** column per result and, in *Quality details*, a per-channel table with verdict and
 sub-scores, plus buttons to **Re-check streams** (streams change over time) and **Download M3U** (export the
