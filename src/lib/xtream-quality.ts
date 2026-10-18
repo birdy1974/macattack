@@ -8,6 +8,8 @@
  * treat both protocols identically.
  */
 
+import { thumbnailGeneration } from "@/lib/thumbnail-store";
+import { archiveChannelKey, verifyArchiveCandidates, type CatchUpVerification } from "@/lib/catchup-verification";
 import { probeStream, scoreStreamProbe, type StreamScore } from "@/lib/stream-probe";
 import type { PictureAnalysis } from "@/lib/ffmpeg-tools";
 import { aggregateChannels, type MacQualityChannelResult, type MacStreamQualityReport } from "@/lib/mac-quality";
@@ -25,8 +27,10 @@ import {
   xtreamCategories,
   xtreamLiveStreams,
   xtreamStreamUrl,
+  xtreamArchiveUrl,
   type XtreamCredentials,
   type XtreamStream,
+  type XtreamCategory,
 } from "@/lib/xtream-streams";
 
 export interface XtreamQualityOptions {
@@ -39,6 +43,7 @@ export interface XtreamQualityOptions {
   signal?: AbortSignal;
   pictureChecks?: boolean;
   thumbnails?: boolean;
+  checkCatchUp?: boolean;
   concurrency?: number;
 }
 
@@ -91,6 +96,7 @@ export async function checkXtreamAccountQuality(
   options: XtreamQualityOptions
 ): Promise<{ report: MacStreamQualityReport | null; account: XtreamAccountSummary | null; error: string | null }> {
   const startedAt = Date.now();
+  const captureGeneration = thumbnailGeneration();
   const credentials = options.credentials ?? parseXtreamUrl(options.url || "");
   if (!credentials) {
     return { report: null, account: null, error: "Not an Xtream URL (expected player_api.php or get.php with username/password)" };
@@ -107,7 +113,7 @@ export async function checkXtreamAccountQuality(
 
   const [categories, streams] = await Promise.all([
     xtreamCategories(credentials, "live", { timeoutMs: options.timeoutMs, signal: options.signal }),
-    xtreamLiveStreams(credentials, { timeoutMs: options.timeoutMs, signal: options.signal, limit: 500 }),
+    xtreamLiveStreams(credentials, { timeoutMs: options.timeoutMs, signal: options.signal, limit: 500, throwOnError: true }),
   ]);
 
   const categoryTitles = new Map(categories.map((category) => [category.id, category.name]));
@@ -157,37 +163,42 @@ export async function checkXtreamAccountQuality(
 
   // Optional picture pass + thumbnails (sequential: keep load predictable).
   const thumbnailsEnabled = options.thumbnails ?? true;
-  const captureThumbnails = thumbnailsEnabled && ffmpeg.available && (options.pictureChecks ?? true);
+  const captureThumbnails = thumbnailsEnabled && ffmpeg.available;
+  const pictureChecksEnabled = options.pictureChecks ?? true;
   const thumbnails: ThumbnailOutcome[] = [];
 
-  if (ffmpeg.available && (options.pictureChecks ?? true)) {
+  if (ffmpeg.available && (pictureChecksEnabled || captureThumbnails)) {
     for (let index = 0; index < channels.length; index += 1) {
       if (options.signal?.aborted) break;
       const liveUrl = liveUrls[index];
       if (!liveUrl) continue;
-      const picture: PictureAnalysis = await analyzePicture(liveUrl, {
-        seconds: Math.max(5, Math.min(Math.round(sampleMs / 1000), 12)),
-        timeoutMs: (Math.max(5, Math.round(sampleMs / 1000)) + 20) * 1000,
-        userAgent: "VLC/3.0.20 LibVLC/3.0.20",
-        signal: options.signal,
-      });
-      channels[index].picture = picture;
-      if (picture.analyzed && channels[index].probe) {
-        channels[index].score = scoreStreamProbe(channels[index].probe as never, {
-          picture: {
-            analyzed: true,
-            frozenDetected: picture.frozenDetected,
-            blackDetected: picture.blackDetected,
-            frozenDurationSec: picture.frozenDurationSec,
-            blackDurationSec: picture.blackDurationSec,
-            fps: picture.fps,
-            videoBitrateMbps: picture.videoBitrateMbps,
-          },
-          labelMismatch: channels[index].labelMismatch,
+      if (pictureChecksEnabled) {
+        const picture: PictureAnalysis = await analyzePicture(liveUrl, {
+          seconds: Math.max(5, Math.min(Math.round(sampleMs / 1000), 12)),
+          timeoutMs: (Math.max(5, Math.round(sampleMs / 1000)) + 20) * 1000,
+          userAgent: "VLC/3.0.20 LibVLC/3.0.20",
+          signal: options.signal,
         });
+        channels[index].picture = picture;
+        if (picture.analyzed && channels[index].probe) {
+          channels[index].score = scoreStreamProbe(channels[index].probe as never, {
+            picture: {
+              analyzed: true,
+              frozenDetected: picture.frozenDetected,
+              blackDetected: picture.blackDetected,
+              frozenDurationSec: picture.frozenDurationSec,
+              blackDurationSec: picture.blackDurationSec,
+              fps: picture.fps,
+              videoBitrateMbps: picture.videoBitrateMbps,
+            },
+            labelMismatch: channels[index].labelMismatch,
+          });
+        }
       }
+
       if (captureThumbnails) {
         const outcome = await captureChannelThumbnail({
+          generation: captureGeneration,
           key: `xtream-${credentials.username}-${index}-${Date.now()}`,
           channel: channels[index].name,
           url: liveUrl,
@@ -200,6 +211,8 @@ export async function checkXtreamAccountQuality(
     }
   }
 
+  const catchUp = await verifyXtreamCatchUp(credentials, streams, categories, login.serverInfo, options);
+
   const aggregate = aggregateChannels(channels);
   aggregate.labelMismatches = channels.filter((channel) => channel.labelMismatch).length;
 
@@ -209,9 +222,8 @@ export async function checkXtreamAccountQuality(
   if (!ffmpeg.available) notes.push("Picture checks skipped: ffmpeg is not installed on this host");
   if (aggregate.frozenChannels > 0) notes.push(`${aggregate.frozenChannels} stream(s) look frozen`);
   if (aggregate.labelMismatches > 0) notes.push(`${aggregate.labelMismatches} stream(s) are mislabeled`);
-  if (selection.some((stream) => stream.tvArchive)) {
-    const archive = selection.find((stream) => stream.tvArchive);
-    notes.push(`Catch-up advertised on "${archive?.name}" (${archive?.tvArchiveDays ?? "?"} day(s)) — not verified automatically for Xtream`);
+  if ((catchUp.advertisedChannels ?? 0) > 0) {
+    notes.push(`Catch-up: ${catchUp.channels?.filter((c) => c.status === "playable").length ?? 0}/${catchUp.advertisedChannels} advertised channels have playable archive media; see the saved channel/genre inventory`);
   }
 
   const report: MacStreamQualityReport = {
@@ -233,23 +245,14 @@ export async function checkXtreamAccountQuality(
     tooling: { ffmpeg: { available: ffmpeg.available, version: ffmpeg.version, reason: ffmpeg.reason } },
     channels,
     genreGroups: [],
-    catchUp: {
-      status: "not_checked",
-      channelName: null,
-      advertisedDays: null,
-      verifiedMinutes: null,
-      linkResolved: false,
-      playable: false,
-      bytesRead: 0,
-      error: null,
-    },
+    catchUp,
     thumbnails: await summariseThumbnails(thumbnailsEnabled, captureThumbnails, thumbnails),
     aggregate,
     notes,
     limitations: [
       "Measured from the scanner host's network, not the viewer's device, Wi-Fi or ISP route.",
       `Only ${channelsToProbe} stream(s) were sampled for a few seconds each — peak-hour congestion is not covered.`,
-      "Xtream catch-up/archive is advertised by the panel but not verified automatically here.",
+      "Catch-up checks sample up to 3 advertised channels across categories. Archive URL + media does not prove broadcast time/content or full retention. Panels without timezone metadata use UTC.",
     ],
   };
 
@@ -269,3 +272,44 @@ export async function checkXtreamAccountQuality(
 }
 
 export type { StreamScore };
+
+function verifyXtreamCatchUp(credentials: XtreamCredentials, streams: XtreamStream[],
+  categories: XtreamCategory[], serverInfo: Record<string, unknown> | null,
+  options: XtreamQualityOptions & { channelKeys?: string[]; skipCheckedKeys?: string[]; channelLimit?: number }
+): Promise<CatchUpVerification> {
+  return verifyArchiveCandidates({
+    candidates: streams.filter((stream) => stream.tvArchive).map((stream) => ({
+      ...stream, genreId: stream.categoryId, days: stream.tvArchiveDays,
+      genreTitle: categories.find((c) => c.id === stream.categoryId)?.name ?? null,
+    })),
+    enabled: options.checkCatchUp !== false, channelKeys: options.channelKeys, skipCheckedKeys: options.skipCheckedKeys, channelLimit: options.channelLimit,
+    methods: ["xtream-timeshift"],
+    resolve: async (stream, minutesAgo) => {
+      try {
+        return { url: xtreamArchiveUrl(credentials, stream.id, minutesAgo,
+          typeof serverInfo?.timezone === "string" ? serverInfo.timezone : "UTC"),
+          linkResolved: true, error: null };
+      } catch {
+        return { url: null, linkResolved: false, error: "Panel reported an unsupported timezone" };
+      }
+    },
+    sampleMs: options.sampleMs ?? 3000, signal: options.signal, userAgent: "VLC/3.0.20 LibVLC/3.0.20",
+  });
+}
+
+/** Archive-only recheck for stored Xtream results. */
+export async function checkXtreamCatchUp(options: XtreamQualityOptions & {
+  channelKeys?: string[]; skipCheckedKeys?: string[]; channelLimit?: number;
+}): Promise<CatchUpVerification> {
+  const credentials = options.credentials ?? parseXtreamUrl(options.url || "");
+  if (!credentials) throw new Error("Xtream credentials are missing");
+  const login = await xtreamAccount(credentials, options);
+  if (!login.auth || !login.account) throw new Error(login.error || "Xtream authentication failed");
+  const [streams, categories] = await Promise.all([
+    xtreamLiveStreams(credentials, { ...options, limit: 3000, throwOnError: true }), xtreamCategories(credentials, "live", options),
+  ]);
+  if (options.channelKeys?.some((key) => !streams.some((c) => c.tvArchive && archiveChannelKey({ ...c, genreId: c.categoryId, days: c.tvArchiveDays }) === key))) {
+    throw new Error("Requested archive channel is no longer advertised in the fetched catalogue");
+  }
+  return verifyXtreamCatchUp(credentials, streams, categories, login.serverInfo, options);
+}

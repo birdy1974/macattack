@@ -51,6 +51,7 @@ export async function POST(request: NextRequest) {
       sampleMs?: number;
       pictureChecks?: boolean;
       thumbnails?: boolean;
+      catchUp?: boolean;
     };
 
     const credentials = parseXtreamUrl(body.url || "");
@@ -67,6 +68,7 @@ export async function POST(request: NextRequest) {
       sampleMs: Math.max(3000, Math.min(Number(body.sampleMs) || 8000, 60000)),
       pictureChecks: body.pictureChecks !== false,
       thumbnails: body.thumbnails !== false,
+      checkCatchUp: body.catchUp !== false,
     });
 
     if (!report) {

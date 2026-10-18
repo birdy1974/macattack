@@ -156,8 +156,8 @@ function masterPlaylist(baseUrl, variantPath = "/variant") {
 
 const CHANNELS = [
   // Channel 1 advertises a 7-day archive — the catch-up verification path.
-  { id: "1", name: "News HD", tv_genre_id: "2", cmd: "ffmpeg http://127.0.0.1:PORT/variant/1080/index.m3u8", logo: "", tv_archive: 1, tv_archive_duration: 7 },
-  { id: "2", name: "Sports FHD", tv_genre_id: "3", cmd: "http://127.0.0.1:PORT/live.ts?seconds=30", logo: "" },
+  { id: "1", name: "News HD", tv_genre_id: "2", cmd: "ffmpeg http://127.0.0.1:PORT/variant/1080/index.m3u8", logo: "", enable_tv_archive: 1, tv_archive_duration: 168 },
+  { id: "2", name: "Sports FHD", tv_genre_id: "3", cmd: "http://127.0.0.1:PORT/live.ts?seconds=30", logo: "", enable_tv_archive: 1, tv_archive_duration: 48 },
   { id: "3", name: "Movies", tv_genre_id: "4", cmd: "ffmpeg /media/broken.m3u8", logo: "" },
   { id: "4", name: "Kids", tv_genre_id: "2", cmd: "ffmpeg http://127.0.0.1:PORT/vod.m3u8", logo: "" },
   { id: "5", name: "Music", tv_genre_id: "5", cmd: "ffmpeg http://127.0.0.1:PORT/drm.m3u8", logo: "" },
@@ -184,6 +184,18 @@ function handlePortal(url, res) {
   }
   if (type === "itv" && action === "get_genres") {
     json(res, { js: [{ id: "2", title: "News" }, { id: "3", title: "Sports" }] });
+    return true;
+  }
+  if (type === "epg" && action === "get_simple_data_table") {
+    const now = Math.floor(Date.now() / 1000);
+    json(res, { js: { data: url.searchParams.get("ch_id") === "1" ? [
+      { id: "archive-news", start_timestamp: now - 7200, stop_timestamp: now - 1800, mark_archive: 1 },
+    ] : [] } });
+    return true;
+  }
+  if (type === "tv_archive" && action === "create_link") {
+    json(res, { js: { cmd: url.searchParams.get("cmd") === "auto /media/archive-news.mpg"
+      ? `ffmpeg http://127.0.0.1:${PORT}/variant/1080/archive.m3u8` : "" } });
     return true;
   }
   if (type === "itv" && action === "create_link") {
@@ -292,7 +304,7 @@ function handleXtream(url, res) {
     return true;
   }
 
-  json(res, { user_info: userInfo, server_info: { url: "127.0.0.1", port: String(PORT) } });
+  json(res, { user_info: userInfo, server_info: { url: "127.0.0.1", port: String(PORT), timezone: "Europe/Amsterdam" } });
   return true;
 }
 
@@ -349,6 +361,17 @@ const server = http.createServer(async (req, res) => {
 
     if (path === "/player_api.php" || path === "/panel_api.php" || path === "/get.php") {
       if (handleXtream(url, res)) return;
+    }
+
+    if (/^\/timeshift\/[^/]+\/[^/]+\/30\/[^/]+\/101\.ts$/.test(path)) {
+      const parts = path.split("/");
+      const user = XTREAM_USERS[decodeURIComponent(parts[2])];
+      if (!user || user.password !== decodeURIComponent(parts[3])) {
+        res.writeHead(401); res.end(); return;
+      }
+      res.writeHead(302, { Location: `${origin}/live.ts?seconds=6` });
+      res.end();
+      return;
     }
 
     // Transient-failure fixtures: /flaky-<failures>[-<seed>].m3u8 fails the

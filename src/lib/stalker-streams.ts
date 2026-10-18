@@ -317,22 +317,24 @@ function pickBoolean(record: Record<string, unknown>, keys: string[]): boolean {
   for (const key of keys) {
     const value = record[key];
     if (value === true) return true;
-    if (typeof value === "number") return value !== 0;
-    if (typeof value === "string") return value !== "" && value !== "0" && value.toLowerCase() !== "false";
+    if (typeof value === "number" && value !== 0) return true;
+    if (typeof value === "string" && value !== "" && value !== "0" && value.toLowerCase() !== "false") return true;
   }
   return false;
 }
 
 function toChannel(item: Record<string, unknown>): StalkerChannel {
   const archiveDaysRaw = pickString(item, ["tv_archive_duration", "archive_duration"]);
-  const archiveDays = archiveDaysRaw !== null && Number.isFinite(Number(archiveDaysRaw)) ? Number(archiveDaysRaw) : null;
+  // Ministra reports retention in hours (unlike Xtream, which uses days).
+  const archiveDays = archiveDaysRaw !== null && Number.isFinite(Number(archiveDaysRaw)) && Number(archiveDaysRaw) > 0
+    ? Number(archiveDaysRaw) / 24 : null;
   return {
     id: pickString(item, ["id", "channel_id", "ch_id"]),
     name: pickString(item, ["name", "title", "tv_name"]) || "(unnamed channel)",
     genreId: pickString(item, ["tv_genre_id", "genre_id", "genre"]),
     logo: pickString(item, ["logo", "tv_logo", "icon"]),
     cmd: pickString(item, ["cmd", "stream_url", "url"]),
-    tvArchive: pickBoolean(item, ["tv_archive", "tv_archive_available"]),
+    tvArchive: pickBoolean(item, ["tv_archive", "enable_tv_archive", "tv_archive_available"]) || (archiveDays ?? 0) > 0,
     tvArchiveDays: archiveDays,
     raw: item,
   };
@@ -614,11 +616,13 @@ export interface CatchUpProbe {
 }
 
 function formatArchiveTime(date: Date): string {
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return (
-    `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ` +
-    `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`
-  );
+  // Archive wall-clock fields and EPG day must match the timezone cookie.
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: STB_REQUEST_TIMEZONE, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+  }).formatToParts(date);
+  const value = (name: string) => parts.find((part) => part.type === name)?.value;
+  return `${value("year")}-${value("month")}-${value("day")} ${value("hour")}:${value("minute")}:${value("second")}`;
 }
 
 /**
@@ -630,27 +634,52 @@ export async function stalkerResolveArchiveLink(
   options: StalkerClientOptions,
   token: string,
   channel: StalkerChannel,
-  minutesAgo: number
+  minutesAgo: number,
+  method: "programme" | "window" = "window"
 ): Promise<CatchUpProbe> {
   const advertisedDays = channel.tvArchiveDays ?? null;
-  if (!channel.cmd) {
+  if (method === "window" && !channel.cmd) {
     return { channel, advertisedDays, url: null, linkResolved: false, error: "Channel has no cmd" };
   }
 
   const end = new Date(Date.now() - Math.max(1, minutesAgo) * 60 * 1000);
   const start = new Date(end.getTime() - 30 * 60 * 1000);
 
+  let params: Record<string, string>;
+  if (method === "programme") {
+    if (!channel.id) return { channel, advertisedDays, url: null, linkResolved: false, error: "No channel ID for programme lookup" };
+    // Native Ministra path: EPG supplies the media ID, NOT the channel ID.
+    // Bounded to two pages on the requested day; absence is not a portal-wide
+    // verdict. The verifier can try the timestamp-window compatibility path.
+    let programme: Record<string, unknown> | undefined;
+    for (const page of [1, 2]) {
+      if (options.signal?.aborted) break;
+      const guide = await stalkerRequest(options, {
+        type: "epg", action: "get_simple_data_table", ch_id: channel.id,
+        date: formatArchiveTime(start).slice(0, 10), p: String(page), token,
+      });
+      if (!guide.ok) break;
+      const rows = extractChannelItems(guide.payload);
+      programme = rows.find((row) => {
+        const from = Number(row.start_timestamp);
+        const to = Number(row.stop_timestamp);
+        return from <= start.getTime() / 1000 && to > start.getTime() / 1000 && to < Date.now() / 1000 &&
+          (row.mark_archive === undefined || pickBoolean(row, ["mark_archive"])) && !!pickString(row, ["id", "real_id"]);
+      });
+      if (programme || rows.length === 0) break;
+    }
+    if (!programme) return { channel, advertisedDays, url: null, linkResolved: false, error: "No completed archive programme in the sampled EPG pages" };
+    const id = pickString(programme, ["id", "real_id"])!;
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) return { channel, advertisedDays, url: null, linkResolved: false, error: "Unsupported archive programme ID" };
+    params = { type: "tv_archive", action: "create_link", cmd: `auto /media/${id}.mpg`, token };
+  } else {
+    params = {
+      type: "itv", action: "create_link", cmd: channel.cmd!,
+      start: formatArchiveTime(start), end: formatArchiveTime(end), token,
+    };
+  }
   const response = await stalkerRequest(options, {
-    type: "itv",
-    action: "create_link",
-    cmd: channel.cmd,
-    series: "",
-    forced_storage: "",
-    disable_ad: "1",
-    download: "0",
-    start: formatArchiveTime(start),
-    end: formatArchiveTime(end),
-    token,
+    ...params, series: "", forced_storage: "", disable_ad: "1", download: "0",
   });
 
   if (!response.ok) {
@@ -667,7 +696,7 @@ export async function stalkerResolveArchiveLink(
     advertisedDays,
     url,
     // A portal that "supports" catch-up but hands back the live URL is faking it.
-    linkResolved: !!url && (!liveUrl || url !== liveUrl || /start=|utc=|archive/i.test(resolved ?? "")),
+    linkResolved: !!url && (!liveUrl || url !== liveUrl),
     error: url ? null : "No archive URL returned",
   };
 }

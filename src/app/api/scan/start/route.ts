@@ -1,11 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { scanJobs } from "@/db/schema";
-import { startScan } from "@/lib/scanner";
+import { getActiveScans, startScan } from "@/lib/scanner";
 import { parseMacList } from "@/lib/mac-list";
 import { parseWatchlist } from "@/lib/channel-watchlist";
 
+import { clearThumbnails } from "@/lib/thumbnail-store";
+
+// Starting two searches concurrently must not clear the first one's frames.
+let startingSearch = false;
+
 export async function POST(request: NextRequest) {
+  let acquiredStart = false;
   try {
     const body = (await request.json()) as {
       portalUrl?: string;
@@ -120,6 +126,16 @@ export async function POST(request: NextRequest) {
       .filter((value) => value.length > 0 && value !== portalUrl)
       .slice(0, 20);
 
+    if (startingSearch || getActiveScans().length > 0) {
+      return NextResponse.json({ error: "Stop the active search before starting a new one" }, { status: 409 });
+    }
+    startingSearch = true;
+    acquiredStart = true;
+
+    // Only validated new searches clear temporary files. History and settings
+    // remain intact; starting/resuming an existing job does not use this path.
+    const thumbnailsRemoved = await clearThumbnails();
+
     // Clamp blockSize to a reasonable range
     const clampedBlockSize = Math.max(100, Math.min(blockSize, 500000));
 
@@ -166,6 +182,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       success: true,
       jobId: job.id,
+      thumbnailsRemoved,
       // Feedback so the UI can show what was actually queued.
       macCount: listMode ? parsedList.macs.length : null,
       skippedEntries: listMode ? parsedList.invalid.length : 0,
@@ -181,5 +198,7 @@ export async function POST(request: NextRequest) {
       },
       { status: 500 }
     );
+  } finally {
+    if (acquiredStart) startingSearch = false;
   }
 }

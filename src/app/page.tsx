@@ -9,6 +9,10 @@ import {
   useSyncExternalStore,
 } from "react";
 import Image from "next/image";
+import { CatchUpResults } from "@/components/catchup-results";
+import { formatCatchUpInventory } from "@/lib/catchup-display";
+import { QualityDashboard } from "@/components/quality-dashboard";
+import type { CatchUpVerification } from "@/lib/catchup-verification";
 import { parseWatchlist } from "@/lib/channel-watchlist";
 import {
   DEFAULT_WEEK_SCHEDULE,
@@ -104,6 +108,7 @@ interface ScanResult {
   qualityThroughputCv?: number | null;
   qualityCatchUpStatus?: string | null;
   qualityCatchUpDays?: number | null;
+  qualityCatchUpSummary?: CatchUpVerification | null;
   qualityThumbnail?: string | null;
   qualityEwma?: number | null;
   qualityTrend?: string | null;
@@ -173,6 +178,7 @@ interface StreamQualityChannelSummary {
 }
 
 interface StreamQualityReportSummary {
+  catchUp?: CatchUpVerification;
   measuredAt: string;
   portal: { channelListSource: string; channelsListed: number; linksResolved: number; linksFailed: number };
   channels: StreamQualityChannelSummary[];
@@ -229,6 +235,7 @@ const AVAILABLE_FIELDS = [
   { key: "qualityFrozen", label: "Stream Frozen Picture Detected", default: false },
   { key: "qualityLabelMismatch", label: "Stream Label Mismatch", default: false },
   { key: "qualityCatchUp", label: "Stream Catch-Up (archive) Check", default: false },
+  { key: "qualityCatchUpChannels", label: "Catch-Up Genres / Channels (saved)", default: false },
   { key: "qualityThumbnail", label: "Stream Thumbnail URL", default: false },
   { key: "qualityEwma", label: "Stream Score EWMA (history)", default: false },
   { key: "qualityTrend", label: "Stream Score Trend (history)", default: false },
@@ -445,10 +452,14 @@ export default function MacAttackPage() {
   const [activeJobId, setActiveJobId] = useState<number | null>(null);
   const [job, setJob] = useState<ScanJob | null>(null);
   const [results, setResults] = useState<ScanResult[]>([]);
+  const resultGeneration = useRef(0);
+  const pollInFlight = useRef(false);
   const [expandedResultId, setExpandedResultId] = useState<number | null>(null);
   const [expandedQualityId, setExpandedQualityId] = useState<number | null>(null);
   const [qualityDetailByResult, setQualityDetailByResult] = useState<Record<number, StreamQualityReportSummary>>({});
   const [qualityDetailLoadingId, setQualityDetailLoadingId] = useState<number | null>(null);
+  const [catchUpActionId, setCatchUpActionId] = useState<number | null>(null);
+  const [catchUpErrorByResult, setCatchUpErrorByResult] = useState<Record<number, string>>({});
   const [qualityActionId, setQualityActionId] = useState<number | null>(null);
   const [qualityActionError, setQualityActionError] = useState<string | null>(null);
   type HistoryRun = {
@@ -722,7 +733,9 @@ export default function MacAttackPage() {
   // Pass `forceLogs` to pull the console once even while auto-refresh is off
   // (used by the "Refresh now" button).
   const pollStatus = useCallback(async (forceLogs = false) => {
-    if (!activeJobId) return;
+    if (!activeJobId || pollInFlight.current) return;
+    pollInFlight.current = true;
+    const generation = resultGeneration.current;
     try {
       const res = await fetch(`/api/scan/status?jobId=${activeJobId}`);
       if (!res.ok) return;
@@ -731,6 +744,7 @@ export default function MacAttackPage() {
         results: Omit<ScanResult, "qualityReport">[];
         logs: LogEntry[];
       };
+      if (generation !== resultGeneration.current) return;
       setJob(data.job);
       // Build the verbose report in the browser from compact job/result fields.
       // The polling API stays lean instead of repeating shared diagnostics for
@@ -757,6 +771,8 @@ export default function MacAttackPage() {
       }
     } catch {
       // ignore
+    } finally {
+      pollInFlight.current = false;
     }
   }, [activeJobId]);
 
@@ -826,10 +842,6 @@ export default function MacAttackPage() {
 
     setError(null);
     setIsLoading(true);
-    setResults([]);
-    setLogs([]);
-    setLogsUpdatedAt(null);
-    setJob(null);
 
     try {
       const res = await fetch("/api/scan/start", {
@@ -887,6 +899,31 @@ export default function MacAttackPage() {
         return;
       }
 
+      resultGeneration.current += 1;
+      setResults([]);
+      setLogs([]);
+      setLogsUpdatedAt(null);
+      setJob(null);
+      setQualityDetailByResult({});
+      setRawDataByResult({});
+      setHistoryByResult({});
+      setMonitorByResult({});
+      setPlaylistTokenByResult({});
+      setExpandedResultId(null);
+      setExpandedQualityId(null);
+      setQualityActionError(null);
+      setQualityActionId(null);
+      setCatchUpActionId(null);
+      setCatchUpErrorByResult({});
+      setQualityDetailLoadingId(null);
+      setRawDataLoadingId(null);
+      setHistoryLoadingId(null);
+      setMonitorBusyId(null);
+      setXtreamResult(null);
+      setRawDataError(null);
+      setMonitorRunResult(null);
+      setCopiedToken(null);
+      setSystemInfo(null);
       setActiveJobId(data.jobId!);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to start scan");
@@ -925,6 +962,7 @@ export default function MacAttackPage() {
     if (!activeJobId) return;
 
     setRawDataLoadingId(resultId);
+    const generation = resultGeneration.current;
     try {
       const response = await fetch(
         `/api/scan/result-data?jobId=${activeJobId}&resultId=${resultId}`
@@ -933,12 +971,16 @@ export default function MacAttackPage() {
         rawData?: unknown;
         error?: string;
       };
+      if (generation !== resultGeneration.current) return;
       if (!response.ok) throw new Error(payload.error || "Failed to load raw data");
       setRawDataByResult((current) => ({ ...current, [resultId]: payload.rawData ?? null }));
     } catch (err) {
+      if (generation !== resultGeneration.current) return;
       setRawDataError(err instanceof Error ? err.message : "Failed to load raw data");
     } finally {
-      setRawDataLoadingId(null);
+      if (generation === resultGeneration.current) {
+        setRawDataLoadingId(null);
+      }
     }
   };
 
@@ -1229,11 +1271,15 @@ export default function MacAttackPage() {
     if (field === "qualityLabelMismatch") {
       return result.qualityLabelMismatch || "—";
     }
+    if (field === "qualityCatchUpChannels") {
+      return formatCatchUpInventory(result.qualityCatchUpSummary);
+    }
     if (field === "qualityCatchUp") {
       if (!result.qualityCatchUpStatus) return "—";
-      return result.qualityCatchUpDays && result.qualityCatchUpDays >= 1
-        ? `${result.qualityCatchUpStatus} (${result.qualityCatchUpDays.toFixed(1)} day(s))`
-        : result.qualityCatchUpStatus;
+      return result.qualityCatchUpStatus === "verified" ? "archive media playable (spot check)"
+        : result.qualityCatchUpStatus === "advertised_but_failed" ? "sampled checks failed"
+        : result.qualityCatchUpStatus === "not_advertised" ? "not advertised in fetched catalogue"
+        : "not checked";
     }
     if (field === "qualityThumbnail") {
       return result.qualityThumbnail
@@ -1287,11 +1333,13 @@ export default function MacAttackPage() {
 
   /** Load the stored per-channel stream-quality report for one result. */
   const loadQualityDetail = async (resultId: number) => {
+    const generation = resultGeneration.current;
     setQualityDetailLoadingId(resultId);
     setQualityActionError(null);
     try {
       const res = await fetch(`/api/scan/quality?resultId=${resultId}`);
       const data = (await res.json()) as { report?: StreamQualityReportSummary | null; error?: string };
+      if (generation !== resultGeneration.current) return;
       if (!res.ok) {
         setQualityActionError(data.error || "Could not load the stream-quality report");
         return;
@@ -1302,14 +1350,47 @@ export default function MacAttackPage() {
         setQualityActionError("No stream-quality report was stored for this result");
       }
     } catch {
+      if (generation !== resultGeneration.current) return;
       setQualityActionError("Could not load the stream-quality report");
     } finally {
-      setQualityDetailLoadingId(null);
+      if (generation === resultGeneration.current) {
+        setQualityDetailLoadingId(null);
+      }
+    }
+  };
+
+  /** Test one archive channel or the next small batch; keep live scores intact. */
+  const checkCatchUpForResult = async (resultId: number, channelKey?: string) => {
+    const generation = resultGeneration.current;
+    setCatchUpActionId(resultId);
+    setCatchUpErrorByResult((current) => ({ ...current, [resultId]: "" }));
+    try {
+      const response = await fetch("/api/scan/catch-up", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resultId, channelKey }),
+      });
+      const data = await response.json() as { error?: string; qualityCatchUpSummary?: CatchUpVerification; qualityCatchUpStatus?: string };
+      if (generation !== resultGeneration.current) return;
+      if (!response.ok || !data.qualityCatchUpSummary) throw new Error(data.error || "Catch-up check failed");
+      const summary = data.qualityCatchUpSummary;
+      setResults((current) => current.map((r) => r.id === resultId ? {
+        ...r, qualityCatchUpSummary: summary, qualityCatchUpStatus: data.qualityCatchUpStatus,
+      } : r));
+      setQualityDetailByResult((current) => current[resultId] ? {
+        ...current, [resultId]: { ...current[resultId], catchUp: summary },
+      } : current);
+    } catch (error) {
+      if (generation === resultGeneration.current) {
+        setCatchUpErrorByResult((current) => ({ ...current, [resultId]: error instanceof Error ? error.message : "Catch-up check failed" }));
+      }
+    } finally {
+      if (generation === resultGeneration.current) setCatchUpActionId(null);
     }
   };
 
   /** Re-measure the streams for a stored result (streams change over time). */
   const recheckQuality = async (resultId: number) => {
+    const generation = resultGeneration.current;
     setQualityActionId(resultId);
     setQualityActionError(null);
     try {
@@ -1333,8 +1414,15 @@ export default function MacAttackPage() {
         qualityChannelsPlayable?: number | null;
         qualityChannelsProbed?: number | null;
         qualityCheckedAt?: string | null;
+        qualityThumbnail?: string | null;
+        qualityFrozen?: number | null;
+        qualityLabelMismatch?: string | null;
+        qualityCatchUpStatus?: string | null;
+        qualityCatchUpSummary?: CatchUpVerification | null;
+        qualityGenreSummary?: ScanResult["qualityGenreSummary"];
         qualityReport?: StreamQualityReportSummary | null;
       };
+      if (generation !== resultGeneration.current) return;
       if (!res.ok) {
         setQualityActionError(data.error || "Stream quality check failed");
         return;
@@ -1344,19 +1432,25 @@ export default function MacAttackPage() {
           result.id === resultId
             ? {
                 ...result,
-                qualityVerdict: data.qualityVerdict ?? result.qualityVerdict,
-                qualityScore: data.qualityScore ?? result.qualityScore,
-                qualitySpeedScore: data.qualitySpeedScore ?? result.qualitySpeedScore,
-                qualityQualityScore: data.qualityQualityScore ?? result.qualityQualityScore,
-                qualityStabilityScore: data.qualityStabilityScore ?? result.qualityStabilityScore,
-                qualityResolution: data.qualityResolution ?? result.qualityResolution,
-                qualityCodec: data.qualityCodec ?? result.qualityCodec,
-                qualityThroughputMbps: data.qualityThroughputMbps ?? result.qualityThroughputMbps,
-                qualityRequiredMbps: data.qualityRequiredMbps ?? result.qualityRequiredMbps,
-                qualityFirstByteMs: data.qualityFirstByteMs ?? result.qualityFirstByteMs,
-                qualityChannelsPlayable: data.qualityChannelsPlayable ?? result.qualityChannelsPlayable,
-                qualityChannelsProbed: data.qualityChannelsProbed ?? result.qualityChannelsProbed,
-                qualityCheckedAt: data.qualityCheckedAt ?? result.qualityCheckedAt,
+                qualityVerdict: data.qualityVerdict !== undefined ? data.qualityVerdict : result.qualityVerdict,
+                qualityScore: data.qualityScore !== undefined ? data.qualityScore : result.qualityScore,
+                qualitySpeedScore: data.qualitySpeedScore !== undefined ? data.qualitySpeedScore : result.qualitySpeedScore,
+                qualityQualityScore: data.qualityQualityScore !== undefined ? data.qualityQualityScore : result.qualityQualityScore,
+                qualityStabilityScore: data.qualityStabilityScore !== undefined ? data.qualityStabilityScore : result.qualityStabilityScore,
+                qualityResolution: data.qualityResolution !== undefined ? data.qualityResolution : result.qualityResolution,
+                qualityCodec: data.qualityCodec !== undefined ? data.qualityCodec : result.qualityCodec,
+                qualityThroughputMbps: data.qualityThroughputMbps !== undefined ? data.qualityThroughputMbps : result.qualityThroughputMbps,
+                qualityRequiredMbps: data.qualityRequiredMbps !== undefined ? data.qualityRequiredMbps : result.qualityRequiredMbps,
+                qualityFirstByteMs: data.qualityFirstByteMs !== undefined ? data.qualityFirstByteMs : result.qualityFirstByteMs,
+                qualityChannelsPlayable: data.qualityChannelsPlayable !== undefined ? data.qualityChannelsPlayable : result.qualityChannelsPlayable,
+                qualityChannelsProbed: data.qualityChannelsProbed !== undefined ? data.qualityChannelsProbed : result.qualityChannelsProbed,
+                qualityCheckedAt: data.qualityCheckedAt !== undefined ? data.qualityCheckedAt : result.qualityCheckedAt,
+                qualityThumbnail: data.qualityThumbnail !== undefined ? data.qualityThumbnail : result.qualityThumbnail,
+                qualityFrozen: data.qualityFrozen !== undefined ? data.qualityFrozen : result.qualityFrozen,
+                qualityLabelMismatch: data.qualityLabelMismatch !== undefined ? data.qualityLabelMismatch : result.qualityLabelMismatch,
+                qualityCatchUpStatus: data.qualityCatchUpStatus !== undefined ? data.qualityCatchUpStatus : result.qualityCatchUpStatus,
+                qualityCatchUpSummary: data.qualityCatchUpSummary !== undefined ? data.qualityCatchUpSummary : result.qualityCatchUpSummary,
+                qualityGenreSummary: data.qualityGenreSummary !== undefined ? data.qualityGenreSummary : result.qualityGenreSummary,
               }
             : result
         )
@@ -1365,9 +1459,12 @@ export default function MacAttackPage() {
         setQualityDetailByResult((current) => ({ ...current, [resultId]: data.qualityReport as StreamQualityReportSummary }));
       }
     } catch {
+      if (generation !== resultGeneration.current) return;
       setQualityActionError("Stream quality check failed");
     } finally {
-      setQualityActionId(null);
+      if (generation === resultGeneration.current) {
+        setQualityActionId(null);
+      }
     }
   };
 
@@ -1378,6 +1475,7 @@ export default function MacAttackPage() {
   /** Load probe history (EWMA/trend sparkline) for one result. */
   const loadProbeHistory = async (resultId: number) => {
     setHistoryLoadingId(resultId);
+    const generation = resultGeneration.current;
     try {
       const res = await fetch(`/api/scan/history?resultId=${resultId}&days=90`);
       const data = (await res.json()) as {
@@ -1385,21 +1483,27 @@ export default function MacAttackPage() {
         summary?: HistorySummary;
         error?: string;
       };
+      if (generation !== resultGeneration.current) return;
       if (res.ok && data.runs && data.summary) {
         setHistoryByResult((current) => ({ ...current, [resultId]: { runs: data.runs!, summary: data.summary! } }));
       }
     } catch {
+      if (generation !== resultGeneration.current) return;
       // Silent: history is an enhancement, not a blocker.
     } finally {
-      setHistoryLoadingId(null);
+      if (generation === resultGeneration.current) {
+        setHistoryLoadingId(null);
+      }
     }
   };
 
   /** Load monitoring state for one result. */
   const loadMonitor = async (resultId: number) => {
+    const generation = resultGeneration.current;
     try {
       const res = await fetch(`/api/scan/monitors?resultId=${resultId}`);
       const data = (await res.json()) as { monitors?: MonitorInfo[] };
+      if (generation !== resultGeneration.current) return;
       setMonitorByResult((current) => ({ ...current, [resultId]: data.monitors?.[0] ?? null }));
     } catch {
       // ignore
@@ -1410,6 +1514,7 @@ export default function MacAttackPage() {
   const toggleMonitor = async (resultId: number, enabled: boolean) => {
     setMonitorBusyId(resultId);
     setMonitorRunResult(null);
+    const generation = resultGeneration.current;
     try {
       const res = await fetch("/api/scan/monitors", {
         method: "POST",
@@ -1423,9 +1528,12 @@ export default function MacAttackPage() {
         setMonitorRunResult(data.error || "Could not update monitoring");
       }
     } catch {
+      if (generation !== resultGeneration.current) return;
       setMonitorRunResult("Could not update monitoring");
     } finally {
-      setMonitorBusyId(null);
+      if (generation === resultGeneration.current) {
+        setMonitorBusyId(null);
+      }
     }
   };
 
@@ -1465,6 +1573,7 @@ export default function MacAttackPage() {
 
   /** Create a stable, revocable subscription URL for a result's M3U. */
   const createPlaylistToken = async (resultId: number) => {
+    const generation = resultGeneration.current;
     try {
       const res = await fetch("/api/scan/playlist-token", {
         method: "POST",
@@ -1472,6 +1581,7 @@ export default function MacAttackPage() {
         body: JSON.stringify({ resultId, limitCount: 200 }),
       });
       const data = (await res.json()) as { url?: string; error?: string };
+      if (generation !== resultGeneration.current) return;
       if (res.ok && data.url) {
         setPlaylistTokenByResult((current) => ({ ...current, [resultId]: data.url! }));
         try {
@@ -1479,12 +1589,14 @@ export default function MacAttackPage() {
           setCopiedToken(data.url);
           setTimeout(() => setCopiedToken(null), 2500);
         } catch {
+      if (generation !== resultGeneration.current) return;
           // Clipboard may be unavailable (http origin) — the URL is shown anyway.
         }
       } else {
         setQualityActionError(data.error || "Could not create the subscription URL");
       }
     } catch {
+      if (generation !== resultGeneration.current) return;
       setQualityActionError("Could not create the subscription URL");
     }
   };
@@ -2953,8 +3065,8 @@ export default function MacAttackPage() {
                       <span className="text-xs text-gray-300">
                         Catch-up (archive) verification
                         <span className="block text-gray-500">
-                          When the portal advertises an archive, request a past programme and verify it actually
-                          resolves and plays.
+                          Spot-check up to 3 advertised channels across genres, independently of the live watchlist.
+                          Tests archive media playback, not full retention or historical content.
                         </span>
                       </span>
                     </label>
@@ -2985,7 +3097,7 @@ export default function MacAttackPage() {
                       <span className="text-xs text-gray-300">
                         Stream thumbnails
                         <span className="block text-gray-500">
-                          Capture one JPEG per probed channel with FFmpeg so you can see what you found.
+                          Capture one JPEG per probed channel with FFmpeg. Images are cleared when a new search starts.
                         </span>
                       </span>
                     </label>
@@ -3211,6 +3323,18 @@ export default function MacAttackPage() {
                   <p className="text-xs text-gray-500 mt-1">Current MAC</p>
                 </div>
               </div>
+            )}
+
+            {job && (
+              <QualityDashboard
+                results={results}
+                running={job.status === "running" || job.status === "pending"}
+                enabled={job.qualityCheckEnabled !== 0 && job.qualityCheckEnabled !== false}
+                onSelect={(id) => {
+                  setExpandedQualityId(id);
+                  document.getElementById(`quality-result-${id}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+                }}
+              />
             )}
 
             {/* Portal connectivity and playback-scope report */}
@@ -3457,7 +3581,7 @@ export default function MacAttackPage() {
                     <tbody className="divide-y divide-gray-800/50">
                       {results.map((result, idx) => (
                         <Fragment key={result.id}>
-                          <tr className="hover:bg-gray-800/50 transition-colors">
+                          <tr id={`quality-result-${result.id}`} className="hover:bg-gray-800/50 transition-colors">
                             <td className="px-3 py-3 text-gray-500 font-mono text-xs">
                               {idx + 1}
                             </td>
@@ -3495,6 +3619,11 @@ export default function MacAttackPage() {
                                     </>
                                   ) : (
                                     <p className="text-xs text-amber-300 mt-0.5">Streams not measured</p>
+                                  )}
+                                  {result.qualityCatchUpSummary?.channels && (
+                                    <p className="text-xs text-purple-300 mt-1">
+                                      Catch-up: {result.qualityCatchUpSummary.channels.filter((c) => c.status === "playable").length}/{result.qualityCatchUpSummary.channels.length} advertised channels playable
+                                    </p>
                                   )}
                                   <button
                                     type="button"
@@ -3673,7 +3802,7 @@ export default function MacAttackPage() {
                                           <button
                                             type="button"
                                             onClick={() => void recheckQuality(result.id)}
-                                            disabled={qualityActionId === result.id}
+                                            disabled={qualityActionId === result.id || catchUpActionId === result.id}
                                             className="px-2 py-1 text-xs text-cyan-200 hover:text-cyan-100 border border-cyan-800 rounded disabled:opacity-50"
                                           >
                                             {qualityActionId === result.id ? "Measuring…" : "Re-check streams"}
@@ -3821,8 +3950,7 @@ export default function MacAttackPage() {
                                                     : "border-gray-700 text-gray-400"
                                               }`}
                                             >
-                                              ⏪ catch-up {result.qualityCatchUpStatus.replace(/_/g, " ")}
-                                              {result.qualityCatchUpDays ? ` (~${result.qualityCatchUpDays.toFixed(1)} d)` : ""}
+                                              ⏪ catch-up {result.qualityCatchUpStatus === "verified" ? "archive media playable (spot check)" : result.qualityCatchUpStatus === "advertised_but_failed" ? "sampled checks failed" : "not advertised in fetched catalogue"}
                                             </span>
                                           )}
                                           {result.qualityEwma != null && (
@@ -3868,6 +3996,13 @@ export default function MacAttackPage() {
                                         </div>
                                       )}
 
+                                      <CatchUpResults
+                                        report={result.qualityCatchUpSummary}
+                                        busy={catchUpActionId !== null || qualityActionId === result.id}
+                                        error={catchUpErrorByResult[result.id]}
+                                        onCheck={(key) => void checkCatchUpForResult(result.id, key)}
+                                      />
+
                                       {/* Thumbnail from the newest measurement */}
                                       {result.qualityThumbnail && (
                                         <div className="flex items-center gap-3">
@@ -3879,7 +4014,7 @@ export default function MacAttackPage() {
                                           />
                                           <p className="text-xs text-gray-500">
                                             Frame captured through ffmpeg at the moment of measurement. Stored on this
-                                            host (never uploaded) and pruned after two weeks.
+                                            host (never uploaded). Cleared when a new search starts, or after two weeks.
                                           </p>
                                         </div>
                                       )}
@@ -4039,6 +4174,21 @@ export default function MacAttackPage() {
                                               </tbody>
                                             </table>
                                           </div>
+                                          {qualityDetailByResult[result.id].catchUp?.attempts && (
+                                            <div className="rounded-lg border border-purple-900/60 p-3 text-xs space-y-2">
+                                              <p className="font-semibold text-purple-200">Catch-up sampling evidence</p>
+                                              <p className="text-gray-400">
+                                                {qualityDetailByResult[result.id].catchUp?.testedChannels ?? 0}/{qualityDetailByResult[result.id].catchUp?.advertisedChannels ?? 0} advertised channels tested across {qualityDetailByResult[result.id].catchUp?.testedGenres ?? 0} genres. This is not a full catalogue or retention audit.
+                                              </p>
+                                              <ul className="space-y-1 text-gray-400">
+                                                {qualityDetailByResult[result.id].catchUp?.attempts?.map((attempt, index) => (
+                                                  <li key={index}>
+                                                    <span className="text-gray-200">{attempt.channelName}</span> · {attempt.method} · window ending {attempt.minutesAgo} min ago · {attempt.playable ? "archive media playable" : attempt.error ?? "no media"}
+                                                  </li>
+                                                ))}
+                                              </ul>
+                                            </div>
+                                          )}
                                           <ul className="list-disc pl-5 space-y-0.5 text-xs text-gray-500">
                                             {qualityDetailByResult[result.id].limitations.map((limitation) => (
                                               <li key={limitation}>{limitation}</li>

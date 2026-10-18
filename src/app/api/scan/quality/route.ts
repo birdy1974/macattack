@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { and, desc, eq } from "drizzle-orm";
-import { db } from "@/db";
+import { desc, eq } from "drizzle-orm";
+import { db, ensureMigrations } from "@/db";
 import { qualityProbeRuns, scanJobs, scanResults, settings } from "@/db/schema";
 import { validateStalkerPortal } from "@/lib/scanner";
 import { checkMacStreamQuality, type MacStreamQualityReport } from "@/lib/mac-quality";
@@ -9,6 +9,7 @@ import { detectDegradation, summariseHistory, type ProbeRun } from "@/lib/qualit
 import { parseProxyList } from "@/lib/proxy";
 import { parseUserAgentList, userAgentSettingKey } from "@/lib/user-agents";
 import { hostOf } from "@/lib/parallel";
+import { saveQualityWithCatchUp } from "@/lib/catchup-store";
 import { checkXtreamAccountQuality } from "@/lib/xtream-quality";
 
 /**
@@ -55,7 +56,8 @@ function flatten(report: MacStreamQualityReport) {
     qualityRetries: measured?.probe?.retryCount ?? 0,
     qualityThroughputCv: measured?.probe?.throughputCoefficientOfVariation ?? null,
     qualityCatchUpStatus: report.catchUp?.status ?? "not_checked",
-    qualityCatchUpDays: report.catchUp?.verifiedMinutes ? report.catchUp.verifiedMinutes / (60 * 24) : null,
+    qualityCatchUpSummary: report.catchUp,
+    qualityCatchUpDays: null,
     qualityThumbnail: thumbnail?.thumbnail ?? null,
     qualityGenreSummary: report.genreGroups,
     qualityVerdict: report.aggregate.verdict,
@@ -142,6 +144,7 @@ export async function GET(request: NextRequest) {
   }
 
   try {
+    await ensureMigrations();
     const [row] = await db
       .select({
         id: scanResults.id,
@@ -153,6 +156,7 @@ export async function GET(request: NextRequest) {
         qualityTrend: scanResults.qualityTrend,
         qualityCheckedAt: scanResults.qualityCheckedAt,
         qualityReport: scanResults.qualityReport,
+        qualityCatchUpSummary: scanResults.qualityCatchUpSummary,
       })
       .from(scanResults)
       .where(eq(scanResults.id, resultId))
@@ -178,6 +182,7 @@ export async function GET(request: NextRequest) {
       trend: row.qualityTrend,
       checkedAt: row.qualityCheckedAt,
       report: row.qualityReport ?? null,
+      catchUp: row.qualityCatchUpSummary ?? null,
       history: history.map((entry) => ({
         measuredAt: entry.measuredAt.toISOString(),
         overall: entry.overallScore,
@@ -223,6 +228,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
+    await ensureMigrations();
     const row = await loadResult(resultId);
     if (!row) return NextResponse.json({ error: "Result not found" }, { status: 404 });
     if (!row.job || row.result.jobId !== row.job.id) {
@@ -250,17 +256,15 @@ export async function POST(request: NextRequest) {
         sampleMs: Math.max(3000, Math.min(Number(body.sampleMs) || 30000, 60000)),
         pictureChecks: body.pictureChecks !== false,
         thumbnails: body.thumbnails !== false,
+        checkCatchUp: body.catchUp !== false,
       });
       if (!report) {
         return NextResponse.json({ error: error || "Xtream check failed" }, { status: 502 });
       }
       const flat = flatten(report);
       const summary = await persistMeasurement(resultId, row.result.jobId, row.result.macAddress, report, "manual");
-      await db
-        .update(scanResults)
-        .set({ ...flat, qualityEwma: summary.ewma, qualityTrend: summary.trend })
-        .where(eq(scanResults.id, resultId));
-      return NextResponse.json({ success: true, ...flat, ewma: summary.ewma, trend: summary.trend });
+      const saved = await saveQualityWithCatchUp(resultId, report, { ...flat, qualityEwma: summary.ewma, qualityTrend: summary.trend });
+      return NextResponse.json({ success: true, ...flat, ...saved, ewma: summary.ewma, trend: summary.trend });
     }
 
     const serverPath = await resolveServerPath(
@@ -321,19 +325,15 @@ export async function POST(request: NextRequest) {
       }))
     );
 
-    await db
-      .update(scanResults)
-      .set({
-        ...flat,
-        qualityEwma: summary.ewma,
-        qualityTrend: summary.trend,
-        stalkerServerPath: row.result.stalkerServerPath || serverPath,
-      })
-      .where(and(eq(scanResults.id, resultId), eq(scanResults.jobId, row.job.id)));
+    const saved = await saveQualityWithCatchUp(resultId, report, {
+      ...flat, qualityEwma: summary.ewma, qualityTrend: summary.trend,
+      stalkerServerPath: row.result.stalkerServerPath || serverPath,
+    });
 
     return NextResponse.json({
       success: true,
       ...flat,
+      ...saved,
       ewma: summary.ewma,
       trend: summary.trend,
       degradation,

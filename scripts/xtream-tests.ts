@@ -68,6 +68,12 @@ async function main() {
   check("live streams are listed", streams.length === 3, String(streams.length));
   check("archive info is parsed", streams.find((stream) => stream.id === "101")?.tvArchive === true);
 
+  let catalogueError = false;
+  try {
+    await xtreamLiveStreams({ ...demo, base: "http://127.0.0.1:1" }, { timeoutMs: 100, throwOnError: true });
+  } catch { catalogueError = true; }
+  check("catalogue failure is not treated as an empty archive inventory", catalogueError);
+
   // ── 3. Selection spread across categories ────────────────────────────────
   const selection = selectXtreamStreams(streams, 2);
   check("selection respects the channel budget", selection.length === 2);
@@ -103,8 +109,8 @@ async function main() {
       report.limitations.length >= 2 && report.limitations.some((line) => line.includes("sampled"))
     );
     check(
-      "catch-up is honestly labelled as not verified",
-      report.catchUp.status === "not_checked" && report.limitations.some((line) => line.toLowerCase().includes("catch-up"))
+      "catch-up archive media is spot checked with scope limitations",
+      report.catchUp.status === "verified" && report.catchUp.attempts?.[0]?.method === "xtream-timeshift" && report.limitations.some((line) => line.toLowerCase().includes("catch-up"))
     );
     const measured = report.channels.find((channel) => channel.probe);
     check("throughput was measured", (measured?.probe?.sustainedMbps ?? 0) > 0, String(measured?.probe?.sustainedMbps));

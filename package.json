@@ -13,7 +13,10 @@
     "probe:url": "npx --yes tsx scripts/probe-selftest.ts",
     "test:waves": "npx --yes tsx scripts/wave-tests.ts",
     "test:xtream": "npx --yes tsx scripts/xtream-tests.ts",
-    "test:watchlist": "npx --yes tsx scripts/watchlist-tests.ts"
+    "test:watchlist": "npx --yes tsx scripts/watchlist-tests.ts",
+    "test:scan-quality": "npx --yes tsx scripts/scan-quality-tests.ts",
+    "test:catchup": "npx --yes tsx scripts/catchup-inventory-tests.ts",
+    "test:catchup-db": "npx --yes tsx scripts/catchup-db-tests.ts"
   },
   "dependencies": {
     "dotenv": "17.3.1",

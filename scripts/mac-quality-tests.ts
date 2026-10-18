@@ -22,6 +22,7 @@ import {
   stalkerListChannels,
   selectChannelsForProbe,
   stalkerResolveStream,
+  stalkerResolveArchiveLink,
   buildM3U,
 } from "../src/lib/stalker-streams";
 
@@ -169,15 +170,25 @@ async function main() {
   );
 
   const archiveChannel = list.channels.find((channel) => channel.tvArchive);
+  check("Ministra archive hours are converted to days", archiveChannel?.tvArchiveDays === 7, archiveChannel?.tvArchiveDays);
   check("the mock portal advertises an archive", !!archiveChannel, list.channels.map((c) => [c.name, c.tvArchive]));
+
+  if (archiveChannel) {
+    const nativeWithoutLiveCmd = await stalkerResolveArchiveLink(options, handshake.token as string,
+      { ...archiveChannel, cmd: null }, 60, "programme");
+    check("native archive needs programme ID, not a live command", !!nativeWithoutLiveCmd.url && nativeWithoutLiveCmd.linkResolved, nativeWithoutLiveCmd.error);
+  }
 
   const catchUpReport = await checkMacStreamQuality({
     serverPath: SERVER_PATH,
     portalBase: PORTAL_BASE,
     mac: MAC,
     timeoutMs: 5000,
-    channelsToProbe: 3,
+    channelsToProbe: 1,
+    watchlist: ["Sports FHD"], // Archive lives in News, outside the live sample.
     sampleMs: 4000,
+    pictureChecks: false,
+    thumbnails: false,
     checkCatchUp: true,
   });
   check("catch-up was attempted", catchUpReport.catchUp.status !== "not_checked", catchUpReport.catchUp);
@@ -191,6 +202,10 @@ async function main() {
     !!catchUpReport.catchUp.channelName && (catchUpReport.catchUp.verifiedMinutes ?? 0) > 0,
     catchUpReport.catchUp
   );
+  check("archive discovery searches beyond the live watchlist", catchUpReport.channels.every((c) => c.name === "Sports FHD") && catchUpReport.catchUp.channelName === "News HD", catchUpReport.catchUp);
+  check("native programme archive method works", catchUpReport.catchUp.attempts?.some((a) => a.method === "programme" && a.playable) === true, catchUpReport.catchUp);
+  check("saved inventory includes archive channels outside the live sample", catchUpReport.catchUp.channels?.some((c) => c.channelId === "1" && c.genreTitle === "News" && c.status === "playable") === true, catchUpReport.catchUp.channels);
+  check("separate genre/channel failures are retained", catchUpReport.catchUp.genres?.some((g) => g.genreTitle === "Sports" && g.failedChannels === 1) === true, catchUpReport.catchUp.genres);
   check("catch-up bytes were read", (catchUpReport.catchUp.bytesRead ?? 0) > 0, catchUpReport.catchUp.bytesRead);
 
   // Same job without the flag must not spend time on catch-up.
