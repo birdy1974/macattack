@@ -228,7 +228,7 @@ const AVAILABLE_FIELDS = [
   { key: "qualityCodec", label: "Stream Video Codec (measured)", default: false },
   { key: "qualityThroughputMbps", label: "Stream Throughput (Mbps measured)", default: true },
   { key: "qualityRequiredMbps", label: "Stream Required Bitrate (Mbps)", default: false },
-  { key: "qualityFirstByteMs", label: "Stream Time to First Byte (ms)", default: true },
+  { key: "qualityFirstByteMs", label: "Stream Time to First Byte median (ms)", default: true },
   { key: "qualityChannels", label: "Stream Channels Playable/Probed", default: false },
   { key: "qualityMeasured", label: "Stream Quality Measured At", default: false },
   { key: "qualityRetries", label: "Stream Retries (transient)", default: false },
@@ -517,7 +517,7 @@ export default function MacAttackPage() {
       hardwareDevice: string | null;
       checkedAt?: string;
     };
-    thumbnails: { dir: string; fallbackDir?: string; fileCount: number | null; maxAgeDays: number; writable?: boolean; usingFallback?: boolean; lastError?: string | null };
+    thumbnails: { dir: string; fallbackDir?: string; effectiveDir?: string; fileCount: number | null; fallbackFileCount?: number; maxAgeDays: number; writable?: boolean; usingFallback?: boolean; lastError?: string | null; uid?: number | null; gid?: number | null };
   } | null>(null);
   const [systemRefreshing, setSystemRefreshing] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -1623,7 +1623,7 @@ export default function MacAttackPage() {
             hardwareDevice: string | null;
             checkedAt?: string;
           };
-          thumbnails: { dir: string; fallbackDir?: string; fileCount: number | null; maxAgeDays: number; writable?: boolean; usingFallback?: boolean; lastError?: string | null };
+          thumbnails: { dir: string; fallbackDir?: string; effectiveDir?: string; fileCount: number | null; fallbackFileCount?: number; maxAgeDays: number; writable?: boolean; usingFallback?: boolean; lastError?: string | null; uid?: number | null; gid?: number | null };
         };
         setSystemInfo(data);
       }
@@ -1650,7 +1650,7 @@ export default function MacAttackPage() {
             hardwareDevice: string | null;
             checkedAt?: string;
           };
-          thumbnails: { dir: string; fallbackDir?: string; fileCount: number | null; maxAgeDays: number; writable?: boolean; usingFallback?: boolean; lastError?: string | null };
+          thumbnails: { dir: string; fallbackDir?: string; effectiveDir?: string; fileCount: number | null; fallbackFileCount?: number; maxAgeDays: number; writable?: boolean; usingFallback?: boolean; lastError?: string | null; uid?: number | null; gid?: number | null };
         };
         setSystemInfo(data);
       }
@@ -2138,19 +2138,35 @@ export default function MacAttackPage() {
                   </p>
                   <p>
                     <span className="text-gray-500">Thumbnails:</span>{" "}
-                    {systemInfo.thumbnails.fileCount ?? 0} file(s) in <code>{systemInfo.thumbnails.dir}</code> (kept{" "}
-                    {systemInfo.thumbnails.maxAgeDays} days)
+                    {(systemInfo.thumbnails.usingFallback
+                      ? (systemInfo.thumbnails.fallbackFileCount ?? 0)
+                      : (systemInfo.thumbnails.fileCount ?? 0))}{" "}
+                    file(s) in{" "}
+                    <code>
+                      {systemInfo.thumbnails.effectiveDir ??
+                        (systemInfo.thumbnails.usingFallback
+                          ? (systemInfo.thumbnails.fallbackDir ?? "/tmp/macattack-thumbnails")
+                          : systemInfo.thumbnails.dir)}
+                    </code>{" "}
+                    (kept {systemInfo.thumbnails.maxAgeDays} days; with the bundled docker-compose this is the host folder{" "}
+                    <code>./data/thumbnails</code> next to docker-compose.yml)
                     {systemInfo.thumbnails.writable === false && (
                       <span className="text-yellow-300">
-                        {" "}— directory is not writable by the app user (uid 1001); check the volume permissions.
+                        {" "}— <code>{systemInfo.thumbnails.dir}</code> is not writable by the app user
+                        {systemInfo.thumbnails.uid != null
+                          ? ` (uid ${systemInfo.thumbnails.uid}${systemInfo.thumbnails.gid != null ? `:${systemInfo.thumbnails.gid}` : ""})`
+                          : ""}
+                        ; on the host, chown the <code>./data</code> folder bound to <code>/app/data</code> to that uid/gid
+                        (or set PUID/PGID to its owner), then recreate the container.
                       </span>
                     )}
                   </p>
                   {systemInfo.thumbnails.usingFallback && (
                     <p className="text-xs text-yellow-300">
                       Writes fall back to <code>{systemInfo.thumbnails.fallbackDir ?? "/tmp/macattack-thumbnails"}</code>{" "}
-                      (cleared when the container is recreated). Fix the mount permissions to keep thumbnails in the data
-                      directory
+                      inside the container (cleared when the container is recreated, and not visible in the host{" "}
+                      <code>./data/thumbnails</code> folder). Fix the mount permissions to keep thumbnails on the host
+                      harddisk
                       {systemInfo.thumbnails.lastError ? ` — ${systemInfo.thumbnails.lastError}` : ""}.
                     </p>
                   )}

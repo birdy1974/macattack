@@ -124,8 +124,20 @@ RUN addgroup --system --gid 1001 nodejs \
 COPY --from=build --chown=nextjs:nodejs /app/.next/standalone ./
 
 # Writable data directory for the optional thumbnail cache
-# (MACATTACK_DATA_DIR defaults to ./data/thumbnails inside /app).
-RUN mkdir -p /app/data && chown -R nextjs:nodejs /app/data
+# (MACATTACK_DATA_DIR defaults to ./data inside /app; thumbnails land in
+# /app/data/thumbnails).
+# chmod 0777 (not just chown to 1001) is deliberate: the bundled
+# docker-compose.yml overrides the runtime user to
+# ${PUID:-1026}:${PGID:-100}, and a directory owned by 1001 with mode 0755 is
+# NOT writable by that user — captures then silently fell back to /tmp and
+# never reached the host harddisk. World-writable *inside the container*
+# keeps the image default (and any fresh Docker-managed volume seeded from
+# it) writable by whichever uid the container actually runs as. A bind
+# mount (the bundled compose `./data:/app/data`) shadows these permissions
+# with the host folder's own, so the host folder still decides there.
+RUN mkdir -p /app/data/thumbnails \
+ && chown -R nextjs:nodejs /app/data \
+ && chmod 0777 /app/data /app/data/thumbnails
 
 USER nextjs
 EXPOSE 3000

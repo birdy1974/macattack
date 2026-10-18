@@ -46,13 +46,26 @@ fi
 # Thumbnail cache: files land in <MACATTACK_DATA_DIR>/thumbnails. Report the
 # directory and its writability at boot, so an unwritable bind mount shows up
 # in `docker compose logs` instead of as an empty folder after a scan.
+# Writability is proven by creating+deleting a probe file: `[ -w ]` follows
+# mode bits only, which Synology share ACLs / read-only mounts can contradict,
+# and `mkdir -p` succeeds on an existing read-only directory.
+# The uid/gid printed are this process's REAL ids (the bundled compose file
+# runs the container as ${PUID:-1026}:${PGID:-100}, not the image's 1001) —
+# chown advice must name the ids the container actually runs as.
 THUMB_DIR="${MACATTACK_DATA_DIR:-/app/data}/thumbnails"
-if mkdir -p "$THUMB_DIR" 2>/dev/null && [ -w "$THUMB_DIR" ]; then
-  echo "Thumbnails: writing captured frames to $THUMB_DIR"
+APP_UID="$(id -u)"
+APP_GID="$(id -g)"
+if mkdir -p "$THUMB_DIR" 2>/dev/null && touch "$THUMB_DIR/.macattack-write-test" 2>/dev/null && rm -f "$THUMB_DIR/.macattack-write-test" 2>/dev/null; then
+  echo "Thumbnails: writing captured frames to $THUMB_DIR (app user uid ${APP_UID}:${APP_GID})"
+  echo "            With the bundled docker-compose.yml this is the host folder ./data/thumbnails next to docker-compose.yml."
 else
-  echo "WARNING: $THUMB_DIR is not writable by the app user (uid 1001)."
-  echo "         Thumbnails fall back to /tmp/macattack-thumbnails and are lost when the container is recreated."
-  echo "         Fix the mount ownership, e.g. chown -R 1001:1001 <host-data-dir>, then recreate the container."
+  echo "WARNING: $THUMB_DIR is not writable by the app user (uid ${APP_UID}:${APP_GID})."
+  echo "         Thumbnails fall back to /tmp/macattack-thumbnails inside the container and are lost when it is recreated;"
+  echo "         they will NOT appear in the host ./data/thumbnails folder."
+  echo "         Fix the host folder bound to /app/data, e.g. on the NAS/Pi host:"
+  echo "           mkdir -p ./data/thumbnails && sudo chown -R ${APP_UID}:${APP_GID} ./data"
+  echo "         (or set PUID/PGID to the folder owner's ids), then recreate the container:"
+  echo "           docker compose up -d --force-recreate app"
 fi
 
 if [ -n "$MACATTACK_FFMPEG_DRI_DEVICE" ]; then

@@ -13,8 +13,11 @@ next-env.d.ts
 # Logs
 *.log
 
-# Runtime thumbnail cache (MACATTACK_DATA_DIR default)
-data/thumbnails/
+# Runtime thumbnail cache (MACATTACK_DATA_DIR default). Keep the folder
+# itself (.gitkeep) so a cloned/copied project already has data/thumbnails
+# for the docker-compose bind mount; ignore everything written into it.
+data/thumbnails/*
+!data/thumbnails/.gitkeep
 
 # OS / editor clutter
 .DS_Store

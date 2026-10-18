@@ -24,6 +24,7 @@ import {
   sanitizeOutputFieldOrder,
   serializeOutputFieldOrder,
 } from "../src/lib/field-order";
+import { buildCsv, escapeCsvField, isCsvSafeHeader, toCsvRow } from "../src/lib/csv";
 import { parseMacList, normalizeMac } from "../src/lib/mac-list";
 import { parseProxy, parseProxyList, redactProxy } from "../src/lib/proxy";
 import { detectLabelMismatch, parseLabelClaim } from "../src/lib/label-mismatch";
@@ -673,6 +674,68 @@ section("RTSP / RTMP / UDP handling");
 }
 
 // ============================================================================
+// CSV EXPORT: quoting + comma-free headers
+// ============================================================================
+// Regression: the CSV header row was joined unquoted and one header
+// ("Stream Time to First Byte (ms, median)") contained a comma, so the header
+// had one cell more than every data row and all following columns shifted.
+section("CSV export");
+{
+  check("escapes quotes by doubling them", escapeCsvField('say "hi"') === '"say ""hi"""');
+  check("keeps commas and newlines inside one quoted cell", escapeCsvField("a,b\nc") === '"a,b\nc"');
+  check("coerces null/undefined/numbers", escapeCsvField(null) === '""' && escapeCsvField(undefined) === '""' && escapeCsvField(42) === '"42"');
+  check("header row is quoted like data rows", toCsvRow(["A,B", "C"]) === '"A,B","C"');
+
+  // Parse the built CSV back (quoted cells, doubled quotes, embedded
+  // newline) and prove every row has exactly the header's column count.
+  const parseCsv = (text: string): string[][] => {
+    const rows: string[][] = [];
+    let row: string[] = [];
+    let cell = "";
+    let quoted = false;
+    for (let i = 0; i < text.length; i += 1) {
+      const ch = text[i];
+      if (quoted) {
+        if (ch === '"' && text[i + 1] === '"') { cell += '"'; i += 1; }
+        else if (ch === '"') quoted = false;
+        else cell += ch;
+      } else if (ch === '"') quoted = true;
+      else if (ch === ",") { row.push(cell); cell = ""; }
+      else if (ch === "\n") { row.push(cell); cell = ""; rows.push(row); row = []; }
+      else cell += ch;
+    }
+    row.push(cell);
+    rows.push(row);
+    return rows;
+  };
+  const doc = buildCsv(
+    ["MAC Address", "Stream Time to First Byte median (ms)", "Quality"],
+    [["00:1A:79:AA:BB:CC", 123, 'good, "very"\nstable'], ["00:1A:79:DD:EE:FF", null, "poor"]]
+  );
+  const parsed = parseCsv(doc);
+  check("every CSV row has the header column count", parsed.length === 3 && parsed.every((r) => r.length === 3), JSON.stringify(parsed.map((r) => r.length)));
+  check("CSV values round-trip commas/quotes/newlines", parsed[1][2] === 'good, "very"\nstable' && parsed[2][1] === "");
+  check("comma-free header rule accepts the fixed name", isCsvSafeHeader("Stream Time to First Byte median (ms)"));
+  check("comma-free header rule rejects the old name", !isCsvSafeHeader("Stream Time to First Byte (ms, median)"));
+
+  // Check for more of the same: every export/table header defined in the
+  // download route's fieldMap and in page.tsx AVAILABLE_FIELDS must obey
+  // the no-comma/no-quote/no-newline header rule.
+  const downloadSource = readFileSync(join(process.cwd(), "src/app/api/scan/download/route.ts"), "utf8");
+  const fieldMapBlock = downloadSource.slice(downloadSource.indexOf("const fieldMap"), downloadSource.indexOf("\n    };", downloadSource.indexOf("const fieldMap")));
+  const fieldMapHeaders = [...fieldMapBlock.matchAll(/:\s*"([^"]*)"/g)].map((m) => m[1]);
+  const pageSource = readFileSync(join(process.cwd(), "src/app/page.tsx"), "utf8");
+  const fieldsBlock = pageSource.slice(pageSource.indexOf("const AVAILABLE_FIELDS"), pageSource.indexOf("\n];", pageSource.indexOf("const AVAILABLE_FIELDS")));
+  const pageHeaders = [...fieldsBlock.matchAll(/label:\s*"([^"]*)"/g)].map((m) => m[1]);
+  check("header audit extracted the download headers", fieldMapHeaders.length >= 40, `${fieldMapHeaders.length}`);
+  check("header audit extracted the page headers", pageHeaders.length >= 40, `${pageHeaders.length}`);
+  const badDownload = fieldMapHeaders.filter((h) => !isCsvSafeHeader(h));
+  const badPage = pageHeaders.filter((h) => !isCsvSafeHeader(h));
+  check("no download header contains comma/quote/newline", badDownload.length === 0, badDownload.join(" | "));
+  check("no page field label contains comma/quote/newline", badPage.length === 0, badPage.join(" | "));
+}
+
+// ============================================================================
 // 9. THUMBNAIL STORE SAFETY (Wave 2)
 // ============================================================================
 section("Thumbnail store");
@@ -712,6 +775,17 @@ section("Thumbnail store");
   const storeInfo = await thumbnailStoreInfo();
   check("store info reports writability", typeof storeInfo.writable === "boolean");
   check("store info names the fallback directory", storeInfo.fallbackDir.includes("macattack-thumbnails"), storeInfo.fallbackDir);
+  // The panel/log must name the ids this process really runs as (the bundled
+  // compose file overrides the image's 1001), and say which directory new
+  // captures are effectively written to.
+  check("store info reports the real runtime uid/gid", storeInfo.uid === (process.getuid?.() ?? null) && storeInfo.gid === (process.getgid?.() ?? null), `${storeInfo.uid}:${storeInfo.gid}`);
+  check("store info reports the effective write directory", storeInfo.effectiveDir === (storeInfo.usingFallback ? storeInfo.fallbackDir : storeInfo.dir), storeInfo.effectiveDir);
+  check("store info counts fallback files separately", typeof storeInfo.fallbackFileCount === "number" && storeInfo.fallbackFileCount >= 0);
+  {
+    let probeLeftBehind = false;
+    try { readFileSync(join(storeInfo.dir, `.macattack-write-test-${process.pid}`)); probeLeftBehind = true; } catch { /* absent = good */ }
+    check("writability probe file is cleaned up", !probeLeftBehind);
+  }
   if (saved) await deleteThumbnail(saved);
 }
 
