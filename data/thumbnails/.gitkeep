@@ -1,0 +1,6 @@
+Captured stream thumbnails (JPEG) are written here at runtime.
+With the bundled docker-compose.yml, ../ (data/) is bind-mounted into the
+container at /app/data, so the .jpg files in this folder are the ones on
+your host harddisk. They are cleared when a new search starts and are
+git-ignored; this placeholder only keeps the folder in the repository so
+the bind-mount target exists (owned by you) before the first start.

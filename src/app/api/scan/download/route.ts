@@ -3,6 +3,7 @@ import { db, ensureMigrations } from "@/db";
 import { scanJobs, scanResults } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { formatCatchUpInventory } from "@/lib/catchup-display";
+import { buildCsv } from "@/lib/csv";
 import { buildQualityReport } from "@/lib/quality-report";
 import { extractPortalExpiry, isMeaningfulExpiryValue } from "@/lib/portal-result-fields";
 
@@ -83,6 +84,10 @@ export async function GET(request: NextRequest) {
       return report;
     };
 
+    // CSV/TXT column headers. Keep every value free of commas, quotes and
+    // line breaks (see @/lib/csv): a comma in a header shifts every
+    // following column in tools that split naively on ",". wave-tests
+    // enforce this for all headers below and in page.tsx AVAILABLE_FIELDS.
     const fieldMap: Record<string, string> = {
       macAddress: "MAC Address",
       portalUrl: "Portal URL",
@@ -105,7 +110,7 @@ export async function GET(request: NextRequest) {
       qualityCodec: "Stream Video Codec (measured)",
       qualityThroughputMbps: "Stream Throughput (Mbps measured)",
       qualityRequiredMbps: "Stream Required Bitrate (Mbps)",
-      qualityFirstByteMs: "Stream Time to First Byte (ms, median)",
+      qualityFirstByteMs: "Stream Time to First Byte median (ms)",
       qualityChannels: "Stream Channels Playable/Probed",
       qualityMeasured: "Stream Quality Measured At",
       qualityRetries: "Stream Retries (transient)",
@@ -426,19 +431,16 @@ export async function GET(request: NextRequest) {
     }
 
     if (format === "csv") {
+      // Headers and values go through the same quoting (buildCsv). The header
+      // row used to be joined unquoted, so a comma inside one header produced
+      // one header cell more than every data row and shifted all following
+      // columns. getFieldValue is typed string but a few fields return the
+      // raw column (number/text), which buildCsv coerces safely.
       const headers = selectedFields.map((f) => fieldMap[f] || f);
-      const csvLines = [headers.join(",")];
-
-      for (const result of results) {
-        const values = selectedFields.map((f) => {
-          const val = getFieldValue(result, f);
-          // Escape CSV values
-          return `"${val.replace(/"/g, '""')}"`;
-        });
-        csvLines.push(values.join(","));
-      }
-
-      const csvContent = csvLines.join("\n");
+      const csvContent = buildCsv(
+        headers,
+        results.map((result) => selectedFields.map((f) => getFieldValue(result, f)))
+      );
 
       return new NextResponse(csvContent, {
         headers: {

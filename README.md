@@ -81,6 +81,13 @@ Or upload the base files with **Synology File Station** to
 ssh admin@<NAS-IP>
 cd /volume1/docker/mac-attack
 
+# Create the thumbnail folder on the NAS harddisk BEFORE the first start.
+# It is bind-mounted into the container, so captured frames show up in
+# /volume1/docker/mac-attack/data/thumbnails (mac-attack\data\thumbnails
+# from Windows). Create it as the user that owns this directory — if Docker
+# auto-creates it instead, it ends up root-owned and unwritable.
+mkdir -p data/thumbnails
+
 docker compose up -d          # on older DSM: docker-compose up -d
 ```
 
@@ -144,6 +151,12 @@ scp docker-compose.yml update.sh pi@<PI-IP>:~/mac-attack/
 ```bash
 ssh pi@<PI-IP>
 cd ~/mac-attack
+
+# Create the thumbnail folder on the Pi's disk BEFORE the first start (it is
+# bind-mounted into the container, so frames land in ~/mac-attack/data/thumbnails).
+# Also match the container user to your Pi user so it may write there:
+# export PUID="$(id -u)" PGID="$(id -g)"   # usually 1000:1000 on the Pi
+mkdir -p data/thumbnails
 
 docker compose up -d          # or: docker-compose up -d
 ```
@@ -427,7 +440,8 @@ npm run test:catchup     # saved channel/genre evidence, cumulative checks, disp
 | `FFMPEG_PATH` | Path to `ffmpeg` when it is not on `PATH` (local source runs only — leave unset in Docker, where the bundled binary is found on PATH; detection still falls back to PATH if the override is wrong) |
 | `MACATTACK_FFMPEG_HWACCEL` | `auto` (default) or `vaapi` to attempt VAAPI when supported/device-accessible; set `none` to force software decoding |
 | `MACATTACK_FFMPEG_DRI_DEVICE` | Optional Linux DRI render-device path (default detection tries `/dev/dri/renderD128`, then `/dev/dri/card0`) |
-| `MACATTACK_DATA_DIR` | Base directory for the thumbnail cache — files land in `<dir>/thumbnails` (default `./data`, cleared on a new search or pruned after 14 days; the bundled compose file mounts a volume at `/app/data` so they survive updates) |
+| `MACATTACK_DATA_DIR` | Base directory for the thumbnail cache — files land in `<dir>/thumbnails` (default `./data`, cleared on a new search or pruned after 14 days; the bundled compose file bind-mounts the host folder `./data` next to docker-compose.yml at `/app/data`, so the JPEGs are on the host harddisk in `./data/thumbnails` and survive updates) |
+| `PUID` / `PGID` | Compose-only: uid/gid the app container runs as (default `1026`/`100`, the Synology user). The host `./data` folder must be writable by these ids or thumbnails fall back to `/tmp` inside the container |
 | `MACATTACK_STB_USER_AGENT` | Overrides the default MAG user agent |
 | `MACATTACK_ALLOW_LOCAL_STREAMS=1` | Test escape hatch: allow loopback stream URLs (used by the fixture suites) |
 | `MACATTACK_FREEZE_NOISE`, `MACATTACK_FREEZE_MIN_SEC`, `MACATTACK_BLACK_MIN_SEC` | Tune ffmpeg freeze/black thresholds |
@@ -575,16 +589,28 @@ Genre counts describe individual channels; one successful channel never confirms
 an entire genre or the full advertised retention.
 
 ### Thumbnails are missing / the data directory stays empty
-Every quality check now logs what happened to each capture, so start there:
+Every quality check logs what happened to each capture, so start there:
 
-- `📸 Thumbnails saved: N → /app/data/thumbnails` — the files are there (inside
-  the container/volume, not necessarily in a host folder).
-- `⚠ <dir> is not writable by the app user (uid 1001) — thumbnails are written
-  to /tmp/macattack-thumbnails instead …` — the configured data directory cannot
-  be written, so MacAttack kept working by using the fallback directory. Those
-  files are served by the app but disappear when the container is recreated.
-  Fix the mount or its ownership, then press **↻ Re-check** in the Host
-  capabilities panel.
+- `📸 Thumbnails saved: N → /app/data/thumbnails` — the files are saved. With
+  the bundled compose file `/app/data` is a **bind mount of the host folder
+  `./data`** next to docker-compose.yml, so look in `./data/thumbnails` on the
+  host harddisk: `/volume1/docker/mac-attack/data/thumbnails` on the NAS
+  (`mac-attack\data\thumbnails` from Windows), `~/mac-attack/data/thumbnails`
+  on the Pi. Remember that starting a **new search clears** the folder, and
+  files are pruned after 14 days.
+- `⚠ <dir> is not writable by the app user (uid <PUID>:<PGID>) — thumbnails are
+  written to /tmp/macattack-thumbnails instead …` — the host `./data` folder
+  cannot be written by the container user, so MacAttack kept working by using
+  a container-local fallback. Those files are served by the app but never
+  appear on the host harddisk and disappear when the container is recreated.
+  The message prints the container's **actual** uid/gid (the bundled compose
+  runs it as `${PUID:-1026}:${PGID:-100}` — *not* the image's 1001). Fix on
+  the host, in the directory holding docker-compose.yml:
+  `mkdir -p data/thumbnails && sudo chown -R <PUID>:<PGID> data`
+  (defaults: `sudo chown -R 1026:100 data`), then
+  `docker compose up -d --force-recreate app` and press **↻ Re-check** in the
+  Host capabilities panel. If `./data` did not exist at first start, Docker
+  auto-created it owned by **root** — same fix.
 - `⚠ No thumbnail for <channel>: <reason>` — ffmpeg could not grab a frame.
   Common reasons on real portals: `no frame decoded within 20s (…)` when the
   stream is offline/DRM-protected or the portal refuses another simultaneous
@@ -593,15 +619,22 @@ Every quality check now logs what happened to each capture, so start there:
   allows only one at a time.
 
 Where the files live: `<MACATTACK_DATA_DIR>/thumbnails` inside the container
-(`/app/data/thumbnails` with the bundled compose file). With the default
-Docker-managed volume `mac-attack-data:/app/data` that directory is **not** a
-host folder — list it with
-`docker exec mac-attack ls -la /app/data/thumbnails`. A host bind mount must be
-writable by uid 1001, e.g.
-`chown -R 1001:1001 /volume1/docker/mac-attack/data` on the NAS.
+(`/app/data/thumbnails` with the bundled compose file), bind-mounted from the
+host `./data/thumbnails`. Verify from either side:
+`ls -la data/thumbnails` on the host, or
+`docker exec mac-attack ls -la /app/data/thumbnails`. At container start,
+`docker compose logs app` prints the thumbnail directory and proves
+writability with a create+delete probe (mode bits can lie under Synology
+share ACLs). Upgrades from older versions: thumbnails used to go to a
+Docker-managed **named volume** (`mac-attack-data`), which is not a host
+folder at all — that, plus the volume being owned by uid 1001 while compose
+runs the app as 1026, is why `mac-attack\data\thumbnails` stayed empty.
+Re-copy the updated docker-compose.yml and recreate the container; the old
+volume is then unused (`docker volume rm <project>_mac-attack-data`).
 
-The Host capabilities panel reports the directory, the file count, whether it is
-writable, and whether writes are falling back to `/tmp`.
+The Host capabilities panel reports the directory actually written to, its
+file count, the app uid/gid, whether a real write probe succeeds, and
+whether writes are falling back to `/tmp`.
 
 ---
 
@@ -632,7 +665,8 @@ writable, and whether writes are falling back to `/tmp`.
 │       ├── parallel.ts        # capped concurrency + per-host rate limiter
 │       ├── label-mismatch.ts  # "4K" label vs. measured reality
 │       ├── ffmpeg-tools.ts    # FFmpeg analysis, VAAPI attempt + software fallback
-│       ├── thumbnail-store.ts # on-disk thumbnail cache (self-pruning)
+│       ├── csv.ts             # RFC 4180 CSV writing; headers stay comma-free (tested)
+│       ├── thumbnail-store.ts # on-disk thumbnail cache in ./data/thumbnails (self-pruning)
 │       ├── quality-history.ts # EWMA / trend / degradation maths
 │       ├── xtream-streams.ts  # Xtream Codes API client
 │       ├── xtream-quality.ts  # Xtream accounts → shared measurement engine

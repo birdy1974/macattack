@@ -5,9 +5,16 @@
  * override with MACATTACK_DATA_DIR) rather than the database, so polling and
  * exports stay small. Names are generated server-side and validated on read,
  * which blocks path traversal.
+ *
+ * Where those files land on the host's harddisk is decided by docker-compose:
+ * the bundled compose file bind-mounts `./data` (next to docker-compose.yml)
+ * at `/app/data`, so captures appear in `./data/thumbnails` on the host —
+ * e.g. `mac-attack\data\thumbnails` over a Windows/SMB share. A Docker
+ * *named volume* at /app/data would instead hide them in Docker's own
+ * storage, invisible in any host folder.
  */
 
-import { constants, promises as fs } from "node:fs";
+import { promises as fs } from "node:fs";
 import path from "node:path";
 
 const FALLBACK_DIR = path.join(process.env.TMPDIR || "/tmp", "macattack-thumbnails");
@@ -19,6 +26,31 @@ let usingFallbackDir = false;
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Numeric uid/gid of this process (null on platforms without them, e.g.
+ * native Windows). This is THE id a bind-mounted data directory must be
+ * writable by. It is not always 1001: the image's default user (`nextjs`)
+ * is 1001:1001, but the bundled docker-compose.yml overrides the container
+ * user to `${PUID:-1026}:${PGID:-100}`. Every user-facing message must use
+ * these live values — the old hardcoded "uid 1001" sent operators to chown
+ * the host folder to an id the container was not even running as.
+ */
+export function runtimeUid(): number | null {
+  return typeof process.getuid === "function" ? process.getuid() : null;
+}
+
+export function runtimeGid(): number | null {
+  return typeof process.getgid === "function" ? process.getgid() : null;
+}
+
+/** "uid 1026:100" style description of the app user, for logs and the UI. */
+export function describeRuntimeUser(): string {
+  const uid = runtimeUid();
+  const gid = runtimeGid();
+  if (uid === null) return "the app user";
+  return gid === null ? `the app user (uid ${uid})` : `the app user (uid ${uid}:${gid})`;
 }
 
 // Serialize writes and resets. A capture begun before a new search must never
@@ -80,22 +112,47 @@ function isSafeName(name: string): boolean {
   return /^[A-Za-z0-9._-]+\.jpg$/.test(name) && !name.includes("..");
 }
 
-export async function ensureThumbnailDir(): Promise<string> {
-  const dir = thumbnailsDir();
+/**
+ * Prove a directory is writable by actually creating and deleting a probe
+ * file in it; returns null when writable, else the failure reason.
+ *
+ * `mkdir -p` plus `access(W_OK)` (the old check) is not proof: mkdir succeeds
+ * when the directory already exists even if it is read-only for this uid, and
+ * access() goes by mode bits, which Synology shared-folder ACLs, NFS
+ * root-squash and read-only mounts can all contradict. A real create+unlink
+ * is the only answer that matches what saveThumbnail will experience. The
+ * probe name is not a `.jpg`, so clear/prune/count logic ignores it.
+ */
+async function probeWritable(dir: string): Promise<string | null> {
+  const probe = path.join(dir, `.macattack-write-test-${process.pid}`);
   try {
     await fs.mkdir(dir, { recursive: true });
-    usingFallbackDir = false;
-    return dir;
+    await fs.writeFile(probe, "");
+    return null;
   } catch (error) {
-    // A bind mount owned by another UID (the container runs as uid 1001) cannot
-    // be created/written by the app user. Keep the fallback so thumbnails still
-    // work, but remember why so the scan log and the Host capabilities panel can
-    // say where the files actually went instead of leaving an empty directory.
-    lastStoreError = `cannot write to ${dir} (${describeError(error)})`;
-    usingFallbackDir = true;
-    await fs.mkdir(FALLBACK_DIR, { recursive: true });
-    return FALLBACK_DIR;
+    return `cannot write to ${dir} as ${describeRuntimeUser()} (${describeError(error)})`;
+  } finally {
+    await fs.unlink(probe).catch(() => undefined);
   }
+}
+
+export async function ensureThumbnailDir(): Promise<string> {
+  const dir = thumbnailsDir();
+  const error = await probeWritable(dir);
+  if (error === null) {
+    usingFallbackDir = false;
+    lastStoreError = null;
+    return dir;
+  }
+  // A bind mount owned by another UID (e.g. Docker auto-created ./data as
+  // root, or a host folder owned by a different NAS user) cannot be written
+  // by the app user. Keep the fallback so thumbnails still work, but remember
+  // why so the scan log and the Host capabilities panel can say where the
+  // files actually went instead of leaving an empty directory.
+  lastStoreError = error;
+  usingFallbackDir = true;
+  await fs.mkdir(FALLBACK_DIR, { recursive: true });
+  return FALLBACK_DIR;
 }
 
 /** Store a JPEG and return its file name (not a path). */
@@ -176,42 +233,62 @@ export async function pruneThumbnails(maxAgeMs = 14 * 24 * 60 * 60 * 1000): Prom
   return removed;
 }
 
+async function countJpegs(dir: string): Promise<number> {
+  try {
+    const names = await fs.readdir(dir);
+    return names.filter((name) => name.endsWith(".jpg")).length;
+  } catch {
+    return 0; // directory not created yet — nothing stored
+  }
+}
+
 /**
  * Where thumbnails live and how many are stored (for the system panel).
  *
- * `writable` reports whether the app user can actually create the directory
- * and write into it. A bind mount owned by another UID (the container runs as
- * uid 1001) shows up here as `writable: false` instead of a silent "0 files".
+ * `writable` is proven with a real create+unlink probe in the configured
+ * directory (see probeWritable), so a host folder owned by a different UID
+ * than the container user shows up here as `writable: false` — with the
+ * actual `uid`/`gid` to chown it to — instead of a silent "0 files".
+ *
+ * `fileCount` counts the configured directory (the host-visible
+ * `./data/thumbnails` bind mount in the bundled compose setup);
+ * `fallbackFileCount` counts the container-local fallback, and
+ * `effectiveDir` says which of the two new captures are really written to.
  */
 export async function thumbnailStoreInfo(): Promise<{
   dir: string;
   fallbackDir: string;
-  fileCount: number | null;
+  /** Directory new thumbnails are actually written to: `dir`, or `fallbackDir` when using the fallback. */
+  effectiveDir: string;
+  fileCount: number;
+  fallbackFileCount: number;
   maxAgeDays: number;
   writable: boolean;
   usingFallback: boolean;
   lastError: string | null;
+  /** uid/gid of the app process; the data directory must be writable by these (null where unsupported). */
+  uid: number | null;
+  gid: number | null;
 }> {
   const dir = thumbnailsDir();
-  let fileCount: number | null = null;
-  let writable = false;
-  try {
-    await fs.mkdir(dir, { recursive: true });
-    await fs.access(dir, constants.W_OK);
-    writable = true;
-    const names = await fs.readdir(dir);
-    fileCount = names.filter((name) => name.endsWith(".jpg")).length;
-  } catch {
-    fileCount = 0; // directory not created yet — nothing stored
-    writable = false;
-  }
+  const probeError = await probeWritable(dir);
+  const writable = probeError === null;
+  if (!writable && probeError) lastStoreError = probeError;
+  // Keep a recorded save-fallback sticky: files already written went to the
+  // fallback even if a probe right now would succeed. A later successful
+  // save (or clearThumbnails) is what resets it.
+  const usingFallback = usingFallbackDir || !writable;
   return {
     dir,
     fallbackDir: FALLBACK_DIR,
-    fileCount,
+    effectiveDir: usingFallback ? FALLBACK_DIR : dir,
+    fileCount: await countJpegs(dir),
+    fallbackFileCount: await countJpegs(FALLBACK_DIR),
     maxAgeDays: 14,
     writable,
-    usingFallback: usingFallbackDir || !writable,
+    usingFallback,
     lastError: lastStoreError,
+    uid: runtimeUid(),
+    gid: runtimeGid(),
   };
 }

@@ -101,9 +101,15 @@ export async function summariseThumbnails(
   }
 
   const info = await thumbnailStoreInfo();
+  // Name the *actual* runtime uid/gid, not a hardcoded 1001: the bundled
+  // docker-compose.yml runs the container as ${PUID:-1026}:${PGID:-100},
+  // so chown-ing the host folder to 1001 would leave it just as unwritable.
+  const appUser =
+    info.uid === null ? "the app user" : `the app user (uid ${info.uid}${info.gid === null ? "" : `:${info.gid}`})`;
   const storeWarning = !info.usingFallback
     ? null
-    : `${info.dir} is not writable by the app user (uid 1001) — thumbnails are written to ${info.fallbackDir} instead and are lost when the container is recreated` +
+    : `${info.dir} is not writable by ${appUser} — thumbnails are written to ${info.fallbackDir} instead and are lost when the container is recreated. ` +
+      `On the host, make the folder bound to /app/data (./data with the bundled compose file) writable by that uid/gid` +
       (info.lastError ? ` (${info.lastError})` : "");
 
   return {
