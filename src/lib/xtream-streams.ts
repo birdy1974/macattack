@@ -99,6 +99,21 @@ export function xtreamApiUrl(
   return url.toString();
 }
 
+/** Standard XC minute-based archive URL, rendered in the panel's timezone. */
+export function xtreamArchiveUrl(
+  credentials: XtreamCredentials, streamId: string, minutesAgo: number,
+  timezone = "UTC", now = Date.now()
+): string {
+  const start = new Date(now - (minutesAgo + 30) * 60000);
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(start);
+  const part = (name: string) => parts.find((p) => p.type === name)?.value;
+  const stamp = `${part("year")}-${part("month")}-${part("day")}:${part("hour")}-${part("minute")}`;
+  return `${credentials.base}/timeshift/${encodeURIComponent(credentials.username)}/${encodeURIComponent(credentials.password)}/30/${stamp}/${encodeURIComponent(streamId)}.ts`;
+}
+
 /** Direct stream URL for one live stream id. */
 export function xtreamStreamUrl(
   credentials: XtreamCredentials,
@@ -294,10 +309,13 @@ export async function xtreamCategories(
 
 export async function xtreamLiveStreams(
   credentials: XtreamCredentials,
-  options: { timeoutMs?: number; signal?: AbortSignal; limit?: number } = {}
+  options: { timeoutMs?: number; signal?: AbortSignal; limit?: number; throwOnError?: boolean } = {}
 ): Promise<XtreamStream[]> {
   const response = await xtreamRequest(xtreamApiUrl(credentials, { action: "get_live_streams" }), options);
-  if (!response.ok || !Array.isArray(response.payload)) return [];
+  if (!response.ok || !Array.isArray(response.payload)) {
+    if (options.throwOnError) throw new Error("Xtream channel catalogue unavailable; saved catch-up evidence has not been changed");
+    return [];
+  }
   const limit = options.limit ?? 500;
   return (response.payload as unknown[])
     .map(asRecord)

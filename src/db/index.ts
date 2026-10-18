@@ -104,6 +104,7 @@ const RESULT_ALTERS = [
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_throughput_cv REAL",
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_catch_up_status TEXT",
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_catch_up_days REAL",
+  "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_catch_up_summary JSONB",
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_thumbnail TEXT",
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_ewma REAL",
   "ALTER TABLE scan_results ADD COLUMN IF NOT EXISTS quality_trend TEXT",

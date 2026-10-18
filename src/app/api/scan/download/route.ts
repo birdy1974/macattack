@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db, ensureMigrations } from "@/db";
 import { scanJobs, scanResults } from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { formatCatchUpInventory } from "@/lib/catchup-display";
 import { buildQualityReport } from "@/lib/quality-report";
 import { extractPortalExpiry, isMeaningfulExpiryValue } from "@/lib/portal-result-fields";
 
@@ -111,6 +112,7 @@ export async function GET(request: NextRequest) {
       qualityFrozen: "Stream Frozen Picture Detected",
       qualityLabelMismatch: "Stream Label Mismatch",
       qualityCatchUp: "Stream Catch-Up (archive) Check",
+      qualityCatchUpChannels: "Catch-Up Genres / Channels (saved)",
       qualityThumbnail: "Stream Thumbnail URL",
       qualityEwma: "Stream Score EWMA (history)",
       qualityTrend: "Stream Score Trend (history)",
@@ -265,6 +267,8 @@ export async function GET(request: NextRequest) {
           return result.qualityFrozen === 1 ? "yes" : result.qualityFrozen === 0 ? "no" : "";
         case "qualityLabelMismatch":
           return result.qualityLabelMismatch || "";
+        case "qualityCatchUpChannels":
+          return formatCatchUpInventory(result.qualityCatchUpSummary);
         case "qualityCatchUp": {
           if (!result.qualityCatchUpStatus) return "";
           const days = result.qualityCatchUpDays;

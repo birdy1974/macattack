@@ -22,6 +22,8 @@
  * ============================================================================
  */
 
+import { thumbnailGeneration } from "@/lib/thumbnail-store";
+import { archiveChannelKey, uncheckedCatchUp, verifyArchiveCandidates, type CatchUpVerification } from "@/lib/catchup-verification";
 import {
   probeStream,
   timeToFirstByteMs,
@@ -113,17 +115,7 @@ export interface MacQualityChannelResult {
   thumbnail: string | null;
 }
 
-export interface CatchUpVerification {
-  status: "verified" | "advertised_but_failed" | "not_advertised" | "not_checked";
-  channelName: string | null;
-  advertisedDays: number | null;
-  /** Minutes back that were actually requested/verified. */
-  verifiedMinutes: number | null;
-  linkResolved: boolean;
-  playable: boolean;
-  bytesRead: number;
-  error: string | null;
-}
+export type { CatchUpVerification } from "@/lib/catchup-verification";
 
 export interface MacQualityAggregate {
   /** Median time from HTTP request to the first media byte, across measured channels (ms). */
@@ -326,6 +318,7 @@ export async function checkMacStreamQuality(
   options: MacQualityCheckOptions
 ): Promise<MacStreamQualityReport> {
   const startedAt = Date.now();
+  const captureGeneration = thumbnailGeneration();
   const channelsToProbe = clamp(options.channelsToProbe ?? DEFAULT_CHANNELS, 1, 8);
   const sampleMs = clamp(options.sampleMs ?? DEFAULT_SAMPLE_MS, MIN_SAMPLE_MS, MAX_SAMPLE_MS);
   const concurrency = clamp(options.concurrency ?? DEFAULT_CONCURRENCY, 1, 4);
@@ -522,19 +515,15 @@ export async function checkMacStreamQuality(
     }));
 
   // ── optional ffmpeg pass: picture evidence + thumbnail (sequential) ───────
-  const resolvePlayableUrl = (index: number): string | null => {
-    const entry = probed[index];
-    return entry?.url ? entry.url : null;
-  };
-
   // Thumbnail bookkeeping: the scan log must say what happened to every
   // capture (saved where, or why not) — a silent empty directory is the worst
   // possible outcome for the operator.
   const thumbnailsEnabled = options.thumbnails ?? true;
   const thumbnails: ThumbnailOutcome[] = [];
-  const captureThumbnails = thumbnailsEnabled && ffmpeg.available && (options.pictureChecks ?? true);
+  const captureThumbnails = thumbnailsEnabled && ffmpeg.available;
+  const pictureChecksEnabled = options.pictureChecks ?? true;
 
-  if (ffmpeg.available && (options.pictureChecks ?? true)) {
+  if (ffmpeg.available && (pictureChecksEnabled || captureThumbnails)) {
     for (let index = 0; index < channels.length; index += 1) {
       if (options.signal?.aborted) break;
       const channel = channels[index];
@@ -545,31 +534,34 @@ export async function checkMacStreamQuality(
       const liveUrl = await resolveLiveUrlAgain(clientOptions, handshake.token, selection[index], index);
       if (!liveUrl) continue;
 
-      const picture = await analyzePicture(liveUrl, {
-        seconds: Math.max(5, Math.min(Math.round(sampleMs / 1000), 12)),
-        timeoutMs: (Math.max(5, Math.round(sampleMs / 1000)) + 20) * 1000,
-        userAgent: handshake.userAgent || undefined,
-        signal: options.signal,
-      });
-      channel.picture = picture;
-      if (picture.analyzed) {
-        // Re-score with the picture evidence (freeze/black caps stability).
-        channel.score = scoreStreamProbe(channel.probe, {
-          picture: {
-            analyzed: true,
-            frozenDetected: picture.frozenDetected,
-            blackDetected: picture.blackDetected,
-            frozenDurationSec: picture.frozenDurationSec,
-            blackDurationSec: picture.blackDurationSec,
-            fps: picture.fps,
-            videoBitrateMbps: picture.videoBitrateMbps,
-          },
-          labelMismatch: channel.labelMismatch,
+      if (pictureChecksEnabled) {
+        const picture = await analyzePicture(liveUrl, {
+          seconds: Math.max(5, Math.min(Math.round(sampleMs / 1000), 12)),
+          timeoutMs: (Math.max(5, Math.round(sampleMs / 1000)) + 20) * 1000,
+          userAgent: handshake.userAgent || undefined,
+          signal: options.signal,
         });
+        channel.picture = picture;
+        if (picture.analyzed) {
+          // Re-score with the picture evidence (freeze/black caps stability).
+          channel.score = scoreStreamProbe(channel.probe, {
+            picture: {
+              analyzed: true,
+              frozenDetected: picture.frozenDetected,
+              blackDetected: picture.blackDetected,
+              frozenDurationSec: picture.frozenDurationSec,
+              blackDurationSec: picture.blackDurationSec,
+              fps: picture.fps,
+              videoBitrateMbps: picture.videoBitrateMbps,
+            },
+            labelMismatch: channel.labelMismatch,
+          });
+        }
       }
 
       if (captureThumbnails) {
         const outcome = await captureChannelThumbnail({
+          generation: captureGeneration,
           key: `${options.mac.replace(/[:.]/g, "")}-${index}-${Date.now()}`,
           channel: channel.name,
           url: liveUrl,
@@ -584,19 +576,23 @@ export async function checkMacStreamQuality(
   }
 
   // ── optional catch-up verification ────────────────────────────────────────
-  const catchUp = options.checkCatchUp === false
-    ? ({ status: "not_checked", channelName: null, advertisedDays: null, verifiedMinutes: null, linkResolved: false, playable: false, bytesRead: 0, error: null } as CatchUpVerification)
-    : await verifyCatchUp(clientOptions, handshake.token, selection, { sampleMs, signal: options.signal, proxy: options.proxy ?? null });
+  const catchUp = list.source === "none" ? { ...uncheckedCatchUp(), error: list.error ?? "Channel catalogue unavailable" }
+    : await verifyCatchUp(clientOptions, handshake.token, list.channels, {
+      sampleMs, signal: options.signal, proxy: options.proxy ?? null,
+      genreTitles: list.genreTitles, enabled: options.checkCatchUp !== false,
+    });
 
   if (catchUp.status === "verified") {
-    notes.push(`Catch-up verified: ${catchUp.channelName} served an archive link ${catchUp.verifiedMinutes} minute(s) back (${catchUp.bytesRead} bytes)`);
+    notes.push(`Catch-up archive media playable: ${catchUp.channelName}, sampled window ending ${catchUp.verifiedMinutes} minute(s) ago (${catchUp.bytesRead} bytes)`);
   } else if (catchUp.status === "advertised_but_failed") {
     notes.push(
-      `Catch-up advertised but not working: ${catchUp.channelName} (${catchUp.error ?? "no archive data"})`
+      `Catch-up sampled checks failed: ${catchUp.channelName} (${catchUp.error ?? "no archive data"})`
     );
   } else if (catchUp.status === "not_advertised") {
-    notes.push("No channel advertised catch-up/archive support on this portal");
+    notes.push("No channel in the fetched catalogue advertised catch-up/archive support");
   }
+
+  limitations.push("Catch-up is a bounded spot check across up to 3 advertised channels in different genres from the fetched catalogue. An archive-specific URL returning media does not prove the broadcast time or content, nor the full advertised retention.");
 
   // ── aggregate ─────────────────────────────────────────────────────────────
   const aggregate = aggregateChannels(channels);
@@ -660,70 +656,47 @@ async function verifyCatchUp(
   clientOptions: Parameters<typeof stalkerResolveArchiveLink>[0],
   token: string,
   selection: StalkerChannel[],
-  options: { sampleMs: number; signal?: AbortSignal; proxy: ProxyConfig | null }
+  options: { sampleMs: number; signal?: AbortSignal; proxy: ProxyConfig | null;
+    genreTitles: Record<string, string>; enabled?: boolean; channelKeys?: string[]; skipCheckedKeys?: string[]; channelLimit?: number }
 ): Promise<CatchUpVerification> {
-  const candidate = selection.find((channel) => channel.tvArchive);
-  if (!candidate) {
-    return {
-      status: "not_advertised",
-      channelName: null,
-      advertisedDays: null,
-      verifiedMinutes: null,
-      linkResolved: false,
-      playable: false,
-      bytesRead: 0,
-      error: null,
-    };
-  }
+  return verifyArchiveCandidates({
+    candidates: selection.filter((channel) => channel.tvArchive).map((channel) => ({
+      ...channel, days: channel.tvArchiveDays,
+      genreTitle: channel.genreId ? options.genreTitles[channel.genreId] ?? null : null,
+    })),
+    enabled: options.enabled, channelKeys: options.channelKeys, skipCheckedKeys: options.skipCheckedKeys, channelLimit: options.channelLimit,
+    methods: ["programme", "window"],
+    resolve: (channel, minutesAgo, method) => stalkerResolveArchiveLink(
+      clientOptions, token, channel, minutesAgo, method as "programme" | "window"
+    ),
+    sampleMs: options.sampleMs, signal: options.signal, proxy: options.proxy,
+    userAgent: clientOptions.userAgent ?? undefined,
+  });
+}
 
-  for (const minutesAgo of [60, 240]) {
-    if (options.signal?.aborted) break;
-    const archive = await stalkerResolveArchiveLink(clientOptions, token, candidate, minutesAgo);
-    if (!archive.url) {
-      return {
-        status: "advertised_but_failed",
-        channelName: candidate.name,
-        advertisedDays: archive.advertisedDays,
-        verifiedMinutes: null,
-        linkResolved: false,
-        playable: false,
-        bytesRead: 0,
-        error: archive.error,
-      };
-    }
-
-    const probe = await probeStream(archive.url, {
-      sampleMs: Math.min(options.sampleMs, 6000),
-      timeoutMs: 10000,
-      signal: options.signal,
-      proxy: options.proxy,
-      headers: { "X-User-Agent": "Model: MAG250; Link: WiFi" },
-    });
-
-    if (probe.bytesRead > 0 && probe.status === "measured") {
-      return {
-        status: "verified",
-        channelName: candidate.name,
-        advertisedDays: archive.advertisedDays,
-        verifiedMinutes: minutesAgo,
-        linkResolved: archive.linkResolved,
-        playable: true,
-        bytesRead: probe.bytesRead,
-        error: null,
-      };
-    }
-  }
-
-  return {
-    status: "advertised_but_failed",
-    channelName: candidate.name,
-    advertisedDays: candidate.tvArchiveDays ?? null,
-    verifiedMinutes: null,
-    linkResolved: false,
-    playable: false,
-    bytesRead: 0,
-    error: "Archive link returned no media data (portal may serve the live stream instead)",
+/** Re-authenticate and test archive channels without rerunning live/picture probes. */
+export async function checkMacCatchUp(options: MacQualityCheckOptions & {
+  channelKeys?: string[]; skipCheckedKeys?: string[]; channelLimit?: number;
+}): Promise<CatchUpVerification> {
+  const clientOptions = {
+    serverPath: options.serverPath, portalBase: options.portalBase, mac: options.mac,
+    timeoutMs: options.timeoutMs, signal: options.signal, proxy: options.proxy ?? null,
+    serialNumber: computeSerialNumber(options.mac, options.serverPath),
+    userAgent: options.rememberedUserAgent,
+    userAgentCandidates: buildUserAgentCandidates(options.rememberedUserAgent, options.userAgents),
   };
+  const handshake = await stalkerHandshake(clientOptions);
+  if (!handshake.token) throw new Error(handshake.error || "Portal authentication failed");
+  clientOptions.userAgent = handshake.userAgent;
+  const list = await stalkerListChannels(clientOptions, handshake.token, { maxChannels: 3000, maxGenres: 24 });
+  if (list.source === "none") throw new Error(list.error || "Channel catalogue unavailable");
+  if (options.channelKeys?.some((key) => !list.channels.some((c) => c.tvArchive && archiveChannelKey({ ...c, days: c.tvArchiveDays }) === key))) {
+    throw new Error("Requested archive channel is no longer advertised in the fetched catalogue");
+  }
+  return verifyCatchUp(clientOptions, handshake.token, list.channels, {
+    sampleMs: options.sampleMs ?? 3000, signal: options.signal, proxy: options.proxy ?? null,
+    genreTitles: list.genreTitles, channelKeys: options.channelKeys, skipCheckedKeys: options.skipCheckedKeys, channelLimit: options.channelLimit,
+  });
 }
 
 function buildGenreGroups(channels: MacQualityChannelResult[]): GenreGroupSummary[] {
@@ -875,10 +848,17 @@ export function formatMacQualityLog(report: MacStreamQualityReport): Array<{ lev
   if (report.catchUp.status === "verified") {
     lines.push({
       level: "success",
-      message: `Catch-up verified on "${report.catchUp.channelName}" back to ${report.catchUp.verifiedMinutes} minute(s)`,
+      message: `Catch-up archive media playable on "${report.catchUp.channelName}" (spot check, window ending ${report.catchUp.verifiedMinutes} minute(s) ago)`,
     });
   } else if (report.catchUp.status === "advertised_but_failed") {
-    lines.push({ level: "warning", message: `Catch-up advertised but not working on "${report.catchUp.channelName}"` });
+    lines.push({ level: "warning", message: `Catch-up sampled checks failed on "${report.catchUp.channelName}"` });
+  }
+
+  if (report.catchUp.attempts) {
+    lines.push({ level: "info", message: `Archive coverage: ${report.catchUp.testedChannels ?? 0}/${report.catchUp.advertisedChannels ?? 0} advertised channel(s), ${report.catchUp.testedGenres ?? 0} genre(s) tested (bounded spot check)` });
+    for (const attempt of report.catchUp.attempts.filter((entry) => !entry.playable).slice(0, 3)) {
+      lines.push({ level: "info", message: `  • Archive ${attempt.channelName} (${attempt.method}, ${attempt.minutesAgo} min ago): ${attempt.error ?? "no archive media"}` });
+    }
   }
 
   for (const channel of report.channels) {

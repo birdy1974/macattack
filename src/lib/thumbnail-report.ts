@@ -14,6 +14,7 @@ import {
   saveThumbnail,
   thumbnailStoreError,
   thumbnailStoreInfo,
+  thumbnailGeneration,
 } from "@/lib/thumbnail-store";
 
 export interface ThumbnailOutcome {
@@ -46,7 +47,9 @@ export async function captureChannelThumbnail(params: {
   userAgent?: string;
   signal?: AbortSignal;
   timeoutMs?: number;
+  generation?: number;
 }): Promise<ThumbnailOutcome> {
+  const generation = params.generation ?? thumbnailGeneration();
   const capture = await captureThumbnail(params.url, {
     userAgent: params.userAgent,
     signal: params.signal,
@@ -62,7 +65,10 @@ export async function captureChannelThumbnail(params: {
     };
   }
 
-  const name = await saveThumbnail(params.key, capture.jpeg);
+  if (generation !== thumbnailGeneration()) {
+    return { channel: params.channel, name: null, ok: false, detail: "Capture discarded because a new search started" };
+  }
+  const name = await saveThumbnail(params.key, capture.jpeg, generation);
   if (!name) {
     return {
       channel: params.channel,
@@ -95,14 +101,14 @@ export async function summariseThumbnails(
   }
 
   const info = await thumbnailStoreInfo();
-  const storeWarning = info.writable
+  const storeWarning = !info.usingFallback
     ? null
     : `${info.dir} is not writable by the app user (uid 1001) — thumbnails are written to ${info.fallbackDir} instead and are lost when the container is recreated` +
       (info.lastError ? ` (${info.lastError})` : "");
 
   return {
     enabled,
-    dir: info.writable ? info.dir : info.fallbackDir,
+    dir: info.usingFallback ? info.fallbackDir : info.dir,
     outcomes,
     storeWarning,
   };

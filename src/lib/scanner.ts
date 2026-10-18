@@ -56,6 +56,7 @@ import { parseWatchlist } from "@/lib/channel-watchlist";
 import { HostRateLimiter, hostOf } from "@/lib/parallel";
 import { buildUserAgentCandidates, parseUserAgentList, userAgentSettingKey } from "@/lib/user-agents";
 import { parseProxyList } from "@/lib/proxy";
+import { saveQualityWithCatchUp } from "@/lib/catchup-store";
 import { pruneThumbnails } from "@/lib/thumbnail-store";
 import { computeSerialNumber } from "@/lib/stalker-streams";
 import { detectDegradation, summariseHistory, type ProbeRun } from "@/lib/quality-history";
@@ -1867,6 +1868,13 @@ export async function startScan(jobId: number, skipVerification: boolean = false
             stalkerServerPath: macTarget.serverPath,
           }).returning();
 
+          // Publish discovery before the potentially lengthy media checks, so
+          // polling/dashboard can show the new address as awaiting measurement.
+          await db.update(scanJobs).set({
+            totalTested: numberToDbInt(tested), totalFound: numberToDbInt(found),
+            currentMac: mac, updatedAt: new Date(),
+          }).where(eq(scanJobs.id, jobId));
+
           await addLog(jobId, "info", "Result saved successfully");
 
           // ── Stream quality / speed / stability check ──────────────────
@@ -1929,37 +1937,32 @@ export async function startScan(jobId: number, skipVerification: boolean = false
               const trend = history.trend;
               const degradation = detectDegradation(history.runs);
 
-              await db
-                .update(scanResults)
-                .set({
-                  qualityVerdict: aggregate.verdict,
-                  qualityScore: aggregate.overallScore,
-                  qualitySpeedScore: aggregate.speedScore,
-                  qualityQualityScore: aggregate.qualityScore,
-                  qualityStabilityScore: aggregate.stabilityScore,
-                  qualityResolution: measuredChannel?.probe?.resolution?.label ?? null,
-                  qualityCodec: measuredChannel?.probe?.videoCodec ?? null,
-                  qualityThroughputMbps: measuredChannel?.probe?.sustainedMbps ?? null,
-                  qualityRequiredMbps: measuredChannel?.probe?.requiredMbps ?? null,
-                  qualityChannelsPlayable: aggregate.channelsPlayable,
-                  qualityChannelsProbed: aggregate.channelsProbed,
-                  qualityFirstByteMs: aggregate.firstByteMsMedian,
-                  qualityCheckedAt: new Date(qualityReport.measuredAt),
-                  qualityReport,
-                  qualityFrozen: aggregate.frozenChannels > 0 ? 1 : 0,
-                  qualityLabelMismatch: aggregate.labelMismatches > 0 ? `${aggregate.labelMismatches} channel(s) mislabeled` : null,
-                  qualityRetries: measuredChannel?.probe?.retryCount ?? 0,
-                  qualityThroughputCv: measuredChannel?.probe?.throughputCoefficientOfVariation ?? null,
-                  qualityCatchUpStatus: qualityReport.catchUp?.status ?? "not_checked",
-                  qualityCatchUpDays: qualityReport.catchUp?.verifiedMinutes
-                    ? qualityReport.catchUp.verifiedMinutes / (60 * 24)
-                    : null,
-                  qualityThumbnail: thumbnailChannel?.thumbnail ?? null,
-                  qualityEwma: ewma,
-                  qualityTrend: trend,
-                  qualityGenreSummary: qualityReport.genreGroups,
-                })
-                .where(eq(scanResults.id, savedResult.id));
+              await saveQualityWithCatchUp(savedResult.id, qualityReport, {
+                qualityVerdict: aggregate.verdict,
+                qualityScore: aggregate.overallScore,
+                qualitySpeedScore: aggregate.speedScore,
+                qualityQualityScore: aggregate.qualityScore,
+                qualityStabilityScore: aggregate.stabilityScore,
+                qualityResolution: measuredChannel?.probe?.resolution?.label ?? null,
+                qualityCodec: measuredChannel?.probe?.videoCodec ?? null,
+                qualityThroughputMbps: measuredChannel?.probe?.sustainedMbps ?? null,
+                qualityRequiredMbps: measuredChannel?.probe?.requiredMbps ?? null,
+                qualityChannelsPlayable: aggregate.channelsPlayable,
+                qualityChannelsProbed: aggregate.channelsProbed,
+                qualityFirstByteMs: aggregate.firstByteMsMedian,
+                qualityCheckedAt: new Date(qualityReport.measuredAt),
+                qualityReport,
+                qualityFrozen: aggregate.frozenChannels > 0 ? 1 : 0,
+                qualityLabelMismatch: aggregate.labelMismatches > 0 ? `${aggregate.labelMismatches} channel(s) mislabeled` : null,
+                qualityRetries: measuredChannel?.probe?.retryCount ?? 0,
+                qualityThroughputCv: measuredChannel?.probe?.throughputCoefficientOfVariation ?? null,
+                qualityCatchUpStatus: qualityReport.catchUp?.status ?? "not_checked",
+                qualityCatchUpDays: null, // A spot-check offset is not verified archive retention.
+                qualityThumbnail: thumbnailChannel?.thumbnail ?? null,
+                qualityEwma: ewma,
+                qualityTrend: trend,
+                qualityGenreSummary: qualityReport.genreGroups,
+              });
 
               if (degradation.degraded) {
                 await addLog(

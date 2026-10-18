@@ -24,8 +24,8 @@ export async function GET(request: NextRequest) {
     headers: {
       "Content-Type": "image/jpeg",
       "Content-Length": String(file.byteLength),
-      // Names contain a timestamp and never change contents.
-      "Cache-Control": "public, max-age=86400, immutable",
+      // A new search clears frames; do not keep old captures in browser caches.
+      "Cache-Control": "no-store",
     },
   });
 }

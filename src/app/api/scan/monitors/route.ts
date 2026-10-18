@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { monitors, qualityProbeRuns, scanJobs, scanResults, settings } from "@/db/schema";
 import { desc, eq } from "drizzle-orm";
+import { saveQualityWithCatchUp } from "@/lib/catchup-store";
 import { checkMacStreamQuality } from "@/lib/mac-quality";
 import { detectDegradation, summariseHistory, type ProbeRun } from "@/lib/quality-history";
 import { parseProxyList } from "@/lib/proxy";
@@ -224,6 +225,8 @@ async function runMonitorCheck(args: {
         },
         channelsToProbe: monitor.channels,
         sampleMs: monitor.sampleMs,
+        checkCatchUp: false,
+        thumbnails: false,
       });
       if (!report) throw new Error(error || "Xtream check failed");
       await persistMonitorOutcome(monitor, result, report, checkedAt, args.proxyPool);
@@ -322,22 +325,19 @@ async function persistMonitorOutcome(
   }
   if (alertOn.includes("degrading") && summary.trend === "degrading") reasons.push("trend is degrading");
 
-  await db
-    .update(scanResults)
-    .set({
-      qualityScore: report.aggregate.overallScore,
-      qualityVerdict: report.aggregate.verdict,
-      qualityEwma: summary.ewma,
-      qualityTrend: summary.trend,
-      qualityCheckedAt: checkedAt,
-      qualityReport: report,
-      qualityFrozen: report.aggregate.frozenChannels > 0 ? 1 : 0,
-      qualityLabelMismatch:
-        report.aggregate.labelMismatches > 0 ? `${report.aggregate.labelMismatches} channel(s) mislabeled` : null,
-      qualityThroughputCv: measuredChannel?.probe?.throughputCoefficientOfVariation ?? null,
-      qualityGenreSummary: report.genreGroups,
-    })
-    .where(eq(scanResults.id, result.id));
+  await saveQualityWithCatchUp(result.id, report, {
+    qualityScore: report.aggregate.overallScore,
+    qualityVerdict: report.aggregate.verdict,
+    qualityEwma: summary.ewma,
+    qualityTrend: summary.trend,
+    qualityCheckedAt: checkedAt,
+    qualityReport: report,
+    qualityFrozen: report.aggregate.frozenChannels > 0 ? 1 : 0,
+    qualityLabelMismatch:
+      report.aggregate.labelMismatches > 0 ? `${report.aggregate.labelMismatches} channel(s) mislabeled` : null,
+    qualityThroughputCv: measuredChannel?.probe?.throughputCoefficientOfVariation ?? null,
+    qualityGenreSummary: report.genreGroups,
+  });
 
   await db
     .update(monitors)

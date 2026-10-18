@@ -12,7 +12,7 @@
  * and Linux VAAPI retry behavior uses a small fake ffmpeg executable.
  */
 
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { promises as fs, chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { getEventListeners } from "node:events";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -682,6 +682,30 @@ section("Thumbnail store");
   if (saved) {
     const roundTrip = await readThumbnail(saved);
     check("reads back the bytes", !!roundTrip && roundTrip.length === 4);
+  }
+  // Reproduce a mounted directory that exists (mkdir succeeds), but rejects
+  // the JPEG write. This must fall back just like a mkdir failure does.
+  const originalWriteFile = fs.writeFile;
+  let rejectedPrimaryWrite = false;
+  fs.writeFile = async (...args: Parameters<typeof fs.writeFile>) => {
+    if (!rejectedPrimaryWrite) {
+      rejectedPrimaryWrite = true;
+      throw Object.assign(new Error("read-only thumbnail mount"), { code: "EACCES" });
+    }
+    return originalWriteFile(...args);
+  };
+  let fallback: string | null = null;
+  try {
+    fallback = await saveThumbnail("wave-test-readonly", Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+    check("write failure retries in the fallback directory", rejectedPrimaryWrite && fallback !== null);
+    check("fallback JPEG can be served", !!fallback && (await readThumbnail(fallback))?.length === 4);
+    const info = await thumbnailStoreInfo();
+    check("write failure reports fallback and reason", info.usingFallback && !!info.lastError?.includes("read-only thumbnail mount"));
+    const summary = await summariseThumbnails(true, true, []);
+    check("capture summary uses actual fallback after a write failure", summary.dir === info.fallbackDir && !!summary.storeWarning);
+  } finally {
+    fs.writeFile = originalWriteFile;
+    if (fallback) await deleteThumbnail(fallback);
   }
   check("rejects path traversal", (await readThumbnail("../../etc/passwd")) === null);
   check("rejects unknown files", (await readThumbnail("definitely-not-here.jpg")) === null);

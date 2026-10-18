@@ -74,6 +74,7 @@ export async function GET(request: NextRequest) {
         qualityThroughputCv: scanResults.qualityThroughputCv,
         qualityCatchUpStatus: scanResults.qualityCatchUpStatus,
         qualityCatchUpDays: scanResults.qualityCatchUpDays,
+        qualityCatchUpSummary: scanResults.qualityCatchUpSummary,
         qualityThumbnail: scanResults.qualityThumbnail,
         qualityEwma: scanResults.qualityEwma,
         qualityTrend: scanResults.qualityTrend,

@@ -1,3 +1,4 @@
+import type { CatchUpVerification } from "@/lib/catchup-verification";
 import {
   pgTable,
   serial,
@@ -155,6 +156,8 @@ export const scanResults = pgTable("scan_results", {
   qualityRetries: integer("quality_retries"),
   qualityThroughputCv: real("quality_throughput_cv"), // throughput variation over the sample
   qualityCatchUpStatus: text("quality_catch_up_status"), // verified | advertised_but_failed | not_advertised | not_checked
+  /** Durable per-channel archive evidence and per-genre availability, not thumbnails. */
+  qualityCatchUpSummary: jsonb("quality_catch_up_summary").$type<CatchUpVerification>(),
   qualityCatchUpDays: real("quality_catch_up_days"), // archive depth actually verified (days)
   qualityThumbnail: text("quality_thumbnail"), // file name served by /api/scan/thumbnail
   qualityEwma: real("quality_ewma"), // rolling score across probe runs

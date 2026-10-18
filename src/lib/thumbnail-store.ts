@@ -21,6 +21,46 @@ function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+// Serialize writes and resets. A capture begun before a new search must never
+// repopulate the cache after that search has cleared it.
+let generation = 0;
+let mutationQueue: Promise<unknown> = Promise.resolve();
+function mutate<T>(operation: () => Promise<T>): Promise<T> {
+  const result = mutationQueue.then(operation);
+  mutationQueue = result.catch(() => undefined);
+  return result;
+}
+
+export function thumbnailGeneration(): number {
+  return generation;
+}
+
+/** Clear only our JPEG cache, never the configured data directory itself. */
+export function clearThumbnails(): Promise<number> {
+  generation += 1;
+  return mutate(async () => {
+    let removed = 0;
+    for (const dir of new Set([thumbnailsDir(), FALLBACK_DIR])) {
+      let entries;
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      for (const entry of entries) {
+        if (!entry.isFile() || !isSafeName(entry.name)) continue;
+        await fs.unlink(path.join(dir, entry.name));
+        removed += 1;
+      }
+    }
+    lastWriteDir = null;
+    lastStoreError = null;
+    usingFallbackDir = false;
+    return removed;
+  });
+}
+
 /** Directory the most recent successful save went into. */
 export function lastThumbnailWriteDir(): string | null {
   return lastWriteDir;
@@ -59,19 +99,30 @@ export async function ensureThumbnailDir(): Promise<string> {
 }
 
 /** Store a JPEG and return its file name (not a path). */
-export async function saveThumbnail(key: string, jpeg: Buffer): Promise<string | null> {
-  try {
-    const dir = await ensureThumbnailDir();
+export function saveThumbnail(key: string, jpeg: Buffer, expectedGeneration = generation): Promise<string | null> {
+  return mutate(async () => {
+    if (expectedGeneration !== generation) return null;
     const safeKey = key.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80);
     const name = `${safeKey}-${Date.now()}.jpg`;
-    await fs.writeFile(path.join(dir, name), jpeg);
-    lastWriteDir = dir;
-    usingFallbackDir = dir === FALLBACK_DIR;
-    return name;
-  } catch (error) {
-    lastStoreError = `could not write ${key} (${describeError(error)})`;
+    // mkdir can succeed for an existing read-only mount. Retry the actual
+    // write in the fallback too, not just directory creation.
+    for (const dir of [thumbnailsDir(), FALLBACK_DIR]) {
+      try {
+        await fs.mkdir(dir, { recursive: true });
+        await fs.writeFile(path.join(dir, name), jpeg);
+        lastWriteDir = dir;
+        usingFallbackDir = dir === FALLBACK_DIR;
+        if (!usingFallbackDir) lastStoreError = null;
+        return name;
+      } catch (error) {
+        const detail = `cannot write to ${dir} (${describeError(error)})`;
+        lastStoreError = dir === FALLBACK_DIR && lastStoreError
+          ? `${lastStoreError}; ${detail}`
+          : detail;
+      }
+    }
     return null;
-  }
+  });
 }
 
 export async function readThumbnail(name: string): Promise<Buffer | null> {

@@ -414,6 +414,8 @@ npm run test:probe      # stream-probe engine, retries, proxy egress
 npm run test:quality    # Stalker → quality pipeline, catch-up, genre groups
 npm run test:xtream     # Xtream Codes login/catalogue/measurement
 npm run test:waves      # pure logic (no server needed)
+npm run test:scan-quality # cache reset, catch-up sampling/timezones, live dashboard (no server needed)
+npm run test:catchup     # saved channel/genre evidence, cumulative checks, display/export (no server needed)
 ```
 
 ---
@@ -425,7 +427,7 @@ npm run test:waves      # pure logic (no server needed)
 | `FFMPEG_PATH` | Path to `ffmpeg` when it is not on `PATH` (local source runs only — leave unset in Docker, where the bundled binary is found on PATH; detection still falls back to PATH if the override is wrong) |
 | `MACATTACK_FFMPEG_HWACCEL` | `auto` (default) or `vaapi` to attempt VAAPI when supported/device-accessible; set `none` to force software decoding |
 | `MACATTACK_FFMPEG_DRI_DEVICE` | Optional Linux DRI render-device path (default detection tries `/dev/dri/renderD128`, then `/dev/dri/card0`) |
-| `MACATTACK_DATA_DIR` | Base directory for the thumbnail cache — files land in `<dir>/thumbnails` (default `./data`, pruned after 14 days; the bundled compose file mounts a volume at `/app/data` so they survive updates) |
+| `MACATTACK_DATA_DIR` | Base directory for the thumbnail cache — files land in `<dir>/thumbnails` (default `./data`, cleared on a new search or pruned after 14 days; the bundled compose file mounts a volume at `/app/data` so they survive updates) |
 | `MACATTACK_STB_USER_AGENT` | Overrides the default MAG user agent |
 | `MACATTACK_ALLOW_LOCAL_STREAMS=1` | Test escape hatch: allow loopback stream URLs (used by the fixture suites) |
 | `MACATTACK_FREEZE_NOISE`, `MACATTACK_FREEZE_MIN_SEC`, `MACATTACK_BLACK_MIN_SEC` | Tune ffmpeg freeze/black thresholds |
@@ -518,6 +520,59 @@ docker exec mac-attack ffmpeg -hide_banner -version | head -n 1
 docker exec mac-attack printenv FFMPEG_PATH   # should print nothing in Docker
 docker compose logs app | grep -i ffmpeg
 ```
+
+### New-search cleanup and live quality dashboard
+
+Starting a new search clears generated thumbnails in both the configured data
+folder and the temporary fallback folder, along with the browser's previous
+result/detail caches. Captures from an older search cannot repopulate the cache.
+Stop the current search before starting another. Cleanup errors are reported,
+not silently ignored. Job/result history, saved settings, monitoring definitions
+and subscription tokens remain intact; old thumbnail images do not.
+
+The **Found MAC quality** dashboard updates from status polling every 1.5 seconds,
+independently of console auto-refresh. It separates found, checked, scored and
+not-yet-measured addresses; shows average scores, verdict distribution, playable
+channel rate, latency, warnings and archive outcomes; and links the highest-scoring
+addresses to their detailed reports. Missing scores are not counted as zero.
+
+Archive discovery considers the fetched catalogue, not just the live watchlist.
+It spot-checks up to three advertised channels across genres/categories, using
+native Stalker programme links with a timestamp-window fallback, or standard
+Xtream timeshift URLs in the panel's timezone. Per-channel attempts are available
+under **Per-channel detail**. “Archive media playable” is not proof of historical
+content or full archive retention. See the [catch-up research and compatibility
+notes](docs/catch-up-verification-research.md) for sources, other methods and limits.
+
+### Saved catch-up channels and genres per MAC
+
+Each measured MAC/account now saves a **catch-up inventory** in its result, separate
+from temporary thumbnail files. Open **Quality details → Saved catch-up availability**
+to see archive channels grouped by genre, with channel IDs/names, advertised retention,
+last-check time and one of three outcomes:
+
+- **Archive media playable**: an archive-specific request returned media.
+- **Sampled checks failed**: the attempted archive windows did not work.
+- **Advertised, untested**: metadata advertises an archive, but that channel has not
+  been checked. It is not treated as confirmed catch-up.
+
+Automatic scans initially test up to three genre-diverse archive channels. Use
+**Check next 3 untested channels** to extend coverage, or **Check/Re-check** beside
+a specific channel. These archive-only actions authenticate the stored MAC/account,
+refresh its catalogue, test archive media, and save results without repeating live
+quality/picture tests. Completed batches accumulate, and live-only monitor runs do
+not overwrite the saved archive evidence. A more recent failed recheck replaces a
+channel's older successful result.
+
+Results survive reloads and new searches. The **Catch-Up Genres / Channels (saved)**
+output field includes them in the result table and CSV/TXT exports; full JSON also
+contains the structured channel and genre inventory. New installs and upgrades add
+`scan_results.quality_catch_up_summary` automatically; older results can populate it
+using **Discover & check catch-up** without requiring a new scan.
+
+Checks apply to the fetched catalogue, not necessarily every channel on the provider.
+Genre counts describe individual channels; one successful channel never confirms
+an entire genre or the full advertised retention.
 
 ### Thumbnails are missing / the data directory stays empty
 Every quality check now logs what happened to each capture, so start there:
